@@ -1,5 +1,4 @@
 import AppKit
-import ImageIO
 import QuartzCore
 import SwiftUI
 
@@ -382,37 +381,28 @@ public struct RecallView: View {
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
-    @State private var image: NSImage?
+    @State private var frame: RecallDisplayFrame?
 
     var body: some View {
-        let cachedImage = RecallDecodedImageCache.shared.cached(artifactID: artifactID)
-        GeometryReader { geometry in
-            ZStack {
-                if let image = cachedImage ?? image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFit()
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                        .shadow(color: .black.opacity(0.28), radius: 32)
-                } else {
-                    Rectangle().fill(RecallPalette.background)
-                    ProgressView().controlSize(.small).tint(.white.opacity(0.65))
-                }
+        let displayed = RecallDecodedImageCache.shared.cached(artifactID: artifactID) ?? frame
+        ZStack {
+            ArtifactYUVView(frame: displayed)
+            if displayed == nil {
+                ProgressView().controlSize(.small).tint(.white.opacity(0.65))
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .clipped()
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
         .task(id: artifactID) {
             if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
-                image = cached
+                frame = cached
                 return
             }
-            guard let loaded = await RecallDecodedImageCache.shared.image(
+            guard let loaded = await RecallDecodedImageCache.shared.frame(
                 artifactID: artifactID,
                 loader: loader
             ), !Task.isCancelled else { return }
-            image = loaded
+            frame = loaded
         }
     }
 }
@@ -421,55 +411,52 @@ private struct ImmersiveArtifactImage: View {
 private final class RecallDecodedImageCache {
     static let shared = RecallDecodedImageCache()
 
-    private let images = NSCache<NSString, NSImage>()
-    private var inFlight: [String: Task<NSImage?, Never>] = [:]
+    private let frames = NSCache<NSString, RecallDisplayFrame>()
+    private var inFlight: [String: Task<RecallDisplayFrame?, Never>] = [:]
     private var pendingPrefetches: [PrefetchRequest] = []
     private var activePrefetches = 0
     private let maximumConcurrentPrefetches = 6
     private var generation: UInt64 = 0
 
     private init() {
-        images.countLimit = 48
-        images.totalCostLimit = 1_536 * 1_024 * 1_024
+        frames.countLimit = 48
+        frames.totalCostLimit = 1_536 * 1_024 * 1_024
     }
 
-    func cached(artifactID: String) -> NSImage? {
-        images.object(forKey: artifactID as NSString)
+    func cached(artifactID: String) -> RecallDisplayFrame? {
+        frames.object(forKey: artifactID as NSString)
     }
 
-    func image(
+    func frame(
         artifactID: String,
         loader: @escaping RecallImageLoader
-    ) async -> NSImage? {
+    ) async -> RecallDisplayFrame? {
         if let cached = cached(artifactID: artifactID) { return cached }
         if let existing = inFlight[artifactID] { return await existing.value }
 
         let requestGeneration = generation
-        let task = Task { @MainActor () -> NSImage? in
+        let task = Task { @MainActor () -> RecallDisplayFrame? in
             guard let data = try? await loader(artifactID) else { return nil }
-            let decoded = await Task.detached(priority: .userInitiated) {
-                Self.decode(data: data)
+            return await Task.detached(priority: .userInitiated) {
+                RecallFrameDecoder.decode(data)
             }.value
-            guard let decoded else { return nil }
-            return NSImage(cgImage: decoded, size: .zero)
         }
         inFlight[artifactID] = task
         let decoded = await task.value
         inFlight[artifactID] = nil
         guard generation == requestGeneration else { return decoded }
         if let decoded {
-            images.setObject(decoded, forKey: artifactID as NSString, cost: estimatedCost(decoded))
+            frames.setObject(decoded, forKey: artifactID as NSString, cost: decoded.cost)
         }
         return decoded
     }
-
 
     func clearSensitiveData() {
         generation &+= 1
         inFlight.values.forEach { $0.cancel() }
         inFlight.removeAll()
         pendingPrefetches.removeAll()
-        images.removeAllObjects()
+        frames.removeAllObjects()
     }
 
     func prefetch(
@@ -496,7 +483,7 @@ private final class RecallDecodedImageCache {
             activePrefetches += 1
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                _ = await image(
+                _ = await frame(
                     artifactID: request.artifactID,
                     loader: request.loader
                 )
@@ -504,17 +491,6 @@ private final class RecallDecodedImageCache {
                 pumpPrefetches()
             }
         }
-    }
-
-    nonisolated private static func decode(data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        let options: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: true]
-        return CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary)
-    }
-
-    private func estimatedCost(_ image: NSImage) -> Int {
-        guard let representation = image.representations.first else { return 1 }
-        return max(representation.pixelsWide * representation.pixelsHigh * 4, 1)
     }
 
     private struct PrefetchRequest {

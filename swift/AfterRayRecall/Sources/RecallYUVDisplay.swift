@@ -1,0 +1,272 @@
+import AppKit
+import CoreMedia
+import CoreVideo
+import ImageIO
+import IOSurface
+import QuartzCore
+import SwiftUI
+import VideoToolbox
+
+struct ArtifactYUVView: NSViewRepresentable {
+    var frame: RecallDisplayFrame?
+
+    func makeNSView(context: Context) -> ArtifactLayerView {
+        ArtifactLayerView()
+    }
+
+    func updateNSView(_ view: ArtifactLayerView, context: Context) {
+        view.display(frame)
+    }
+}
+
+final class ArtifactLayerView: NSView {
+    private var retainedBuffer: CVPixelBuffer?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+        layer?.isOpaque = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.contentsGravity = .resizeAspect
+        layer?.minificationFilter = .linear
+        layer?.magnificationFilter = .linear
+        layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        layer?.contentsScale = window?.backingScaleFactor ?? layer?.contentsScale ?? 2
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        layer?.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    func display(_ frame: RecallDisplayFrame?) {
+        layer?.contentsScale = window?.backingScaleFactor ?? layer?.contentsScale ?? 2
+        if let buffer = frame?.pixelBuffer, let surface = CVPixelBufferGetIOSurface(buffer) {
+            retainedBuffer = buffer
+            layer?.contents = surface
+            return
+        }
+        retainedBuffer = nil
+        if let image = frame?.fallbackImage {
+            layer?.contents = image
+            return
+        }
+        layer?.contents = nil
+    }
+}
+
+final class RecallDisplayFrame: NSObject {
+    let pixelBuffer: CVPixelBuffer?
+    let fallbackImage: CGImage?
+
+    init(pixelBuffer: CVPixelBuffer? = nil, fallbackImage: CGImage? = nil) {
+        self.pixelBuffer = pixelBuffer
+        self.fallbackImage = fallbackImage
+    }
+
+    var cost: Int {
+        if let pixelBuffer {
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            return max(width * height * 3 / 2, 1)
+        }
+        if let fallbackImage {
+            return max(fallbackImage.width * fallbackImage.height * 4, 1)
+        }
+        return 1
+    }
+}
+
+enum RecallFrameDecoder {
+    static func decode(_ data: Data) -> RecallDisplayFrame? {
+        if isJPEG(data), let buffer = RecallJPEGDecoder.shared.decode(data) {
+            return RecallDisplayFrame(pixelBuffer: buffer)
+        }
+        guard let image = decodeWithImageIO(data) else { return nil }
+        return RecallDisplayFrame(fallbackImage: image)
+    }
+
+    static func isJPEG(_ data: Data) -> Bool {
+        data.count >= 3 && data[data.startIndex] == 0xFF
+            && data[data.index(after: data.startIndex)] == 0xD8
+            && data[data.index(data.startIndex, offsetBy: 2)] == 0xFF
+    }
+
+    static func pixelSize(of data: Data) -> (width: Int, height: Int)? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, options),
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+            let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+            let height = properties[kCGImagePropertyPixelHeight] as? NSNumber
+        else { return nil }
+        let size = (width.intValue, height.intValue)
+        guard size.0 > 0, size.1 > 0 else { return nil }
+        return size
+    }
+
+    static func decodeWithImageIO(_ data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+        return CGImageSourceCreateImageAtIndex(source, 0, options)
+    }
+}
+
+final class RecallJPEGDecoder: @unchecked Sendable {
+    static let shared = RecallJPEGDecoder()
+
+    private let lock = NSLock()
+    private var session: VTDecompressionSession?
+    private var format: CMVideoFormatDescription?
+    private var sessionWidth = 0
+    private var sessionHeight = 0
+
+    func decode(_ data: Data) -> CVPixelBuffer? {
+        guard let size = RecallFrameDecoder.pixelSize(of: data) else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard prepareSession(width: size.width, height: size.height) else { return nil }
+        return decodeLocked(data)
+    }
+
+    private func prepareSession(width: Int, height: Int) -> Bool {
+        if session != nil, sessionWidth == width, sessionHeight == height {
+            return true
+        }
+        invalidate()
+        let formats: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_32BGRA,
+        ]
+        for pixelFormat in formats {
+            if let created = makeSession(width: width, height: height, pixelFormat: pixelFormat) {
+                session = created.session
+                format = created.format
+                sessionWidth = width
+                sessionHeight = height
+                return true
+            }
+        }
+        return false
+    }
+
+    private func makeSession(
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) -> (session: VTDecompressionSession, format: CMVideoFormatDescription)? {
+        var format: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_JPEG,
+            width: Int32(width),
+            height: Int32(height),
+            extensions: nil,
+            formatDescriptionOut: &format
+        )
+        guard formatStatus == noErr, let format else { return nil }
+
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: [
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: kCFBooleanTrue as Any,
+            ] as CFDictionary,
+            imageBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+            ] as CFDictionary,
+            outputCallback: nil,
+            decompressionSessionOut: &session
+        )
+        guard status == noErr, let session else { return nil }
+        return (session, format)
+    }
+
+    private func decodeLocked(_ data: Data) -> CVPixelBuffer? {
+        guard let session, let format else { return nil }
+
+        var block: CMBlockBuffer?
+        let createStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: data.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: data.count,
+            flags: 0,
+            blockBufferOut: &block
+        )
+        guard createStatus == noErr, let block else { return nil }
+
+        let replaceStatus = data.withUnsafeBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferReplaceDataBytes(
+                with: base,
+                blockBuffer: block,
+                offsetIntoDestination: 0,
+                dataLength: data.count
+            )
+        }
+        guard replaceStatus == noErr else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: .zero,
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = data.count
+        var sample: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: block,
+            formatDescription: format,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sample
+        )
+        guard sampleStatus == noErr, let sample else { return nil }
+
+        var imageBuffer: CVImageBuffer?
+        var infoFlags = VTDecodeInfoFlags()
+        let decodeStatus = VTDecompressionSessionDecodeFrame(
+            session,
+            sampleBuffer: sample,
+            flags: [],
+            infoFlagsOut: &infoFlags
+        ) { status, _, buffer, _, _ in
+            if status == noErr {
+                imageBuffer = buffer
+            }
+        }
+        guard decodeStatus == noErr else { return nil }
+        return imageBuffer
+    }
+
+    private func invalidate() {
+        if let session {
+            VTDecompressionSessionInvalidate(session)
+        }
+        session = nil
+        format = nil
+        sessionWidth = 0
+        sessionHeight = 0
+    }
+}

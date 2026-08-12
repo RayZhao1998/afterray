@@ -119,8 +119,8 @@ public enum MockArtifactFactory {
 
         guard let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:])
+              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
         else { throw CocoaError(.fileWriteUnknown) }
-        return png
+        return jpeg
     }
 }
