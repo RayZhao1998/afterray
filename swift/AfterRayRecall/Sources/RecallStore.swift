@@ -4,7 +4,8 @@ import Foundation
 public final class RecallStore: ObservableObject {
     @Published public private(set) var sessions: [RecallSession] = []
     @Published public private(set) var moments: [RecallMoment] = []
-    @Published public var selectedIndex: Int = 0
+    @Published public private(set) var playheadMs: Int64 = 0
+    @Published public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .loading
 
     private let daemon: any RecallDaemonServing
@@ -15,8 +16,7 @@ public final class RecallStore: ObservableObject {
     }
 
     public var selectedMoment: RecallMoment? {
-        guard moments.indices.contains(selectedIndex) else { return nil }
-        return moments[selectedIndex]
+        RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
     }
 
     public func loadTimeline(preservingSelection: Bool = false) async {
@@ -37,7 +37,7 @@ public final class RecallStore: ObservableObject {
                 return
             }
             moments = []
-            selectedIndex = 0
+            applyPlayhead(0)
             loadState = .failed(message: error.localizedDescription)
         }
     }
@@ -93,16 +93,21 @@ public final class RecallStore: ObservableObject {
         // continue scrubbing while that request is in flight, and the refresh
         // must preserve their newest position rather than a stale snapshot.
         let preservedMomentID = preservingSelection ? selectedMoment?.id : nil
-        let preservedIndex = selectedIndex
+        let preservedPlayheadMs = playheadMs
         moments = loaded
-        if let targetID = momentID ?? preservedMomentID,
-           let index = loaded.firstIndex(where: { $0.id == targetID })
-        {
-            selectedIndex = index
+        if let targetID = momentID, let moment = loaded.first(where: { $0.id == targetID }) {
+            applyPlayhead(moment.capturedAtMs)
         } else if preservingSelection {
-            selectedIndex = min(max(preservedIndex, 0), max(loaded.count - 1, 0))
+            let bounds = TimelineLayout.timeBounds(moments: loaded)
+            if !loaded.isEmpty, preservedPlayheadMs >= bounds.startMs, preservedPlayheadMs <= bounds.endMs {
+                applyPlayhead(preservedPlayheadMs)
+            } else if let preservedMomentID, let moment = loaded.first(where: { $0.id == preservedMomentID }) {
+                applyPlayhead(moment.capturedAtMs)
+            } else {
+                applyPlayhead(loaded.last?.capturedAtMs ?? 0)
+            }
         } else {
-            selectedIndex = max(loaded.count - 1, 0)
+            applyPlayhead(loaded.last?.capturedAtMs ?? 0)
         }
         loadState = .ready
     }
@@ -122,16 +127,22 @@ public final class RecallStore: ObservableObject {
         }
     }
 
+    public func select(playheadMs ms: Int64) {
+        applyPlayhead(ms)
+    }
+
     public func select(index: Int) {
         guard let index = RecallGeometry.clampedIndex(index, count: moments.count) else { return }
-        selectedIndex = index
+        applyPlayhead(moments[index].capturedAtMs)
     }
 
     public func toggleFavorite() async {
-        guard moments.indices.contains(selectedIndex) else { return }
-        let momentID = moments[selectedIndex].id
-        let previous = moments[selectedIndex].isFavorite
-        moments[selectedIndex].isFavorite.toggle()
+        guard let selected = selectedMoment,
+              let index = moments.firstIndex(where: { $0.id == selected.id })
+        else { return }
+        let momentID = selected.id
+        let previous = selected.isFavorite
+        moments[index].isFavorite.toggle()
         do {
             try await daemon.setFavorite(momentID: momentID, favorite: !previous)
         } catch {
@@ -147,8 +158,13 @@ public final class RecallStore: ObservableObject {
         sensitiveGeneration &+= 1
         sessions = []
         moments = []
-        selectedIndex = 0
+        applyPlayhead(0)
         loadState = .loading
+    }
+
+    private func applyPlayhead(_ ms: Int64) {
+        playheadMs = RecallPlayhead.clamp(ms, moments: moments)
+        selectedIndex = RecallPlayhead.resolveIndex(playheadMs: playheadMs, moments: moments) ?? 0
     }
 
     private static func isDaemonConnectionError(_ error: Error) -> Bool {

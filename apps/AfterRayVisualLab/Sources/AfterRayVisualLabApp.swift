@@ -16,7 +16,7 @@ struct AfterRayVisualLabApp: App {
 
 private struct VisualLabView: View {
     @State private var scenario: RecallScenario = .long
-    @State private var selectedIndex = 12
+    @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
 
@@ -33,7 +33,7 @@ private struct VisualLabView: View {
         HSplitView {
             RecallView(
                 moments: moments,
-                selectedIndex: $selectedIndex,
+                playheadMs: $playheadMs,
                 loadState: scenario.loadState,
                 tuning: tuning,
                 imageLoader: MockArtifactFactory.loader,
@@ -47,7 +47,9 @@ private struct VisualLabView: View {
         }
         .onChange(of: scenario) { _, newScenario in
             favoriteOverrides = []
-            selectedIndex = min(max(newScenario.moments.count / 2, 0), max(newScenario.moments.count - 1, 0))
+            let moments = newScenario.moments
+            let index = min(max(moments.count / 2, 0), max(moments.count - 1, 0))
+            playheadMs = moments.indices.contains(index) ? moments[index].capturedAtMs : 0
         }
     }
 
@@ -88,8 +90,8 @@ private struct VisualLabView: View {
     }
 
     private func toggleFavorite() {
-        guard moments.indices.contains(selectedIndex) else { return }
-        let id = moments[selectedIndex].id
+        guard let selected = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments) else { return }
+        let id = selected.id
         if favoriteOverrides.contains(id) { favoriteOverrides.remove(id) }
         else { favoriteOverrides.insert(id) }
     }

@@ -7,7 +7,7 @@ public typealias RecallArtifactLoader = (String) async throws -> Data
 
 public struct RecallView: View {
     public let moments: [RecallMoment]
-    @Binding public var selectedIndex: Int
+    @Binding public var playheadMs: Int64
     @Binding public var isLive: Bool
     public let loadState: RecallLoadState
     public var tuning: RecallVisualTuning
@@ -17,14 +17,14 @@ public struct RecallView: View {
     public var onToggleAudio: ((RecallMoment) -> Void)?
     public var onReload: (() -> Void)?
 
-    @State private var dragOriginPosition: Int?
-    @State private var scrollAccumulator: CGFloat = 0
+    @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var movementDirection = -1
     @State private var showsDetails = false
+    @State private var timelineViewportWidth: CGFloat = 720
 
     public init(
         moments: [RecallMoment],
-        selectedIndex: Binding<Int>,
+        playheadMs: Binding<Int64>,
         isLive: Binding<Bool> = .constant(false),
         loadState: RecallLoadState = .ready,
         tuning: RecallVisualTuning = .standard,
@@ -35,7 +35,7 @@ public struct RecallView: View {
         onReload: (() -> Void)? = nil
     ) {
         self.moments = moments
-        self._selectedIndex = selectedIndex
+        self._playheadMs = playheadMs
         self._isLive = isLive
         self.loadState = loadState
         self.tuning = tuning
@@ -47,8 +47,15 @@ public struct RecallView: View {
     }
 
     private var selectedMoment: RecallMoment? {
-        guard moments.indices.contains(selectedIndex) else { return nil }
-        return moments[selectedIndex]
+        RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+    }
+
+    private var timelineLayout: TimelineLayout {
+        TimelineLayout(
+            moments: moments,
+            viewportWidth: max(timelineViewportWidth, 1),
+            density: tuning.timelineDensity
+        )
     }
 
     public var body: some View {
@@ -119,11 +126,13 @@ public struct RecallView: View {
                 Spacer(minLength: 100)
 
                 AppUsageTimeline(
-                    moments: moments,
-                    selectedIndex: selectedIndex,
+                    layout: timelineLayout,
+                    playheadMs: playheadMs,
                     isLive: isLive,
+                    selectedMoment: selectedMoment,
                     tuning: tuning,
-                    onSelect: { selectTimeline(position: $0) }
+                    onSelectMs: { selectPlayhead(playheadMs: $0) },
+                    onViewportWidthChange: { timelineViewportWidth = $0 }
                 )
                 .padding(.horizontal, 26)
                 .padding(.bottom, 18)
@@ -146,7 +155,7 @@ public struct RecallView: View {
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
         .animation(.easeOut(duration: 0.18), value: showsDetails)
-        .task(id: "\(selectedIndex):\(movementDirection)") {
+        .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection)") {
             prefetchAroundSelection()
         }
     }
@@ -286,43 +295,43 @@ public struct RecallView: View {
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
-                if dragOriginPosition == nil {
-                    dragOriginPosition = isLive ? moments.count : selectedIndex
+                if dragOrigin == nil {
+                    dragOrigin = (playheadMs, isLive)
                 }
-                guard let origin = dragOriginPosition else { return }
-                let position = RecallGeometry.timelinePosition(
-                    fromDragTranslation: value.translation.width,
-                    originPosition: origin,
-                    momentCount: moments.count,
-                    pointsPerMoment: tuning.dragPointsPerMoment
+                guard let origin = dragOrigin else { return }
+                let scale = 54 / max(tuning.dragPointsPerMoment, 1)
+                let moved = RecallPlayhead.move(
+                    playheadMs: origin.playheadMs,
+                    isLive: origin.isLive,
+                    deltaX: value.translation.width * scale,
+                    layout: timelineLayout
                 )
-                selectTimeline(position: position)
+                selectPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
             }
-            .onEnded { _ in dragOriginPosition = nil }
+            .onEnded { _ in dragOrigin = nil }
     }
 
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
-        if ended {
-            scrollAccumulator = 0
-            return
-        }
-        guard delta != 0 else { return }
-        if isLive, let step = RecallGeometry.liveScrollStep(delta: delta) {
-            moveSelection(by: step)
-            scrollAccumulator = 0
-            return
-        }
+        if ended { return }
+        guard delta != 0, !moments.isEmpty else { return }
         if !isPrecise {
-            moveSelection(by: delta > 0 ? -1 : 1)
+            let stepped = RecallPlayhead.stepMoment(
+                playheadMs: playheadMs,
+                isLive: isLive,
+                delta: delta > 0 ? -1 : 1,
+                moments: moments
+            )
+            selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
             return
         }
 
-        scrollAccumulator += delta
-        let threshold: CGFloat = 10
-        let steps = Int(abs(scrollAccumulator) / threshold)
-        guard steps > 0 else { return }
-        moveSelection(by: scrollAccumulator > 0 ? -steps : steps)
-        scrollAccumulator.formTruncatingRemainder(dividingBy: threshold)
+        let moved = RecallPlayhead.move(
+            playheadMs: playheadMs,
+            isLive: isLive,
+            deltaX: delta,
+            layout: timelineLayout
+        )
+        selectPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
     }
 
     private func handleMoveCommand(_ direction: MoveCommandDirection) {
@@ -334,34 +343,37 @@ public struct RecallView: View {
     }
 
     private func moveSelection(by delta: Int) {
-        guard !moments.isEmpty else { return }
-        let currentPosition = isLive ? moments.count : selectedIndex
-        let nextPosition = min(max(currentPosition + delta, 0), moments.count)
-        selectTimeline(position: nextPosition)
+        let stepped = RecallPlayhead.stepMoment(
+            playheadMs: playheadMs,
+            isLive: isLive,
+            delta: delta,
+            moments: moments
+        )
+        selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
     }
 
-    private func selectTimeline(position: Int) {
+    private func selectPlayhead(playheadMs nextMs: Int64, isLive nextLive: Bool? = nil) {
         guard !moments.isEmpty else { return }
-        let currentPosition = isLive ? moments.count : selectedIndex
+        let layout = timelineLayout
+        let resolvedLive = nextLive ?? (nextMs >= layout.endMs)
+        let clampedMs = resolvedLive
+            ? (moments.last?.capturedAtMs ?? nextMs)
+            : layout.clamp(nextMs)
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            if position != currentPosition {
-                movementDirection = position > currentPosition ? 1 : -1
+            if clampedMs != playheadMs {
+                movementDirection = clampedMs > playheadMs ? 1 : -1
             }
-            if position == moments.count {
-                selectedIndex = moments.count - 1
-                isLive = true
-            } else {
-                selectedIndex = position
-                isLive = false
-            }
+            playheadMs = clampedMs
+            isLive = resolvedLive
         }
     }
 
     private func prefetchAroundSelection() {
         guard !moments.isEmpty else { return }
-        let center = min(max(selectedIndex, 0), moments.count - 1)
+        let center = RecallPlayhead.resolveIndex(playheadMs: playheadMs, moments: moments)
+            ?? moments.count - 1
         var offsets = [0]
         for distance in 1...20 {
             offsets.append(distance * movementDirection)
@@ -381,10 +393,16 @@ public struct RecallView: View {
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
+    @State private var loadedArtifactID: String?
     @State private var frame: RecallDisplayFrame?
 
     var body: some View {
-        let displayed = RecallDecodedImageCache.shared.cached(artifactID: artifactID) ?? frame
+        let displayed = RecallDisplayedFrame.choose(
+            artifactID: artifactID,
+            cached: RecallDecodedImageCache.shared.cached(artifactID: artifactID),
+            loadedID: loadedArtifactID,
+            loadedFrame: frame
+        )
         ZStack {
             ArtifactYUVView(frame: displayed)
             if displayed == nil {
@@ -395,6 +413,7 @@ private struct ImmersiveArtifactImage: View {
         .allowsHitTesting(false)
         .task(id: artifactID) {
             if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
+                loadedArtifactID = artifactID
                 frame = cached
                 return
             }
@@ -402,6 +421,7 @@ private struct ImmersiveArtifactImage: View {
                 artifactID: artifactID,
                 loader: loader
             ), !Task.isCancelled else { return }
+            loadedArtifactID = artifactID
             frame = loaded
         }
     }
@@ -530,38 +550,23 @@ private struct AppIdentity: View {
 }
 
 private struct AppUsageTimeline: View {
-    let moments: [RecallMoment]
-    let selectedIndex: Int
+    let layout: TimelineLayout
+    let playheadMs: Int64
     let isLive: Bool
+    let selectedMoment: RecallMoment?
     let tuning: RecallVisualTuning
-    let onSelect: (Int) -> Void
-    @State private var model: TimelineModel
-
-    init(
-        moments: [RecallMoment],
-        selectedIndex: Int,
-        isLive: Bool,
-        tuning: RecallVisualTuning,
-        onSelect: @escaping (Int) -> Void
-    ) {
-        self.moments = moments
-        self.selectedIndex = selectedIndex
-        self.isLive = isLive
-        self.tuning = tuning
-        self.onSelect = onSelect
-        _model = State(initialValue: TimelineModel(moments: moments))
-    }
+    let onSelectMs: (Int64) -> Void
+    let onViewportWidthChange: (CGFloat) -> Void
 
     var body: some View {
         VStack(spacing: 9) {
             timestamp
             GeometryReader { geometry in
                 let width = geometry.size.width
-                let contentWidth = model.contentWidth(for: width, density: tuning.timelineDensity)
-                let selectedX = model.x(forMomentAt: selectedIndex, width: contentWidth)
+                let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
 
                 ZStack(alignment: .leading) {
-                    timelineTrack(width: contentWidth)
+                    timelineTrack
                         .offset(x: width / 2 - selectedX)
 
                     edgeFade
@@ -573,6 +578,10 @@ private struct AppUsageTimeline: View {
                         .shadow(color: RecallPalette.ray.opacity(0.9), radius: 7)
                 }
                 .clipped()
+                .onAppear { onViewportWidthChange(width) }
+                .onChange(of: width) { _, newWidth in
+                    onViewportWidthChange(newWidth)
+                }
             }
             .frame(height: tuning.timelineSegmentHeight + 20)
 
@@ -583,13 +592,6 @@ private struct AppUsageTimeline: View {
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
         }
-        .onChange(of: momentsRevision) {
-            model = TimelineModel(moments: moments)
-        }
-    }
-
-    private var momentsRevision: String {
-        "\(moments.count):\(moments.first?.id ?? "-"):\(moments.last?.id ?? "-")"
     }
 
     private var timestamp: some View {
@@ -619,41 +621,43 @@ private struct AppUsageTimeline: View {
     }
 
     private var selectedDate: Date {
-        guard moments.indices.contains(selectedIndex) else { return .now }
-        return Date(timeIntervalSince1970: TimeInterval(moments[selectedIndex].capturedAtMs) / 1_000)
+        let ms = selectedMoment?.capturedAtMs ?? playheadMs
+        return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
     }
 
-    private func timelineTrack(width: CGFloat) -> some View {
+    private var timelineTrack: some View {
         ZStack(alignment: .leading) {
-            HStack(spacing: tuning.timelineSegmentGap) {
-                ForEach(model.runs) { run in
-                    let runWidth = model.width(
-                        for: run,
-                        contentWidth: width,
-                        segmentGap: tuning.timelineSegmentGap
+            HStack(spacing: 0) {
+                ForEach(Array(layout.runs.enumerated()), id: \.element.id) { index, run in
+                    let drawnWidth = max(
+                        run.width - (index == layout.runs.count - 1 ? 0 : tuning.timelineSegmentGap),
+                        1
                     )
-                    Button { onSelect(run.centerIndex) } label: {
-                        AppUsageSegmentView(
-                            run: run,
-                            width: runWidth,
-                            height: tuning.timelineSegmentHeight
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .frame(width: runWidth)
-                    .help("\(run.applicationName) · \(run.durationLabel)")
+                    AppUsageSegmentView(
+                        run: run,
+                        width: drawnWidth,
+                        height: tuning.timelineSegmentHeight
+                    )
+                    .frame(width: run.width, alignment: .leading)
+                    .help("\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))")
                 }
             }
-            .frame(width: width, alignment: .leading)
+            .frame(width: layout.contentWidth, alignment: .leading)
+            .contentShape(Rectangle())
+            .gesture(
+                SpatialTapGesture().onEnded { value in
+                    onSelectMs(layout.ms(x: value.location.x))
+                }
+            )
 
-            ForEach(Array(moments.enumerated()).filter(\.element.isFavorite), id: \.element.id) { index, _ in
+            ForEach(layout.moments.filter(\.isFavorite), id: \.id) { moment in
                 Image(systemName: "star.fill")
                     .font(.system(size: 7, weight: .bold))
                     .foregroundStyle(.white)
-                    .position(x: model.x(forMomentAt: index, width: width), y: 2)
+                    .position(x: layout.x(ms: moment.capturedAtMs), y: 2)
             }
         }
-        .frame(width: width, height: 56)
+        .frame(width: layout.contentWidth, height: 56)
         .padding(.vertical, 6)
     }
 
@@ -674,12 +678,16 @@ private struct AppUsageSegmentView: View {
     let width: CGFloat
     let height: Double
 
+    private var color: Color {
+        RecallPalette.appColor(seed: run.bundleIdentifier ?? run.applicationName)
+    }
+
     var body: some View {
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(
                     LinearGradient(
-                        colors: [run.color.opacity(0.92), run.color.opacity(0.62)],
+                        colors: [color.opacity(0.92), color.opacity(0.62)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -697,7 +705,7 @@ private struct AppUsageSegmentView: View {
                             Text(run.applicationName)
                                 .font(.system(size: 10, weight: .semibold, design: .rounded))
                                 .lineLimit(1)
-                            Text(run.durationLabel)
+                            Text(DurationFormatter.short(milliseconds: run.durationMs))
                                 .font(.system(size: 9, weight: .medium, design: .rounded))
                                 .foregroundStyle(.white.opacity(0.66))
                                 .monospacedDigit()
@@ -740,88 +748,6 @@ private struct ApplicationIcon: View {
             let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
         else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
-    }
-}
-
-private struct AppUsageRun: Identifiable {
-    let id: Int
-    let applicationName: String
-    let bundleIdentifier: String?
-    let startMs: Int64
-    let endMs: Int64
-    let startIndex: Int
-    let endIndex: Int
-    let color: Color
-
-    var centerIndex: Int { startIndex + (endIndex - startIndex) / 2 }
-    var durationMs: Int64 { max(endMs - startMs, 1_000) }
-    var durationLabel: String { DurationFormatter.short(milliseconds: durationMs) }
-}
-
-private struct TimelineModel {
-    let moments: [RecallMoment]
-    let runs: [AppUsageRun]
-    let startMs: Int64
-    let endMs: Int64
-
-    init(moments: [RecallMoment]) {
-        self.moments = moments
-        guard let first = moments.first, let last = moments.last else {
-            runs = []
-            startMs = 0
-            endMs = 1
-            return
-        }
-
-        let intervals = zip(moments, moments.dropFirst())
-            .map { max($1.capturedAtMs - $0.capturedAtMs, 1_000) }
-            .sorted()
-        let trailingInterval = intervals.isEmpty ? 10_000 : intervals[intervals.count / 2]
-        startMs = first.capturedAtMs
-        endMs = last.capturedAtMs + min(trailingInterval, 60_000)
-
-        var collected: [AppUsageRun] = []
-        var runStart = 0
-        for index in 1...moments.count {
-            let endsRun = index == moments.count || Self.identity(of: moments[index]) != Self.identity(of: moments[runStart])
-            guard endsRun else { continue }
-            let runEndMs = index < moments.count ? moments[index].capturedAtMs : endMs
-            let identity = Self.identity(of: moments[runStart])
-            collected.append(
-                AppUsageRun(
-                    id: collected.count,
-                    applicationName: identity.name,
-                    bundleIdentifier: identity.bundle,
-                    startMs: moments[runStart].capturedAtMs,
-                    endMs: runEndMs,
-                    startIndex: runStart,
-                    endIndex: index - 1,
-                    color: RecallPalette.appColor(seed: identity.bundle ?? identity.name)
-                )
-            )
-            runStart = index
-        }
-        runs = collected
-    }
-
-    func contentWidth(for viewportWidth: CGFloat, density: Double) -> CGFloat {
-        let seconds = CGFloat(max(endMs - startMs, 1)) / 1_000
-        return max(viewportWidth * 1.18, min(seconds * density, 9_000))
-    }
-
-    func width(for run: AppUsageRun, contentWidth: CGFloat, segmentGap: Double) -> CGFloat {
-        let fraction = CGFloat(run.durationMs) / CGFloat(max(endMs - startMs, 1))
-        return max(contentWidth * fraction - segmentGap, 5)
-    }
-
-    func x(forMomentAt index: Int, width: CGFloat) -> CGFloat {
-        guard moments.indices.contains(index) else { return 0 }
-        let elapsed = moments[index].capturedAtMs - startMs
-        return width * CGFloat(elapsed) / CGFloat(max(endMs - startMs, 1))
-    }
-
-    private static func identity(of moment: RecallMoment) -> (name: String, bundle: String?) {
-        (moment.applicationName ?? "Unknown app", moment.bundleIdentifier)
     }
 }
 

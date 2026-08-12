@@ -509,9 +509,9 @@ private struct AfterRayRootView: View {
     var body: some View {
         RecallView(
             moments: store.moments,
-            selectedIndex: Binding(
-                get: { store.selectedIndex },
-                set: { store.select(index: $0) }
+            playheadMs: Binding(
+                get: { store.playheadMs },
+                set: { store.select(playheadMs: $0) }
             ),
             isLive: $isLive,
             loadState: store.loadState,

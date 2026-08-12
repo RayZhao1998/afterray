@@ -78,6 +78,23 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
         XCTAssertEqual(store.selectedMoment?.id, "m2")
     }
+
+    func testRefreshPreservesPlayheadBetweenMoments() async {
+        let daemon = RefreshingDaemon()
+        let store = RecallStore(daemon: daemon)
+        await store.loadTimeline()
+
+        store.select(playheadMs: 150)
+        XCTAssertEqual(store.playheadMs, 150)
+        XCTAssertEqual(store.selectedMoment?.id, "m1")
+
+        await daemon.appendMoment(id: "m3", capturedAtMs: 300)
+        await store.refreshTimeline(preservingSelection: true)
+
+        XCTAssertEqual(store.playheadMs, 150)
+        XCTAssertEqual(store.selectedMoment?.id, "m1")
+        XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
+    }
 }
 
 private actor RefreshingDaemon: RecallDaemonServing {
