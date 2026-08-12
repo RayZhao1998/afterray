@@ -1,0 +1,615 @@
+use afterray_models::{
+    JobState, ModelInput, ModelOutput, ModelQueue, QueueConfig, worker_adapters,
+};
+use afterray_platform_macos::{ArtifactKind, CaptureConfig, CaptureEvent, MacOsCaptureBackend};
+use afterray_protocol::{PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit, Status};
+use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
+use anyhow::Context;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+    sync::Mutex,
+    task::JoinHandle,
+};
+use uuid::Uuid;
+
+fn default_socket_path() -> PathBuf {
+    std::env::var_os("AFTERRAY_SOCKET").map_or_else(
+        || std::env::temp_dir().join("afterray-v0.sock"),
+        PathBuf::from,
+    )
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let socket = default_socket_path();
+    if socket.exists() {
+        std::fs::remove_file(&socket).context("remove stale daemon socket")?;
+    }
+    let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
+
+    let mut vault_config = VaultConfig::default();
+    if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
+        vault_config.data_dir = PathBuf::from(path);
+    }
+    if let Ok(value) = std::env::var("AFTERRAY_MAX_UNSTARRED_MOMENTS") {
+        vault_config.max_unstarred_moments = value.parse().context("invalid retention limit")?;
+    }
+    let staging_dir = vault_config.data_dir.join("capture-staging");
+    let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
+
+    let shim_path = std::env::var_os("AFTERRAY_CAPTURE_SHIM").map_or_else(
+        || PathBuf::from("apps/AfterRayCaptureShim/.build/debug/AfterRayCaptureShim"),
+        PathBuf::from,
+    );
+    let capture = MacOsCaptureBackend::new(CaptureConfig::new(shim_path, staging_dir));
+
+    let worker_path = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
+        || PathBuf::from("scripts/download-models/afterray_model_worker.py"),
+        PathBuf::from,
+    );
+    let models = ModelQueue::new(worker_adapters(worker_path), QueueConfig::default())?;
+
+    let state = Arc::new(AppState {
+        store,
+        capture,
+        models,
+        recording: Mutex::new(RecordingRuntime::default()),
+        capture_interval: Duration::from_secs(
+            std::env::var("AFTERRAY_CAPTURE_INTERVAL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10),
+        ),
+    });
+    println!("afterrayd listening on {}", socket.display());
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(error) = handle(stream, state).await {
+                eprintln!("client error: {error:#}");
+            }
+        });
+    }
+}
+
+struct AppState {
+    store: Arc<Vault>,
+    capture: Arc<MacOsCaptureBackend>,
+    models: ModelQueue,
+    recording: Mutex<RecordingRuntime>,
+    capture_interval: Duration,
+}
+
+#[derive(Default)]
+struct RecordingRuntime {
+    active_session_id: Option<String>,
+    scheduler: Option<JoinHandle<()>>,
+    event_consumer: Option<JoinHandle<()>>,
+}
+
+async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> {
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    while let Some(line) = lines.next_line().await? {
+        let response = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => dispatch(request, &state).await,
+            Err(error) => Response::failure(format!("invalid request: {error}")),
+        };
+        let mut encoded = serde_json::to_vec(&response)?;
+        encoded.push(b'\n');
+        write.write_all(&encoded).await?;
+    }
+    Ok(())
+}
+
+async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
+    match request {
+        Request::Ping => Response::success(serde_json::json!({"pong": true})),
+        Request::Status => {
+            let active_session_id = state.recording.lock().await.active_session_id.clone();
+            Response::success(Status {
+                daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                schema_version: afterray_store::SCHEMA_VERSION,
+                recording_state: if active_session_id.is_some() {
+                    RecordingState::Recording
+                } else {
+                    RecordingState::Idle
+                },
+                active_session_id,
+            })
+        }
+        Request::RecordStart => record_start(state).await,
+        Request::RecordStop => record_stop(state).await,
+        Request::SessionsList => into_response(state.store.sessions_sync()),
+        Request::MomentsList { session_id } => into_response(state.store.moments_sync(&session_id)),
+        Request::RecallWindow {
+            session_id,
+            center_ms,
+            limit,
+        } => match state.store.moments_sync(&session_id) {
+            Ok(mut moments) => {
+                moments.sort_by_key(|moment| moment.captured_at_ms.abs_diff(center_ms));
+                moments.truncate(limit.clamp(1, 500));
+                moments.sort_by_key(|moment| moment.captured_at_ms);
+                Response::success(moments)
+            }
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::ReadArtifact { artifact_id } => {
+            into_response(state.store.read_artifact(&artifact_id))
+        }
+        Request::FavoriteSet {
+            moment_id,
+            favorite,
+        } => match state.store.set_favorite(&moment_id, favorite) {
+            Ok(()) => Response::success(
+                serde_json::json!({"moment_id": moment_id, "is_favorite": favorite}),
+            ),
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::Search { query, limit } => {
+            match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
+                Ok(hits) => Response::success(hits),
+                Err(error) => Response::failure(error.to_string()),
+            }
+        }
+        Request::ModelsStatus => Response::success(model_status()),
+        Request::JobsList => Response::success(state.models.list().await),
+        Request::JobRetry { job_id } => match state.models.retry(&job_id).await {
+            Ok(snapshot) => Response::success(snapshot),
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::Summarize { session_id } => summarize(state, &session_id).await,
+    }
+}
+
+async fn record_start(state: &Arc<AppState>) -> Response {
+    let mut recording = state.recording.lock().await;
+    if let Some(id) = &recording.active_session_id {
+        return Response::success(serde_json::json!({"session_id": id, "already_recording": true}));
+    }
+    let session = match state.store.create_session_sync(now_ms()) {
+        Ok(session) => session,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    if let Err(error) = state.capture.start_capture().await {
+        let _ = state.store.end_session_sync(&session.id, now_ms());
+        return Response::failure(error.to_string());
+    }
+
+    let capture = Arc::clone(&state.capture);
+    let interval = state.capture_interval;
+    let scheduler = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        loop {
+            timer.tick().await;
+            let request_id = Uuid::now_v7().to_string();
+            if let Err(error) = capture.capture_screen(&request_id).await {
+                eprintln!("capture request failed: {error}");
+                break;
+            }
+        }
+    });
+
+    let event_state = Arc::clone(state);
+    let session_id = session.id.clone();
+    let event_consumer = tokio::spawn(async move {
+        consume_capture_events(event_state, session_id).await;
+    });
+    recording.active_session_id = Some(session.id.clone());
+    recording.scheduler = Some(scheduler);
+    recording.event_consumer = Some(event_consumer);
+    Response::success(serde_json::json!({"session": session}))
+}
+
+async fn record_stop(state: &Arc<AppState>) -> Response {
+    let (session_id, scheduler, consumer) = {
+        let mut recording = state.recording.lock().await;
+        let Some(session_id) = recording.active_session_id.take() else {
+            return Response::success(serde_json::json!({"already_stopped": true}));
+        };
+        (
+            session_id,
+            recording.scheduler.take(),
+            recording.event_consumer.take(),
+        )
+    };
+    if let Some(scheduler) = scheduler {
+        scheduler.abort();
+    }
+    if let Err(error) = state.capture.stop_capture().await {
+        return Response::failure(error.to_string());
+    }
+    if let Some(consumer) = consumer {
+        let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
+    }
+    match state.store.end_session_sync(&session_id, now_ms()) {
+        Ok(()) => Response::success(serde_json::json!({"session_id": session_id})),
+        Err(error) => Response::failure(error.to_string()),
+    }
+}
+
+async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
+    while let Some(event) = state.capture.next_event().await {
+        match event {
+            Ok(CaptureEvent::Ready { .. }) => {}
+            Ok(CaptureEvent::Artifact {
+                kind,
+                path,
+                content_type,
+                started_at_ms,
+                ended_at_ms,
+                ..
+            }) => {
+                let result = import_artifact(
+                    &state,
+                    &session_id,
+                    kind,
+                    &path,
+                    &content_type,
+                    started_at_ms,
+                    ended_at_ms,
+                )
+                .await;
+                if let Err(error) = result {
+                    eprintln!("capture artifact import failed: {error:#}");
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+            }
+            Ok(CaptureEvent::Warning { code, message }) => {
+                eprintln!("capture warning [{code}]: {message}");
+            }
+            Ok(CaptureEvent::Failed { code, message }) => {
+                eprintln!("capture failed [{code}]: {message}");
+                break;
+            }
+            Ok(CaptureEvent::Stopped) | Err(_) => break,
+        }
+    }
+}
+
+async fn import_artifact(
+    state: &Arc<AppState>,
+    session_id: &str,
+    kind: ArtifactKind,
+    path: &Path,
+    content_type: &str,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+) -> anyhow::Result<()> {
+    let bytes = tokio::fs::read(path).await?;
+    match kind {
+        ArtifactKind::Screen => {
+            let moment =
+                state
+                    .store
+                    .insert_moment(session_id, started_at_ms, content_type, &bytes)?;
+            let job = state
+                .models
+                .submit(ModelInput::Ocr {
+                    image_path: path.to_path_buf(),
+                    prompt: None,
+                })
+                .await?;
+            let model_state = Arc::clone(state);
+            let path = path.to_path_buf();
+            tokio::spawn(async move {
+                let snapshot = model_state.models.wait(&job).await;
+                if let Ok(snapshot) = snapshot
+                    && let Some(ModelOutput::Ocr { text }) = snapshot.output
+                    && let Ok(evidence_id) = model_state.store.insert_text_evidence(
+                        &moment.session_id,
+                        Some(&moment.id),
+                        None,
+                        "ocr",
+                        &text,
+                        moment.captured_at_ms,
+                        None,
+                        &snapshot.adapter,
+                    )
+                {
+                    submit_embedding(&model_state, evidence_id, text).await;
+                }
+                let _ = tokio::fs::remove_file(path).await;
+            });
+        }
+        ArtifactKind::SystemAudio | ArtifactKind::Microphone => {
+            let track = match kind {
+                ArtifactKind::Microphone => afterray_protocol::AudioTrack::Microphone,
+                ArtifactKind::SystemAudio | ArtifactKind::Screen => {
+                    afterray_protocol::AudioTrack::System
+                }
+            };
+            let segment = state.store.insert_audio_segment(
+                session_id,
+                track,
+                started_at_ms,
+                ended_at_ms,
+                content_type,
+                &bytes,
+            )?;
+            let job = state
+                .models
+                .submit(ModelInput::Asr {
+                    audio_path: path.to_path_buf(),
+                    language: None,
+                })
+                .await?;
+            let model_state = Arc::clone(state);
+            let path = path.to_path_buf();
+            tokio::spawn(async move {
+                let snapshot = model_state.models.wait(&job).await;
+                if let Ok(snapshot) = snapshot
+                    && let Some(ModelOutput::Asr { text, .. }) = snapshot.output
+                    && let Ok(evidence_id) = model_state.store.insert_text_evidence(
+                        &segment.session_id,
+                        None,
+                        Some(&segment.id),
+                        "transcript",
+                        &text,
+                        segment.started_at_ms,
+                        Some(segment.ended_at_ms),
+                        &snapshot.adapter,
+                    )
+                {
+                    submit_embedding(&model_state, evidence_id, text).await;
+                }
+                let _ = tokio::fs::remove_file(path).await;
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {
+    let Ok(job_id) = state.models.submit(ModelInput::Embedding { text }).await else {
+        return;
+    };
+    let Ok(snapshot) = state.models.wait(&job_id).await else {
+        return;
+    };
+    if snapshot.state == JobState::Done
+        && let Some(ModelOutput::Embedding { vector }) = snapshot.output
+    {
+        let _ = state
+            .store
+            .insert_embedding(&evidence_id, &vector, &snapshot.adapter);
+    }
+}
+
+async fn search_hits(
+    store: &Vault,
+    models: &ModelQueue,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, StoreError> {
+    let candidate_limit = limit.saturating_mul(4).clamp(limit, 400);
+    let full_text = store.search(query, candidate_limit)?;
+    let job_id = match models
+        .submit(ModelInput::Embedding {
+            text: query.to_owned(),
+        })
+        .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            eprintln!("semantic search unavailable; returning FTS results: {error}");
+            return Ok(limit_hits(full_text, limit));
+        }
+    };
+    let snapshot = match models.wait(&job_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "semantic search job {job_id} could not be read; returning FTS results: {error}"
+            );
+            return Ok(limit_hits(full_text, limit));
+        }
+    };
+    let ModelOutput::Embedding { vector } = (match snapshot.output {
+        Some(output) if snapshot.state == JobState::Done => output,
+        _ => {
+            eprintln!(
+                "semantic search job {job_id} did not complete; returning FTS results: {}",
+                snapshot
+                    .last_error
+                    .unwrap_or_else(|| format!("state was {:?}", snapshot.state))
+            );
+            return Ok(limit_hits(full_text, limit));
+        }
+    }) else {
+        eprintln!(
+            "semantic search job {job_id} returned the wrong output type; returning FTS results"
+        );
+        return Ok(limit_hits(full_text, limit));
+    };
+    let semantic = match store.semantic_search(&vector, &snapshot.adapter, candidate_limit) {
+        Ok(hits) => hits,
+        Err(error) => {
+            eprintln!("semantic search scoring failed; returning FTS results: {error}");
+            return Ok(limit_hits(full_text, limit));
+        }
+    };
+    Ok(fuse_search_results(full_text, semantic, limit))
+}
+
+fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    hits.truncate(limit);
+    hits
+}
+
+async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
+    let text = match state.store.session_text(session_id) {
+        Ok(text) if !text.is_empty() => text,
+        Ok(_) => return Response::failure("the session has no OCR or transcript evidence yet"),
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    let prompt =
+        format!("Summarize this local computer activity with concrete evidence:\n\n{text}");
+    let job_id = match state
+        .models
+        .submit(ModelInput::Llm {
+            prompt,
+            system: Some(
+                "You are AfterRay. Be concise and never invent missing evidence.".to_owned(),
+            ),
+        })
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    match state.models.wait(&job_id).await {
+        Ok(snapshot) if snapshot.state == JobState::Done => Response::success(snapshot),
+        Ok(snapshot) => Response::failure(
+            snapshot
+                .last_error
+                .unwrap_or_else(|| "summary job did not complete".to_owned()),
+        ),
+        Err(error) => Response::failure(error.to_string()),
+    }
+}
+
+fn model_status() -> serde_json::Value {
+    serde_json::json!({
+        "worker": std::env::var("AFTERRAY_MODEL_WORKER")
+            .unwrap_or_else(|_| "scripts/download-models/afterray_model_worker.py".to_owned()),
+        "ollama_url": std::env::var("AFTERRAY_OLLAMA_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned()),
+        "capabilities": ["ocr", "asr", "embedding", "llm"]
+    })
+}
+
+fn into_response<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Response {
+    match result {
+        Ok(data) => Response::success(data),
+        Err(error) => Response::failure(error.to_string()),
+    }
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
+
+    fn test_vault() -> (tempfile::TempDir, Vault) {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                max_unstarred_moments: 100,
+            },
+            [9_u8; 32],
+        )
+        .unwrap();
+        (directory, vault)
+    }
+
+    fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {
+        ModelQueue::new(adapters, QueueConfig::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_returns_fts_when_embedding_adapter_is_unavailable() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "needle in local memory",
+                1,
+                None,
+                "ocr-model",
+            )
+            .unwrap();
+
+        let hits = search_hits(&vault, &queue(Vec::new()), "needle", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "needle in local memory");
+    }
+
+    #[tokio::test]
+    async fn search_embeds_query_and_fuses_semantic_results() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let exact_id = vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "needle exact words",
+                1,
+                None,
+                "ocr-model",
+            )
+            .unwrap();
+        let semantic_id = vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "conceptual local context",
+                2,
+                None,
+                "ocr-model",
+            )
+            .unwrap();
+        vault
+            .insert_embedding(&exact_id, &[0.0, 1.0], "test-embedding")
+            .unwrap();
+        vault
+            .insert_embedding(&semantic_id, &[1.0, 0.0], "test-embedding")
+            .unwrap();
+
+        let script = r#"
+import json, sys
+json.load(sys.stdin)
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "embedding", "vector": [1.0, 0.0]},
+  "retryable": False
+}))
+"#;
+        let mut config = ProcessAdapterConfig::new(
+            "test-embedding",
+            ModelCapability::Embedding,
+            "/usr/bin/python3",
+        );
+        config.args = vec!["-c".to_owned(), script.to_owned()];
+        let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
+        let hits = search_hits(&vault, &models, "needle", 10).await.unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.text == "needle exact words"));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.text == "conceptual local context")
+        );
+    }
+}

@@ -1,0 +1,11 @@
+/target/
+/.build/
+**/.build/
+/.swiftpm/
+/DerivedData/
+/.afterray-dev/
+/.afterray/
+*.xcuserstate
+.DS_Store
+__pycache__/
+*.pyc

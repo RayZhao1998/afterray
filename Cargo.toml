@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/afterray-protocol",
+  "crates/afterray-core",
+  "crates/afterray-store",
+  "crates/afterray-models",
+  "crates/afterray-platform-macos",
+  "crates/afterrayd",
+  "crates/afterray-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Proprietary"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1.8"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6.0"
+rand = "0.9"
+rusqlite = { version = "0.38", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["full"] }
+uuid = { version = "1.20", features = ["v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

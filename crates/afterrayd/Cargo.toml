@@ -1,0 +1,24 @@
+[package]
+name = "afterrayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+afterray-models = { path = "../afterray-models" }
+afterray-platform-macos = { path = "../afterray-platform-macos" }
+afterray-protocol = { path = "../afterray-protocol" }
+afterray-store = { path = "../afterray-store" }
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true
