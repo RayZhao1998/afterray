@@ -7,7 +7,7 @@ struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        Window("AfterRay", id: "recall") {
             AfterRayRootView()
                 .frame(minWidth: 900, minHeight: 620)
         }
@@ -20,6 +20,87 @@ struct AfterRayApp: App {
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_: Notification) {
         DaemonSupervisor.shared.stop()
+    }
+}
+
+@MainActor
+private final class AutomaticFullscreenController {
+    static let shared = AutomaticFullscreenController()
+
+    private weak var window: NSWindow?
+    private var windowWaiters: [CheckedContinuation<NSWindow, Never>] = []
+    private var entryContinuation: CheckedContinuation<Void, Never>?
+    private var entryObserver: NSObjectProtocol?
+    private var didRequestEntry = false
+
+    func register(window: NSWindow) {
+        guard self.window !== window else { return }
+        self.window = window
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = false
+
+        let waiters = windowWaiters
+        windowWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: window) }
+    }
+
+    func enterOnce() async {
+        let window = await resolveWindow()
+        guard !didRequestEntry else { return }
+        didRequestEntry = true
+        guard !window.styleMask.contains(.fullScreen) else { return }
+
+        await withCheckedContinuation { continuation in
+            entryContinuation = continuation
+            entryObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didEnterFullScreenNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.finishEntry() }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                self?.finishEntry()
+            }
+            window.toggleFullScreen(nil)
+        }
+    }
+
+    private func resolveWindow() async -> NSWindow {
+        if let window { return window }
+        return await withCheckedContinuation { continuation in
+            windowWaiters.append(continuation)
+        }
+    }
+
+    private func finishEntry() {
+        if let entryObserver {
+            NotificationCenter.default.removeObserver(entryObserver)
+            self.entryObserver = nil
+        }
+        entryContinuation?.resume()
+        entryContinuation = nil
+    }
+}
+
+private struct AutomaticFullscreenProbe: NSViewRepresentable {
+    func makeNSView(context _: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        registerWindow(from: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context _: Context) {
+        registerWindow(from: nsView)
+    }
+
+    private func registerWindow(from view: NSView) {
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            AutomaticFullscreenController.shared.register(window: window)
+        }
     }
 }
 
@@ -63,6 +144,7 @@ private struct AfterRayRootView: View {
             onReload: reload
         )
         .background(Color(red: 0.025, green: 0.022, blue: 0.026))
+        .background(AutomaticFullscreenProbe())
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
@@ -91,6 +173,7 @@ private struct AfterRayRootView: View {
             }
         }
         .task {
+            await AutomaticFullscreenController.shared.enterOnce()
             await bootstrap()
         }
         .task(id: control.status?.recordingState) {
