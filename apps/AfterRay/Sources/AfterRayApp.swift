@@ -198,13 +198,17 @@ private final class PermissionGuideController {
 
     private let panelSize = NSSize(width: 392, height: 214)
     private var panel: PermissionGuidePanel?
+    private var permissionPollTask: Task<Void, Never>?
 
     var isVisible: Bool { panel?.isVisible == true }
 
     func show(for permission: RequiredPermission) {
         let panel = panel ?? makePanel()
         let hostingView = NSHostingView(
-            rootView: PermissionDropGuide(permission: permission)
+            rootView: PermissionDropGuide(
+                permission: permission,
+                onDismiss: { [weak self] in self?.hide() }
+            )
                 .frame(width: panelSize.width, height: panelSize.height)
         )
         hostingView.frame = NSRect(origin: .zero, size: panelSize)
@@ -225,6 +229,7 @@ private final class PermissionGuideController {
             context.duration = 0.14
             panel.animator().alphaValue = 1
         }
+        monitorPermission(permission)
     }
 
     func showAfterOpeningSettings(for permission: RequiredPermission) {
@@ -235,6 +240,8 @@ private final class PermissionGuideController {
     }
 
     func hide() {
+        permissionPollTask?.cancel()
+        permissionPollTask = nil
         guard let panel, panel.isVisible else { return }
         panel.orderOut(nil)
         panel.alphaValue = 1
@@ -256,7 +263,8 @@ private final class PermissionGuideController {
         panel.hasShadow = true
         panel.isFloatingPanel = false
         panel.hidesOnDeactivate = false
-        panel.canHide = false
+        panel.canHide = true
+        panel.becomesKeyOnlyIfNeeded = true
         panel.isReleasedWhenClosed = false
         panel.level = .statusBar
         panel.collectionBehavior = [
@@ -269,6 +277,20 @@ private final class PermissionGuideController {
         return panel
     }
 
+    private func monitorPermission(_ permission: RequiredPermission) {
+        permissionPollTask?.cancel()
+        permissionPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(600))
+                guard !Task.isCancelled, self?.panel?.isVisible == true else { return }
+                if permission.isGrantedNow {
+                    self?.hide()
+                    return
+                }
+            }
+        }
+    }
+
     private var targetScreen: NSScreen {
         let mouseLocation = NSEvent.mouseLocation
         return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
@@ -279,6 +301,7 @@ private final class PermissionGuideController {
 
 private struct PermissionDropGuide: View {
     let permission: RequiredPermission
+    let onDismiss: () -> Void
 
     private var applicationURL: URL { Bundle.main.bundleURL }
 
@@ -299,6 +322,18 @@ private struct PermissionDropGuide: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Spacer(minLength: 4)
+
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                        .background(.white.opacity(0.08), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.72))
+                .help("Dismiss")
             }
 
             HStack(spacing: 12) {

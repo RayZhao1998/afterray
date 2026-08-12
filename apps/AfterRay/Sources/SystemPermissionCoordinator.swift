@@ -123,4 +123,15 @@ enum RequiredPermission: String, CaseIterable, Identifiable {
         case .accessibility: "accessibility"
         }
     }
+
+    var isGrantedNow: Bool {
+        switch self {
+        case .screenRecording:
+            CGPreflightScreenCaptureAccess()
+        case .microphone:
+            AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        case .accessibility:
+            AXIsProcessTrusted()
+        }
+    }
 }
