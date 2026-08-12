@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::{collections::HashMap, fs, path::PathBuf, process::Command, sync::Mutex};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const KEYCHAIN_SERVICE: &str = "dev.afterray.v0.vault";
 
@@ -200,7 +200,8 @@ impl Vault {
                         AND audio.ended_at_ms >= m.captured_at_ms - 30000
                       ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
                         audio.started_at_ms DESC
-                      LIMIT 1)
+                      LIMIT 1),
+                    m.accessibility_artifact_id
              FROM moments m WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
         )?;
         let rows = statement.query_map([session_id], moment_from_row)?;
@@ -224,6 +225,7 @@ impl Vault {
             ocr_text: None,
             transcript_text: None,
             audio_artifact_id: None,
+            accessibility_artifact_id: None,
         };
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO moments (id, session_id, captured_at_ms, image_artifact_id, is_favorite)
@@ -275,6 +277,67 @@ impl Vault {
             ],
         )?;
         Ok(segment)
+    }
+
+    pub fn attach_accessibility_snapshot(
+        &self,
+        session_id: &str,
+        captured_at_ms: i64,
+        content_type: &str,
+        snapshot: &[u8],
+    ) -> Result<Option<String>, StoreError> {
+        let candidate = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, captured_at_ms, accessibility_artifact_id
+                   FROM moments
+                  WHERE session_id = ?1
+                  ORDER BY ABS(captured_at_ms - ?2), captured_at_ms DESC
+                  LIMIT 1",
+                params![session_id, captured_at_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((moment_id, moment_time, previous_artifact)) = candidate else {
+            return Ok(None);
+        };
+        if moment_time.abs_diff(captured_at_ms) > 2_000 {
+            return Ok(None);
+        }
+
+        let artifact_id = self.put_artifact(content_type, snapshot)?;
+        let update_result = {
+            let connection = self.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE moments SET accessibility_artifact_id = ?2 WHERE id = ?1",
+                params![moment_id, artifact_id],
+            )
+        };
+        if let Err(error) = update_result {
+            let _ = self
+                .connection
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM artifacts WHERE id = ?1", [&artifact_id]);
+            let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            return Err(error.into());
+        }
+        if let Some(previous) = previous_artifact {
+            self.connection
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM artifacts WHERE id = ?1", [&previous])?;
+            let _ = fs::remove_file(self.artifact_path(&previous));
+        }
+        Ok(Some(artifact_id))
     }
 
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
@@ -542,16 +605,21 @@ impl Vault {
         let transaction = connection.transaction()?;
         let candidates = {
             let mut statement = transaction.prepare(
-                "SELECT id, image_artifact_id FROM moments WHERE is_favorite = 0
+                "SELECT id, image_artifact_id, accessibility_artifact_id
+                   FROM moments WHERE is_favorite = 0
                  ORDER BY captured_at_ms ASC LIMIT ?1",
             )?;
             statement
                 .query_map([excess], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for (moment_id, artifact_id) in &candidates {
+        for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
             transaction.execute(
                 "DELETE FROM evidence_fts WHERE evidence_id IN
                  (SELECT id FROM text_evidence WHERE moment_id = ?1)",
@@ -559,6 +627,12 @@ impl Vault {
             )?;
             transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
             transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
+                transaction.execute(
+                    "DELETE FROM artifacts WHERE id = ?1",
+                    [accessibility_artifact_id],
+                )?;
+            }
         }
         let audio_candidates = {
             let mut statement = transaction.prepare(
@@ -587,8 +661,11 @@ impl Vault {
         }
         transaction.commit()?;
         drop(connection);
-        for (_, artifact_id) in candidates {
+        for (_, artifact_id, accessibility_artifact_id) in candidates {
             let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
+                let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
+            }
         }
         for (_, artifact_id) in audio_candidates {
             let _ = fs::remove_file(self.artifact_path(&artifact_id));
@@ -754,7 +831,8 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
            captured_at_ms INTEGER NOT NULL,
            image_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
-           is_favorite INTEGER NOT NULL DEFAULT 0
+           is_favorite INTEGER NOT NULL DEFAULT 0,
+           accessibility_artifact_id TEXT REFERENCES artifacts(id)
          );
          CREATE INDEX IF NOT EXISTS moments_session_time ON moments(session_id, captured_at_ms);
          CREATE TABLE IF NOT EXISTS audio_segments (
@@ -792,6 +870,21 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
            error TEXT
          );",
     )?;
+    let has_accessibility_artifact = {
+        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "accessibility_artifact_id")
+    };
+    if !has_accessibility_artifact {
+        connection.execute(
+            "ALTER TABLE moments ADD COLUMN accessibility_artifact_id TEXT REFERENCES artifacts(id)",
+            [],
+        )?;
+    }
+    connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
 }
 
@@ -805,6 +898,7 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         ocr_text: row.get(5)?,
         transcript_text: row.get(6)?,
         audio_artifact_id: row.get(7)?,
+        accessibility_artifact_id: row.get(8)?,
     })
 }
 
@@ -920,6 +1014,37 @@ mod tests {
             b"private-screen-text"
         );
         drop(directory);
+    }
+
+    #[test]
+    fn accessibility_snapshot_attaches_within_two_seconds() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", b"screen")
+            .unwrap();
+        let artifact = vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                11_500,
+                "application/vnd.afterray.ax+json",
+                br#"{"root":{"role":"AXWindow"}}"#,
+            )
+            .unwrap();
+        assert!(artifact.is_some());
+        let loaded = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(loaded[0].id, moment.id);
+        assert_eq!(loaded[0].accessibility_artifact_id, artifact);
+
+        let too_late = vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                12_001,
+                "application/vnd.afterray.ax+json",
+                b"{}",
+            )
+            .unwrap();
+        assert!(too_late.is_none());
     }
 
     #[test]

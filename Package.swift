@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "AfterRayRecall", targets: ["AfterRayRecall"]),
         .library(name: "AfterRayMockData", targets: ["AfterRayMockData"]),
         .executable(name: "afterray-app", targets: ["AfterRayApp"]),
+        .executable(name: "afterray-native-model-worker", targets: ["AfterRayNativeModelWorker"]),
         .executable(name: "afterray-visual-lab", targets: ["AfterRayVisualLab"]),
     ],
     targets: [
@@ -25,6 +26,10 @@ let package = Package(
             name: "AfterRayApp",
             dependencies: ["AfterRayRecall"],
             path: "apps/AfterRay/Sources"
+        ),
+        .executableTarget(
+            name: "AfterRayNativeModelWorker",
+            path: "apps/AfterRayNativeModelWorker/Sources"
         ),
         .executableTarget(
             name: "AfterRayVisualLab",

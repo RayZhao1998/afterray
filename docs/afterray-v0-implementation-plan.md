@@ -15,8 +15,9 @@ V0 完成时，应能跑通：
 
 ```text
 启动 AfterRay
-→ 手动开始一次 Recording Session
-→ 本地记录屏幕、系统音频和麦克风
+→ 首次启动连续申请屏幕、麦克风和 Accessibility 权限
+→ 权限齐备后自动开始 Recording Session
+→ 本地记录屏幕、系统音频、麦克风和前台 Accessibility Tree
 → 保存截图与音频片段
 → OCR、ASR、Embedding 和 LLM 各跑通一条真实路径
 → 打开 Recall View
@@ -27,13 +28,15 @@ V0 完成时，应能跑通：
 → 退出并重新启动后仍能继续回放和检索
 ```
 
-V0 不是 Alpha，也不是给普通用户安装的正式版本。它可以依赖开发者手动下载模型、手动给 `afterrayd` 授权权限和手动开始录制。
+V0 不是 Alpha，也不是给普通用户安装的正式版本。它可以依赖开发者运行模型下载脚本，但权限由 App 统一引导，录制不要求手动开始。
 
 ## 2. 冻结需求
 
 ### V0-R001：本地录制
 
-WHEN 开发者点击 Start Recording，AfterRay SHALL 在本机开始记录当前显示器、系统音频和麦克风。
+WHEN App 首次启动，AfterRay SHALL 依次请求屏幕录制、麦克风和 Accessibility 权限。
+
+WHEN 三项权限全部可用，AfterRay SHALL 自动在本机开始记录当前显示器、系统音频、麦克风和前台 App 的 Accessibility Tree。
 
 WHEN 开发者点击 Stop Recording，AfterRay SHALL 结束当前 Session，并让已提交内容可以立即回放。
 
@@ -163,7 +166,7 @@ Rust durable job
 → commit Evidence
 ```
 
-这允许 V0 先用最容易跑通的 MLX Swift/Python/Ollama worker，同时保持调度、数据和未来 CLI 接口跨平台。以后替换推理实现不影响 UI、Store 或队列。
+这允许 V0 使用 AfterRay 自己管理的本地 worker，同时保持调度、数据和未来 CLI 接口跨平台。以后替换推理实现不影响 UI、Store 或队列。
 
 ### 4.4 建议目录
 
@@ -289,7 +292,7 @@ Embedding
 
 目标：先得到不含模型的真实本地 recorder。
 
-- `V0-101`：Rust Session/Recorder state machine，CLI 与 Swift 均可 Start/Stop。
+- `V0-101`：Rust Session/Recorder state machine，App 自动 Start，CLI 与 Swift 均可 Pause/Resume。
 - `V0-102`：定义 `CaptureBackend`、Frame/Audio artifact contract 和 fake backend。
 - `V0-103`：用 Rust bindings 跑通 ScreenCaptureKit screen/audio/microphone；限定 2 个工程日。
 - `V0-104`：若 `V0-103` 未达到稳定出口，使用薄 Swift Capture Helper 实现同一 contract；不保留两套生产 backend。
@@ -298,7 +301,7 @@ Embedding
 
 出口：
 
-- 能手动录制至少 10 分钟。
+- 权限齐备后能自动开始真实录制。
 - 重启后截图和两条音轨仍可打开。
 - Stop 后不继续写入新文件。
 - 关闭 Swift UI 不会停止 daemon 中已经开始的录制。
@@ -353,7 +356,7 @@ Embedding
 - `V0-402`：Rust Store 超过阈值后按时间删除最旧未收藏 Moment。
 - `V0-403`：事务更新 metadata，并清理 encrypted image、文本、Embedding 和无引用音频。
 - `V0-404`：验证收藏不计入阈值，全部历史被收藏时仍可继续新增未收藏 Moment。
-- `V0-405`：完成一次 60 分钟录制、停止、处理、回放、搜索、收藏和清理。
+- `V0-405`：完成一次录制、停止、处理、回放、搜索、收藏和清理闭环。
 
 出口：
 
@@ -395,9 +398,9 @@ Phase 0
 ## 8. V0 Done
 
 - 在开发机上可以从源码构建并启动 `afterrayd`、`afterray` CLI 和 AfterRay.app。
-- Rust CLI 和 Swift UI 通过同一个 daemon API 完成 status、Start/Stop、查询与收藏。
-- 可以手动开始和停止一次本地 Recording Session。
-- Session 同时包含屏幕、系统音频和麦克风内容。
+- Rust CLI 和 Swift UI 通过同一个 daemon API 完成 status、Pause/Resume、查询与收藏。
+- 首次启动会引导全部必需权限，权限齐备后自动开始本地 Recording Session。
+- Session 同时包含屏幕、系统音频、麦克风和前台 Accessibility Tree。
 - OCR、ASR、Embedding、LLM 各有一条真实本地路径成功运行。
 - 可以通过左右拖拽回到 Session 中任意已记录时刻。
 - 可以播放该时刻对应音频，并查看 OCR/Transcript。
@@ -405,9 +408,9 @@ Phase 0
 - 未收藏内容达到内部数量阈值后，最旧未收藏内容被删除；收藏内容不计入阈值。
 - Swift UI 关闭时 daemon 可以继续录制和处理；daemon 重启后已有内容仍可回放和搜索。
 - SQLite 与加密 artifact 只由 Rust Vault 访问，Swift UI 和 CLI 不直接碰文件。
-- 完成一次至少 60 分钟的本机自用闭环。
+- 完成一次本机自用闭环。
 
-V0 不要求签名分发、长期稳定运行、正式安全保证、商业逻辑、自动会议检测或普通用户 onboarding。
+V0 不要求生产签名分发、长期稳定运行、正式安全保证、商业逻辑或自动会议检测。
 
 ## 9. V0 后的第一轮迭代：只优化 Recall
 

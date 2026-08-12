@@ -30,6 +30,24 @@ public final class AfterRayControlModel: ObservableObject {
         }
     }
 
+    /// Starts capture when the daemon is idle. Calling this repeatedly is safe.
+    @discardableResult
+    public func ensureRecording() async -> Bool {
+        await refreshStatus()
+        guard status?.recordingState == .idle else { return isRecording }
+        isChangingRecording = true
+        defer { isChangingRecording = false }
+        do {
+            _ = try await daemon.recordStart()
+            status = try await daemon.status()
+            message = nil
+            return isRecording
+        } catch {
+            message = error.localizedDescription
+            return false
+        }
+    }
+
     @discardableResult
     public func toggleRecording() async -> Bool {
         guard canToggleRecording else { return false }

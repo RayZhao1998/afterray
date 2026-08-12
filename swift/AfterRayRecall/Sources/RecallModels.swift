@@ -29,6 +29,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
 
     /// Optional until the daemon's recall read model attaches the nearest audio segment.
     public let audioArtifactId: String?
+    public let accessibilityArtifactId: String?
 
     public init(
         id: String,
@@ -38,7 +39,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         isFavorite: Bool = false,
         ocrText: String? = nil,
         transcriptText: String? = nil,
-        audioArtifactId: String? = nil
+        audioArtifactId: String? = nil,
+        accessibilityArtifactId: String? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -48,6 +50,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.ocrText = ocrText
         self.transcriptText = transcriptText
         self.audioArtifactId = audioArtifactId
+        self.accessibilityArtifactId = accessibilityArtifactId
     }
 
     enum CodingKeys: String, CodingKey {
@@ -59,6 +62,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case ocrText = "ocr_text"
         case transcriptText = "transcript_text"
         case audioArtifactId = "audio_artifact_id"
+        case accessibilityArtifactId = "accessibility_artifact_id"
     }
 }
 

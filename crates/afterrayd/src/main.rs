@@ -1,5 +1,6 @@
 use afterray_models::{
-    JobState, ModelInput, ModelOutput, ModelQueue, QueueConfig, worker_adapters,
+    JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
+    ProcessAdapterConfig, QueueConfig,
 };
 use afterray_platform_macos::{ArtifactKind, CaptureConfig, CaptureEvent, MacOsCaptureBackend};
 use afterray_protocol::{PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit, Status};
@@ -53,7 +54,14 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from("scripts/download-models/afterray_model_worker.py"),
         PathBuf::from,
     );
-    let models = ModelQueue::new(worker_adapters(worker_path), QueueConfig::default())?;
+    let native_worker_path = std::env::var_os("AFTERRAY_NATIVE_MODEL_WORKER").map_or_else(
+        || PathBuf::from(".build/debug/afterray-native-model-worker"),
+        PathBuf::from,
+    );
+    let models = ModelQueue::new(
+        local_model_adapters(native_worker_path, worker_path),
+        QueueConfig::default(),
+    )?;
 
     let state = Arc::new(AppState {
         store,
@@ -78,6 +86,29 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
+
+fn local_model_adapters(
+    native_worker: PathBuf,
+    general_worker: PathBuf,
+) -> Vec<Arc<dyn ModelAdapter>> {
+    [
+        (ModelCapability::Ocr, native_worker, "vision-ocr"),
+        (ModelCapability::Asr, general_worker.clone(), "whisper-cpp"),
+        (
+            ModelCapability::Embedding,
+            general_worker.clone(),
+            "llama-cpp-embedding",
+        ),
+        (ModelCapability::Llm, general_worker, "mlx-vlm"),
+    ]
+    .into_iter()
+    .map(|(capability, program, name)| {
+        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+            name, capability, program,
+        ))) as Arc<dyn ModelAdapter>
+    })
+    .collect()
 }
 
 struct AppState {
@@ -376,7 +407,7 @@ async fn import_artifact(
         ArtifactKind::SystemAudio | ArtifactKind::Microphone => {
             let track = match kind {
                 ArtifactKind::Microphone => afterray_protocol::AudioTrack::Microphone,
-                ArtifactKind::SystemAudio | ArtifactKind::Screen => {
+                ArtifactKind::SystemAudio | ArtifactKind::Screen | ArtifactKind::Accessibility => {
                     afterray_protocol::AudioTrack::System
                 }
             };
@@ -416,6 +447,20 @@ async fn import_artifact(
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
+        }
+        ArtifactKind::Accessibility => {
+            let attached = state.store.attach_accessibility_snapshot(
+                session_id,
+                started_at_ms,
+                content_type,
+                &bytes,
+            )?;
+            if attached.is_none() {
+                eprintln!(
+                    "accessibility snapshot had no screen moment within the two-second alignment window"
+                );
+            }
+            tokio::fs::remove_file(path).await?;
         }
     }
     Ok(())
@@ -538,10 +583,11 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
 
 fn model_status() -> serde_json::Value {
     serde_json::json!({
-        "worker": std::env::var("AFTERRAY_MODEL_WORKER")
+        "runtime": "afterray-managed",
+        "ocr_worker": std::env::var("AFTERRAY_NATIVE_MODEL_WORKER")
+            .unwrap_or_else(|_| ".build/debug/afterray-native-model-worker".to_owned()),
+        "model_worker": std::env::var("AFTERRAY_MODEL_WORKER")
             .unwrap_or_else(|_| "scripts/download-models/afterray_model_worker.py".to_owned()),
-        "ollama_url": std::env::var("AFTERRAY_OLLAMA_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned()),
         "capabilities": ["ocr", "asr", "embedding", "llm"]
     })
 }

@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import ApplicationServices
 import AppKit
 import CoreMedia
 import Foundation
@@ -67,6 +68,7 @@ private enum ArtifactKind: String, Encodable {
     case screen
     case systemAudio = "system_audio"
     case microphone
+    case accessibility
 }
 
 private struct Event: Encodable {
@@ -108,11 +110,17 @@ private struct Event: Encodable {
     ) -> Self {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        let contentType: String
+        switch kind {
+        case .screen: contentType = "image/jpeg"
+        case .systemAudio, .microphone: contentType = "audio/mp4"
+        case .accessibility: contentType = "application/vnd.afterray.ax+json"
+        }
         return Self(
             event: "artifact",
             kind: kind,
             path: url.path,
-            contentType: kind == .screen ? "image/jpeg" : "audio/mp4",
+            contentType: contentType,
             startedAtMs: startedAtMs,
             endedAtMs: endedAtMs,
             byteCount: size,
@@ -159,6 +167,162 @@ private struct Event: Encodable {
         self.code = code
         self.message = message
     }
+}
+
+private struct AccessibilityFrame: Encodable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+private struct AccessibilityNode: Encodable {
+    let role: String?
+    let subrole: String?
+    let title: String?
+    let nodeDescription: String?
+    let identifier: String?
+    let value: String?
+    let valueRedacted: Bool
+    let frame: AccessibilityFrame?
+    let children: [AccessibilityNode]
+
+    enum CodingKeys: String, CodingKey {
+        case role, subrole, title, identifier, value, frame, children
+        case nodeDescription = "description"
+        case valueRedacted = "value_redacted"
+    }
+}
+
+private struct AccessibilitySnapshot: Encodable {
+    let capturedAtMs: Int64
+    let processId: Int32
+    let bundleIdentifier: String?
+    let applicationName: String?
+    let truncated: Bool
+    let root: AccessibilityNode
+
+    enum CodingKeys: String, CodingKey {
+        case capturedAtMs = "captured_at_ms"
+        case processId = "process_id"
+        case bundleIdentifier = "bundle_identifier"
+        case applicationName = "application_name"
+        case truncated, root
+    }
+}
+
+private final class AccessibilityTreeEncoder {
+    private let maximumNodes = 20_000
+    private var nodeCount = 0
+    private var visited = Set<CFHashCode>()
+    private(set) var truncated = false
+
+    func encode(_ element: AXUIElement) -> AccessibilityNode {
+        nodeCount += 1
+        let identity = CFHash(element)
+        guard nodeCount <= maximumNodes, visited.insert(identity).inserted else {
+            truncated = true
+            return AccessibilityNode(
+                role: string(element, kAXRoleAttribute),
+                subrole: string(element, kAXSubroleAttribute),
+                title: nil,
+                nodeDescription: nil,
+                identifier: nil,
+                value: nil,
+                valueRedacted: false,
+                frame: nil,
+                children: []
+            )
+        }
+
+        let subrole = string(element, kAXSubroleAttribute)
+        let secure = subrole == "AXSecureTextField"
+        let children = (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+            .map(encode)
+        return AccessibilityNode(
+            role: string(element, kAXRoleAttribute),
+            subrole: subrole,
+            title: string(element, kAXTitleAttribute),
+            nodeDescription: string(element, kAXDescriptionAttribute),
+            identifier: string(element, kAXIdentifierAttribute),
+            value: secure ? nil : scalarString(attribute(element, kAXValueAttribute)),
+            valueRedacted: secure,
+            frame: frame(element),
+            children: children
+        )
+    }
+
+    private func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+            return nil
+        }
+        return value
+    }
+
+    private func string(_ element: AXUIElement, _ name: String) -> String? {
+        scalarString(attribute(element, name))
+    }
+
+    private func scalarString(_ value: AnyObject?) -> String? {
+        if let string = value as? String { return string }
+        if let number = value as? NSNumber { return number.stringValue }
+        return nil
+    }
+
+    private func frame(_ element: AXUIElement) -> AccessibilityFrame? {
+        guard
+            let positionValue = attribute(element, kAXPositionAttribute),
+            let sizeValue = attribute(element, kAXSizeAttribute),
+            CFGetTypeID(positionValue) == AXValueGetTypeID(),
+            CFGetTypeID(sizeValue) == AXValueGetTypeID()
+        else { return nil }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard
+            AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        else { return nil }
+        return AccessibilityFrame(
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height
+        )
+    }
+}
+
+private func captureAccessibilityTree(
+    requestId: String,
+    capturedAtMs: Int64,
+    outputDirectory: URL,
+    events: EventWriter
+) throws {
+    guard let application = NSWorkspace.shared.frontmostApplication else {
+        events.send(.warning(code: "ax_no_frontmost_app", message: "No foreground application was available"))
+        return
+    }
+    let encoder = AccessibilityTreeEncoder()
+    let root = encoder.encode(AXUIElementCreateApplication(application.processIdentifier))
+    let snapshot = AccessibilitySnapshot(
+        capturedAtMs: capturedAtMs,
+        processId: application.processIdentifier,
+        bundleIdentifier: application.bundleIdentifier,
+        applicationName: application.localizedName,
+        truncated: encoder.truncated,
+        root: root
+    )
+    let url = outputDirectory
+        .appendingPathComponent("accessibility-\(UUID().uuidString)")
+        .appendingPathExtension("json")
+    try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    events.send(.artifact(
+        kind: .accessibility,
+        url: url,
+        startedAtMs: capturedAtMs,
+        endedAtMs: capturedAtMs,
+        requestId: requestId
+    ))
 }
 
 private final class EventWriter: @unchecked Sendable {
@@ -359,6 +523,12 @@ private func captureScreen(
         endedAtMs: now,
         requestId: requestId
     ))
+    try captureAccessibilityTree(
+        requestId: requestId,
+        capturedAtMs: now,
+        outputDirectory: options.outputDirectory,
+        events: events
+    )
 }
 
 private struct InputCommand: Decodable {

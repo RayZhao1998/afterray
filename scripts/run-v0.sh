@@ -11,7 +11,7 @@ usage() {
     '  --daemon-only   Build and run afterrayd without opening the Swift app.' \
     '  --ephemeral     Use a throwaway vault instead of .afterray/v0-data.' \
     '' \
-    'This script never downloads models or starts recording automatically.'
+    'This script never downloads models. The app records automatically after permission approval.'
 }
 
 mode='app'
@@ -55,6 +55,8 @@ capture_shim="$capture_package/.build/debug/AfterRayCaptureShim"
 daemon_bin="$repo_root/target/debug/afterrayd"
 cli_bin="$repo_root/target/debug/afterray"
 app_bin="$repo_root/.build/debug/afterray-app"
+native_model_worker="$repo_root/.build/debug/afterray-native-model-worker"
+app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
 mkdir -p "$swift_cache/clang" "$swift_cache/swiftpm"
@@ -76,6 +78,30 @@ swift build \
   --package-path "$repo_root" \
   --configuration debug \
   --product afterray-app
+swift build \
+  --package-path "$repo_root" \
+  --configuration debug \
+  --product afterray-native-model-worker
+
+printf '%s\n' '==> Assembling AfterRay.app'
+case "$app_bundle" in
+  "$repo_root"/.afterray-dev/AfterRay.app) rm -rf -- "$app_bundle" ;;
+  *) printf 'Refusing to replace unexpected app bundle: %s\n' "$app_bundle" >&2; exit 1 ;;
+esac
+mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Helpers"
+cp "$repo_root/apps/AfterRay/Resources/Info.plist" "$app_bundle/Contents/Info.plist"
+cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
+cp "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
+cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
+cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
+cp "$repo_root/scripts/download-models/afterray_model_worker.py" \
+  "$app_bundle/Contents/Helpers/afterray_model_worker.py"
+chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
+codesign --force --sign - "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
+codesign --force --sign - "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
+codesign --force --sign - "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
+codesign --force --sign - "$app_bundle/Contents/Helpers/afterray_model_worker.py" >/dev/null
+codesign --force --sign - "$app_bundle" >/dev/null
 
 if [[ "$mode" == 'build' ]]; then
   printf '%s\n' 'AfterRay V0 build completed.'
@@ -114,12 +140,38 @@ else
   export AFTERRAY_DATA_DIR="${AFTERRAY_DATA_DIR:-$repo_root/.afterray/v0-data}"
 fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
+export AFTERRAY_NATIVE_MODEL_WORKER="$native_model_worker"
 mkdir -p "$AFTERRAY_DATA_DIR"
 default_whisper_model="$repo_root/.afterray/models/ggml-large-v3-turbo-q5_0.bin"
 if [[ -z "${AFTERRAY_WHISPER_MODEL:-}" && -f "$default_whisper_model" ]]; then
   export AFTERRAY_WHISPER_MODEL="$default_whisper_model"
 fi
+default_embedding_model="$repo_root/.afterray/models/nomic-embed-text-v1.5.Q4_K_M.gguf"
+if [[ -z "${AFTERRAY_EMBEDDING_MODEL:-}" && -f "$default_embedding_model" ]]; then
+  export AFTERRAY_EMBEDDING_MODEL="$default_embedding_model"
+fi
+default_llm_model="$repo_root/.afterray/models/gemma-4-26b-a4b-it-4bit"
+if [[ -z "${AFTERRAY_LLM_MODEL:-}" && -d "$default_llm_model" ]]; then
+  export AFTERRAY_LLM_MODEL="$default_llm_model"
+fi
+mlx_runtime="$repo_root/.afterray/mlx-runtime"
+if [[ -x "$mlx_runtime/bin/python3" ]]; then
+  export PATH="$mlx_runtime/bin:$PATH"
+fi
 daemon_log="$run_dir/afterrayd.log"
+
+if [[ "$mode" == 'app' ]]; then
+  export AFTERRAY_DAEMON="$app_bundle/Contents/Helpers/afterrayd"
+  export AFTERRAY_CAPTURE_SHIM="$app_bundle/Contents/Helpers/AfterRayCaptureShim"
+  export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"
+  export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray_model_worker.py"
+  printf '%s\n' \
+    '==> Opening AfterRay.app' \
+    'The app will request Screen Recording, Microphone, and Accessibility access.' \
+    'Recording starts automatically once all three permissions are enabled.'
+  "$app_bundle/Contents/MacOS/AfterRay"
+  exit $?
+fi
 
 printf '==> Starting afterrayd\n    socket: %s\n    data:   %s\n' \
   "$AFTERRAY_SOCKET" "$AFTERRAY_DATA_DIR"
@@ -146,8 +198,8 @@ fi
 
 printf '\n%s\n' 'AfterRay V0 daemon is ready.'
 printf '%s\n' \
-  'Recording is intentionally not started automatically.' \
-  'The first record start may trigger macOS Screen Recording and Microphone prompts.' \
+  'Daemon-only mode does not start recording automatically.' \
+  'The app is responsible for requesting permissions and starting capture.' \
   'Grant the requested permissions, then retry the command if macOS asks you to.' \
   '' \
   'From another terminal, use:'
@@ -157,11 +209,5 @@ printf '  AFTERRAY_SOCKET=%q %q record stop\n' "$AFTERRAY_SOCKET" "$cli_bin"
 printf '  AFTERRAY_SOCKET=%q %q sessions list\n' "$AFTERRAY_SOCKET" "$cli_bin"
 printf '\nDaemon log: %s\n' "$daemon_log"
 
-if [[ "$mode" == 'daemon' ]]; then
-  printf '%s\n' 'Press Control-C to stop afterrayd and clean the temporary run directory.'
-  wait "$daemon_pid"
-  exit $?
-fi
-
-printf '%s\n' '==> Opening the Swift recall app (close it to stop this V0 run)'
-"$app_bin"
+printf '%s\n' 'Press Control-C to stop afterrayd and clean the temporary run directory.'
+wait "$daemon_pid"

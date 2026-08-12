@@ -2,8 +2,8 @@
 
 **A private timeline for everything you saw and heard on your Mac.**
 
-AfterRay continuously captures your screen and, when you choose to record,
-system and microphone audio. Local OCR and speech recognition turn those
+AfterRay continuously captures your screen, system audio, microphone audio,
+and the foreground app's Accessibility tree. Local OCR and speech recognition turn those
 captures into searchable context. A native recall timeline lets you drag back
 through the day, recover the exact screen you saw, and play the audio around
 that moment.
@@ -18,11 +18,11 @@ stay local.
 
 ## What works today
 
-- Manual recording of the current display, system audio, and microphone audio.
+- Automatic recording after the required macOS permissions are approved.
 - A native macOS timeline with horizontal drag-to-recall.
 - Screenshot previews, OCR text, transcripts, and audio playback by moment.
 - Full-text and local embedding search across captured evidence.
-- Local session summaries through an Ollama-hosted LLM.
+- Local session summaries through an AfterRay-managed MLX runtime.
 - Favorites that survive automatic retention cleanup.
 - An encrypted local vault backed by SQLCipher and XChaCha20-Poly1305.
 - A Rust CLI that exposes the same API used by the Swift app.
@@ -37,12 +37,12 @@ stay local.
   for recordings.
 - Xcode and the Xcode Command Line Tools.
 - A current Rust toolchain.
-- [Ollama](https://ollama.com/download), `ffmpeg`, and `whisper.cpp`.
+- `ffmpeg`, `whisper.cpp`, and `llama.cpp` for the current developer build.
 
 Install the command-line dependencies with Homebrew:
 
 ```sh
-brew install ollama ffmpeg whisper-cpp
+brew install ffmpeg whisper-cpp llama.cpp
 ```
 
 Install Rust from [rustup.rs](https://rustup.rs/) if `cargo --version` is not
@@ -50,13 +50,8 @@ already available.
 
 ## Quick start
 
-Clone the repository and enter it, then start Ollama:
-
-```sh
-ollama serve
-```
-
-In another terminal, download the local models. This is required once:
+Clone the repository and enter it, then let AfterRay download its own local
+runtime and model files. This is required once:
 
 ```sh
 ./scripts/download-models/download.sh
@@ -68,13 +63,11 @@ Build and launch AfterRay:
 make v0
 ```
 
-The command builds the native capture helper, Rust daemon and CLI, then opens
-the Swift app. It does **not** begin recording automatically.
-
-Click **Record** in the app to start a session. On the first attempt, macOS will
-request Screen & System Audio Recording and Microphone access. Grant access to
-the terminal or capture helper shown by macOS, quit the affected process if
-asked, run `make v0` again, and click **Record** once more.
+The command assembles and launches a signed development `AfterRay.app`. On its
+first launch the app immediately requests Screen & System Audio Recording,
+Microphone, and Accessibility access. macOS presents these as separate system
+approvals; Accessibility must be enabled in System Settings. AfterRay starts
+recording automatically as soon as all three are enabled.
 
 Recorded data persists between runs at:
 
@@ -92,10 +85,10 @@ Stop AfterRay by pressing `Control-C` in the terminal that launched it.
 
 ## Using the app
 
-1. Click **Record** and use your Mac normally.
-2. Click **Stop** when the session is finished.
+1. Approve the three macOS permissions and use your Mac normally.
+2. Use **Pause** only when you intentionally want capture to stop.
 3. Drag the recall strip left or right to move through captured moments.
-4. Inspect OCR and transcript evidence associated with the selected moment.
+4. Inspect OCR, Accessibility, and transcript evidence for the selected moment.
 5. Play its audio segment when one is available.
 6. Favorite an important moment to protect it from retention cleanup.
 7. Search for words or concepts to jump back to matching evidence.
@@ -105,29 +98,10 @@ with `AFTERRAY_CAPTURE_INTERVAL_SECONDS`.
 
 ## Local models
 
-The development setup currently connects four local capabilities:
-
-| Capability | Default runtime | Default model |
-| --- | --- | --- |
-| OCR | Ollama | `qwen2.5vl:3b` |
-| Speech recognition | whisper.cpp | `large-v3-turbo-q5_0` |
-| Embedding | Ollama | `nomic-embed-text` |
-| LLM | Ollama | `gemma4:latest` |
-
-Rust owns scheduling, concurrency, retries, cancellation, and result storage.
-The model worker only performs one typed inference request at a time. This
-keeps the core independent from Ollama and whisper.cpp, so the inference layer
-can later move to MLX without changing the app or vault.
-
-Override a model or runtime with environment variables before launching:
-
-```sh
-export AFTERRAY_OCR_MODEL='qwen2.5vl:3b'
-export AFTERRAY_EMBEDDING_MODEL='nomic-embed-text'
-export AFTERRAY_LLM_MODEL='gemma4:latest'
-export AFTERRAY_WHISPER_MODEL="$PWD/.afterray/models/ggml-large-v3-turbo-q5_0.bin"
-make v0
-```
+AfterRay downloads model files into `.afterray/models` and owns the inference
+processes itself. No Ollama installation, server, account, or API is involved.
+Rust continues to own scheduling, concurrency, retries, cancellation, and
+result storage; native workers only execute typed local inference jobs.
 
 ## Architecture
 
@@ -144,7 +118,7 @@ AfterRay.app (SwiftUI)                 afterray CLI (Rust)
              │                                        │
    macOS capture backend                    Local process adapter
              │                                        │
-  thin ScreenCaptureKit shim              Ollama + whisper.cpp
+  ScreenCaptureKit + AX shim          Vision + MLX + native runtimes
 ```
 
 The split is intentional:
@@ -235,35 +209,21 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_SOCKET` | Unix socket shared by clients and daemon | Runner-generated temporary path |
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
 | `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
-| `AFTERRAY_MODEL_WORKER` | Typed local model worker | Bundled Python worker |
-| `AFTERRAY_OLLAMA_URL` | Ollama API endpoint | `http://127.0.0.1:11434` |
+| `AFTERRAY_MODEL_WORKER` | Typed local model worker | Bundled AfterRay worker |
 
 ## Troubleshooting
 
 ### Recording fails immediately
 
-Open **System Settings → Privacy & Security** and verify both:
+Open **System Settings → Privacy & Security** and verify all three:
 
 - **Screen & System Audio Recording**
 - **Microphone**
+- **Accessibility**
 
 Enable the terminal application that launched AfterRay, or the AfterRay helper
 if macOS lists it separately. macOS may require that application to be quit and
 reopened before the permission becomes active.
-
-### AfterRay cannot reach Ollama
-
-Start it in another terminal:
-
-```sh
-ollama serve
-```
-
-Then confirm that the models exist:
-
-```sh
-ollama list
-```
 
 ### A model is missing
 
@@ -283,10 +243,10 @@ This does not modify the persistent vault at `.afterray/v0-data`.
 
 ## V0 boundaries
 
-V0 intentionally does not include activity-triggered capture, Accessibility
-Tree snapshots, meeting detection, automatic recording, onboarding, model
-delivery, subscriptions, App Store packaging, multi-device sync, third-party
-agent access, or Windows support.
+V0 intentionally does not include activity-triggered capture, meeting
+detection, subscriptions, production App Store packaging, multi-device sync,
+third-party agent access, or Windows support. Model setup is still a developer
+script rather than the final in-app download experience.
 
 The next product milestone is focused on the recall experience itself: making
 navigation through hours, days, and eventually months feel immediate and

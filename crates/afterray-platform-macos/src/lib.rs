@@ -95,6 +95,7 @@ pub enum ArtifactKind {
     Screen,
     SystemAudio,
     Microphone,
+    Accessibility,
 }
 
 #[derive(Debug, thiserror::Error)]

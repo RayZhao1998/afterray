@@ -7,6 +7,7 @@ public enum RecallImageQuality: Sendable {
 }
 
 public typealias RecallImageLoader = (String, RecallImageQuality) async throws -> Data
+public typealias RecallArtifactLoader = (String) async throws -> Data
 
 public struct RecallView: View {
     public let moments: [RecallMoment]
@@ -14,6 +15,7 @@ public struct RecallView: View {
     public let loadState: RecallLoadState
     public var tuning: RecallVisualTuning
     public let imageLoader: RecallImageLoader
+    public var artifactLoader: RecallArtifactLoader?
     public var onToggleFavorite: (() -> Void)?
     public var onToggleAudio: ((RecallMoment) -> Void)?
     public var onReload: (() -> Void)?
@@ -26,6 +28,7 @@ public struct RecallView: View {
         loadState: RecallLoadState = .ready,
         tuning: RecallVisualTuning = .standard,
         imageLoader: @escaping RecallImageLoader,
+        artifactLoader: RecallArtifactLoader? = nil,
         onToggleFavorite: (() -> Void)? = nil,
         onToggleAudio: ((RecallMoment) -> Void)? = nil,
         onReload: (() -> Void)? = nil
@@ -35,6 +38,7 @@ public struct RecallView: View {
         self.loadState = loadState
         self.tuning = tuning
         self.imageLoader = imageLoader
+        self.artifactLoader = artifactLoader
         self.onToggleFavorite = onToggleFavorite
         self.onToggleAudio = onToggleAudio
         self.onReload = onReload
@@ -178,6 +182,16 @@ public struct RecallView: View {
                     emptyText: isProcessing ? "OCR is processing…" : "No screen text found"
                 )
 
+                if
+                    let artifactID = selectedMoment?.accessibilityArtifactId,
+                    let artifactLoader
+                {
+                    AccessibilitySnapshotBlock(
+                        artifactID: artifactID,
+                        loader: artifactLoader
+                    )
+                }
+
                 EvidenceBlock(
                     eyebrow: "HEARD",
                     icon: "waveform",
@@ -272,6 +286,47 @@ public struct RecallView: View {
     private func formatTimestamp(_ moment: RecallMoment) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(moment.capturedAtMs) / 1_000)
         return date.formatted(date: .abbreviated, time: .standard)
+    }
+}
+
+private struct AccessibilitySnapshotBlock: View {
+    let artifactID: String
+    let loader: RecallArtifactLoader
+    @State private var expanded = false
+    @State private var snapshot = ""
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(snapshot.isEmpty ? "Loading…" : snapshot)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 10)
+            }
+            .frame(maxHeight: 240)
+        } label: {
+            Label("ACCESSIBILITY TREE", systemImage: "point.3.connected.trianglepath.dotted")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .tracking(1.3)
+                .foregroundStyle(RecallPalette.ray.opacity(0.9))
+        }
+        .task(id: expanded) {
+            guard expanded, snapshot.isEmpty else { return }
+            guard let data = try? await loader(artifactID) else {
+                snapshot = "The snapshot could not be loaded."
+                return
+            }
+            if
+                let object = try? JSONSerialization.jsonObject(with: data),
+                let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+            {
+                snapshot = String(decoding: pretty, as: UTF8.self)
+            } else {
+                snapshot = String(decoding: data, as: UTF8.self)
+            }
+        }
     }
 }
 

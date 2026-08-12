@@ -22,6 +22,13 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.id, "m1")
         XCTAssertEqual(moment.ocrText, "hello")
         XCTAssertNil(moment.audioArtifactId)
+        XCTAssertNil(moment.accessibilityArtifactId)
+    }
+
+    func testMomentDecodesAccessibilityArtifact() throws {
+        let json = #"{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false,"ocr_text":null,"transcript_text":null,"audio_artifact_id":null,"accessibility_artifact_id":"ax1"}"#
+        let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))
+        XCTAssertEqual(moment.accessibilityArtifactId, "ax1")
     }
 
     func testArtifactPayloadDecodesBytes() throws {

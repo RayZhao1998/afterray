@@ -48,30 +48,19 @@ Example response:
 On failure, omit `output` and return `error` plus `retryable`. A timeout or
 cancellation drops and kills the worker process.
 
-## Reference local worker
+## Local workers
 
-The repository includes a real worker at
-`scripts/download-models/afterray_model_worker.py`:
+The repository includes two real workers:
 
-- OCR: an Ollama vision model;
-- Embedding: Ollama `/api/embed`;
-- LLM: Ollama `/api/generate`;
-- ASR: ffmpeg normalization followed by `whisper-cli` from whisper.cpp.
+- `afterray-native-model-worker` performs screenshot OCR through macOS Vision;
+- `afterray_model_worker.py` invokes AfterRay-managed MLX, llama.cpp, and
+  whisper.cpp runtimes for the remaining capabilities.
 
-Install runtime dependencies, start Ollama, then download model assets:
+Install native development dependencies and download model assets:
 
 ```sh
-brew install ollama ffmpeg whisper-cpp
-ollama serve
+brew install ffmpeg whisper-cpp llama.cpp
 scripts/download-models/download.sh
-```
-
-Use `worker_adapters` to create all four adapters for the reference worker:
-
-```rust,no_run
-use afterray_models::worker_adapters;
-
-let adapters = worker_adapters("scripts/download-models/afterray_model_worker.py");
 ```
 
 Use `ProcessAdapterConfig` directly when different capabilities need different
@@ -81,10 +70,9 @@ Configuration variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AFTERRAY_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API |
-| `AFTERRAY_OCR_MODEL` | `qwen2.5vl:3b` | OCR/VLM model |
-| `AFTERRAY_EMBEDDING_MODEL` | `nomic-embed-text` | embedding model |
-| `AFTERRAY_LLM_MODEL` | `gemma3:4b` | generation model |
+| `AFTERRAY_NATIVE_MODEL_WORKER` | bundled Swift worker | OCR executable |
+| `AFTERRAY_EMBEDDING_MODEL` | AfterRay model directory | embedding weights |
+| `AFTERRAY_LLM_MODEL` | AfterRay model directory | MLX generation weights |
 | `AFTERRAY_FFMPEG_BIN` | `ffmpeg` | audio conversion executable |
 | `AFTERRAY_WHISPER_BIN` | `whisper-cli` | whisper.cpp executable |
 | `AFTERRAY_WHISPER_MODEL` | none | required local GGML model path |

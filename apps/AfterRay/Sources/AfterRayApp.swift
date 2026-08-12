@@ -1,8 +1,11 @@
 import AfterRayRecall
+import AppKit
 import SwiftUI
 
 @main
 struct AfterRayApp: App {
+    @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             AfterRayRootView()
@@ -13,14 +16,23 @@ struct AfterRayApp: App {
     }
 }
 
+@MainActor
+private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_: Notification) {
+        DaemonSupervisor.shared.stop()
+    }
+}
+
 private struct AfterRayRootView: View {
     @StateObject private var store: RecallStore
     @StateObject private var control: AfterRayControlModel
     @StateObject private var audioPlayer: ArtifactAudioPlayer
+    @StateObject private var permissions = SystemPermissionCoordinator()
+    @Environment(\.scenePhase) private var scenePhase
     private let images: RecallImageRepository
 
     init() {
-        let daemon = UnixSocketDaemonClient()
+        let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
         let repository = RecallImageRepository(daemon: daemon)
         _store = StateObject(wrappedValue: RecallStore(daemon: daemon))
         _control = StateObject(wrappedValue: AfterRayControlModel(daemon: daemon))
@@ -46,6 +58,9 @@ private struct AfterRayRootView: View {
                 imageLoader: { artifactID, _ in
                     try await images.data(artifactID: artifactID)
                 },
+                artifactLoader: { artifactID in
+                    try await images.data(artifactID: artifactID)
+                },
                 onToggleFavorite: {
                     Task { await store.toggleFavorite() }
                 },
@@ -69,10 +84,14 @@ private struct AfterRayRootView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
         }
+        .overlay {
+            if !permissions.allGranted {
+                PermissionPanel(coordinator: permissions)
+                    .transition(.opacity)
+            }
+        }
         .task {
-            async let status: Void = control.refreshStatus()
-            async let timeline: Void = store.loadLatestSession()
-            _ = await (status, timeline)
+            await bootstrap()
         }
         .task(id: control.status?.recordingState) {
             while !Task.isCancelled, control.isRecording {
@@ -83,6 +102,33 @@ private struct AfterRayRootView: View {
             }
         }
         .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
+        .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task {
+                permissions.refresh()
+                if permissions.allGranted {
+                    _ = await control.ensureRecording()
+                    await store.loadLatestSession()
+                }
+            }
+        }
+    }
+
+    private func bootstrap() async {
+        do {
+            try await DaemonSupervisor.shared.startIfNeeded()
+        } catch {
+            await control.refreshStatus()
+            return
+        }
+        await permissions.requestRequiredPermissions()
+        if permissions.allGranted {
+            _ = await control.ensureRecording()
+        } else {
+            await control.refreshStatus()
+        }
+        await store.loadLatestSession()
     }
 
     private func toggleRecording() {
@@ -106,6 +152,91 @@ private struct AfterRayRootView: View {
     }
 }
 
+private struct PermissionPanel: View {
+    @ObservedObject var coordinator: SystemPermissionCoordinator
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.62).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("LET AFTERRAY REMEMBER")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .tracking(1.8)
+                        .foregroundStyle(.red)
+                    Text("Three local permissions are required")
+                        .font(.title2.weight(.semibold))
+                    Text("AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(spacing: 9) {
+                    ForEach(RequiredPermission.allCases) { permission in
+                        permissionRow(permission)
+                    }
+                }
+
+                if coordinator.isRequesting {
+                    HStack(spacing: 9) {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for macOS approval…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button("Request permissions again") {
+                        Task { await coordinator.requestRequiredPermissions() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                }
+            }
+            .padding(26)
+            .frame(width: 470)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(.white.opacity(0.12))
+            }
+            .shadow(color: .black.opacity(0.6), radius: 36, y: 18)
+        }
+    }
+
+    private func permissionRow(_ permission: RequiredPermission) -> some View {
+        let granted = isGranted(permission)
+        return HStack(spacing: 12) {
+            Image(systemName: permission.icon)
+                .frame(width: 22)
+                .foregroundStyle(granted ? Color.green : Color.red)
+            Text(permission.title)
+                .font(.callout.weight(.medium))
+            Spacer()
+            if granted {
+                Label("Allowed", systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            } else {
+                Button("Open Settings") { coordinator.openSettings(for: permission) }
+                    .buttonStyle(.borderless)
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 46)
+        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func isGranted(_ permission: RequiredPermission) -> Bool {
+        switch permission {
+        case .screenRecording: coordinator.screenRecording
+        case .microphone: coordinator.microphone
+        case .accessibility: coordinator.accessibility
+        }
+    }
+}
+
 private struct ControlBar: View {
     @ObservedObject var model: AfterRayControlModel
     let onToggleRecording: () -> Void
@@ -125,7 +256,7 @@ private struct ControlBar: View {
 
             Button(action: onToggleRecording) {
                 Label(
-                    model.isRecording ? "Stop" : "Record",
+                    model.isRecording ? "Pause" : "Resume",
                     systemImage: model.isRecording ? "stop.fill" : "record.circle"
                 )
             }

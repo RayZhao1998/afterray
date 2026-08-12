@@ -31,6 +31,19 @@ final class AfterRayControlModelTests: XCTestCase {
         let query = await daemon.lastSearchQuery
         XCTAssertEqual(query, "architecture")
     }
+
+    func testEnsureRecordingStartsOnlyWhenIdle() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+
+        let first = await model.ensureRecording()
+        let second = await model.ensureRecording()
+        XCTAssertTrue(first)
+        XCTAssertTrue(second)
+
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["start"])
+    }
 }
 
 private actor ControlDaemon: AfterRayDaemonServing {

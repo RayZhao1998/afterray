@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Reference AfterRay V0 model worker.
+"""AfterRay-managed local model worker.
 
 Reads one WorkerRequest JSON object from stdin and writes one WorkerResponse to
-stdout. OCR, embeddings, and LLM generation use the local Ollama API. ASR uses
-ffmpeg to normalize audio and whisper.cpp to transcribe it.
+stdout. OCR is handled by the native Swift worker. This process runs ASR with
+whisper.cpp, embeddings with llama.cpp, and Gemma 4 with MLX directly. It never
+contacts an Ollama service.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 from pathlib import Path
@@ -16,8 +16,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 
 PROTOCOL_VERSION = 1
 
@@ -32,85 +30,80 @@ def env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def ollama_request(endpoint: str, payload: dict) -> dict:
-    base_url = env("AFTERRAY_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-    request = urllib.request.Request(
-        f"{base_url}{endpoint}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        missing = error.code == 404 or "not found" in body.lower()
-        hint = " Run scripts/download-models/download.sh first." if missing else ""
-        raise WorkerError(
-            f"Ollama returned HTTP {error.code}: {body}.{hint}",
-            retryable=not missing,
-        ) from error
-    except urllib.error.URLError as error:
-        raise WorkerError(
-            "cannot reach Ollama at "
-            f"{base_url}; start `ollama serve` or set AFTERRAY_OLLAMA_URL: {error}",
-            retryable=True,
-        ) from error
-
-
 def run_ocr(model_input: dict) -> dict:
-    image_path = Path(model_input["image_path"])
-    if not image_path.is_file():
-        raise WorkerError(f"OCR image does not exist: {image_path}")
-    prompt = model_input.get("prompt") or (
-        "Transcribe every visible word in this screenshot. Preserve reading "
-        "order and line breaks. Return only the transcription."
+    raise WorkerError(
+        "OCR must be routed to afterray-native-model-worker; check "
+        "AFTERRAY_NATIVE_MODEL_WORKER"
     )
-    result = ollama_request(
-        "/api/generate",
-        {
-            "model": env("AFTERRAY_OCR_MODEL", "qwen2.5vl:3b"),
-            "prompt": prompt,
-            "images": [base64.b64encode(image_path.read_bytes()).decode("ascii")],
-            "stream": False,
-        },
-    )
-    text = result.get("response")
-    if not isinstance(text, str):
-        raise WorkerError("Ollama OCR response did not contain `response`", retryable=True)
-    return {"type": "ocr", "text": text.strip()}
 
 
 def run_embedding(model_input: dict) -> dict:
-    result = ollama_request(
-        "/api/embed",
-        {
-            "model": env("AFTERRAY_EMBEDDING_MODEL", "nomic-embed-text"),
-            "input": model_input["text"],
-        },
+    executable = require_executable("AFTERRAY_EMBEDDING_BIN", "llama-embedding")
+    model = required_model(
+        "AFTERRAY_EMBEDDING_MODEL",
+        ".afterray/models/nomic-embed-text-v1.5.Q4_K_M.gguf",
     )
-    embeddings = result.get("embeddings")
-    if not isinstance(embeddings, list) or not embeddings or not isinstance(embeddings[0], list):
-        raise WorkerError("Ollama embedding response was missing `embeddings[0]`", retryable=True)
-    return {"type": "embedding", "vector": embeddings[0]}
+    completed = subprocess.run(
+        [
+            executable,
+            "-m",
+            str(model),
+            "-p",
+            model_input["text"],
+            "--embd-output-format",
+            "json",
+            "-ngl",
+            "99",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise WorkerError(
+            f"llama-embedding exited {completed.returncode}: {completed.stderr[-2000:]}",
+            retryable=True,
+        )
+    try:
+        document = json.loads(completed.stdout)
+        vector = document["data"][0]["embedding"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise WorkerError(f"llama-embedding returned invalid JSON: {error}", retryable=True) from error
+    return {"type": "embedding", "vector": vector}
 
 
 def run_llm(model_input: dict) -> dict:
     prompt = model_input["prompt"]
     if system := model_input.get("system"):
         prompt = f"System:\n{system}\n\nUser:\n{prompt}"
-    result = ollama_request(
-        "/api/generate",
-        {
-            "model": env("AFTERRAY_LLM_MODEL", "gemma4:latest"),
-            "prompt": prompt,
-            "stream": False,
-        },
+    model_path = required_model(
+        "AFTERRAY_LLM_MODEL",
+        ".afterray/models/gemma-4-26b-a4b-it-4bit",
     )
-    text = result.get("response")
+    try:
+        from mlx_vlm import generate, load
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_config
+    except ImportError as error:
+        raise WorkerError(
+            "AfterRay's MLX runtime is missing; run scripts/download-models/download.sh"
+        ) from error
+
+    model, processor = load(str(model_path))
+    config = load_config(str(model_path))
+    formatted = apply_chat_template(processor, config, prompt, num_images=0)
+    result = generate(
+        model,
+        processor,
+        formatted,
+        [],
+        max_tokens=int(env("AFTERRAY_LLM_MAX_TOKENS", "512")),
+        temperature=0.0,
+        verbose=False,
+    )
+    text = result if isinstance(result, str) else getattr(result, "text", None)
     if not isinstance(text, str):
-        raise WorkerError("Ollama LLM response did not contain `response`", retryable=True)
+        raise WorkerError("MLX returned no generated text", retryable=True)
     return {"type": "llm", "text": text.strip()}
 
 
@@ -122,6 +115,15 @@ def require_executable(config_name: str, fallback: str) -> str:
             f"executable `{configured}` was not found; install it or set {config_name}"
         )
     return resolved
+
+
+def required_model(config_name: str, fallback: str) -> Path:
+    model = Path(env(config_name, fallback)).expanduser()
+    if not model.exists():
+        raise WorkerError(
+            f"model asset `{model}` is missing; run scripts/download-models/download.sh"
+        )
+    return model
 
 
 def extract_whisper_text(document: dict) -> str:
