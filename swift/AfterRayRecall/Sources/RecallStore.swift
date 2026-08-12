@@ -18,20 +18,14 @@ public final class RecallStore: ObservableObject {
         return moments[selectedIndex]
     }
 
-    public func loadLatestSession(preservingSelection: Bool = false) async {
+    public func loadTimeline(preservingSelection: Bool = false) async {
         if moments.isEmpty {
             loadState = .loading
         }
         do {
             sessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
-            guard let latest = sessions.last else {
-                moments = []
-                selectedIndex = 0
-                loadState = .ready
-                return
-            }
-            let sessionID = preservingSelection ? selectedMoment?.sessionId ?? latest.id : latest.id
-            try await loadSession(id: sessionID, preservingSelection: preservingSelection)
+            let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            apply(loaded, preservingSelection: preservingSelection)
         } catch {
             if Self.isDaemonConnectionError(error) {
                 loadState = .loading
@@ -49,6 +43,14 @@ public final class RecallStore: ObservableObject {
         preservingSelection: Bool = false
     ) async throws {
         let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
+        apply(loaded, selecting: momentID, preservingSelection: preservingSelection)
+    }
+
+    private func apply(
+        _ loaded: [RecallMoment],
+        selecting momentID: String? = nil,
+        preservingSelection: Bool = false
+    ) {
         // Read the selection after the daemon request returns. The user may
         // continue scrubbing while that request is in flight, and the refresh
         // must preserve their newest position rather than a stale snapshot.
@@ -70,7 +72,8 @@ public final class RecallStore: ObservableObject {
     public func openSearchHit(_ hit: RecallSearchHit) async {
         loadState = .loading
         do {
-            try await loadSession(id: hit.sessionId, selecting: hit.momentId)
+            let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            apply(loaded, selecting: hit.momentId)
         } catch {
             loadState = Self.isDaemonConnectionError(error)
                 ? .loading

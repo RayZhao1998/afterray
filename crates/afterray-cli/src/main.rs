@@ -34,6 +34,7 @@ enum Command {
     Moments {
         session_id: String,
     },
+    Timeline,
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
@@ -111,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             command: SessionsCommand::List,
         } => Request::SessionsList,
         Command::Moments { session_id } => Request::MomentsList { session_id },
+        Command::Timeline => Request::TimelineList,
         Command::Search { query, limit } => Request::Search { query, limit },
         Command::Favorite {
             command: FavoriteCommand::Add { moment_id },

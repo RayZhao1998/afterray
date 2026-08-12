@@ -7,7 +7,9 @@ final class RecallStoreTests: XCTestCase {
         let daemon = FakeDaemon()
         let store = RecallStore(daemon: daemon)
 
-        await store.loadLatestSession()
+        await store.loadTimeline()
+        XCTAssertEqual(store.sessions.map(\.id), ["s1", "s2"])
+        XCTAssertEqual(store.moments.map(\.id), ["m1", "m2"])
         XCTAssertEqual(store.selectedMoment?.id, "m2")
 
         await store.toggleFavorite()
@@ -19,7 +21,7 @@ final class RecallStoreTests: XCTestCase {
     func testConnectionFailureStaysInRecoveringState() async {
         let store = RecallStore(daemon: ConnectionFailingDaemon())
 
-        await store.loadLatestSession()
+        await store.loadTimeline()
 
         XCTAssertEqual(store.loadState, .loading)
     }
@@ -41,7 +43,7 @@ final class RecallStoreTests: XCTestCase {
     func testBackgroundRefreshPreservesLatestUserSelection() async {
         let daemon = RefreshingDaemon()
         let store = RecallStore(daemon: daemon)
-        await store.loadLatestSession()
+        await store.loadTimeline()
         XCTAssertEqual(store.selectedMoment?.id, "m2")
 
         store.select(index: 0)
@@ -49,7 +51,7 @@ final class RecallStoreTests: XCTestCase {
         await daemon.delayNextMomentsRequest()
 
         let refresh = Task { @MainActor in
-            await store.loadLatestSession(preservingSelection: true)
+            await store.loadTimeline(preservingSelection: true)
         }
         try? await Task.sleep(for: .milliseconds(10))
         store.select(index: 1)
@@ -86,6 +88,14 @@ private actor RefreshingDaemon: RecallDaemonServing {
         [RecallSession(id: "s1", startedAtMs: 100)]
     }
 
+    func timeline() async throws -> [RecallMoment] {
+        if shouldDelayNextMomentsRequest {
+            shouldDelayNextMomentsRequest = false
+            try await Task.sleep(for: .milliseconds(40))
+        }
+        return storedMoments
+    }
+
     func moments(sessionID _: String) async throws -> [RecallMoment] {
         if shouldDelayNextMomentsRequest {
             shouldDelayNextMomentsRequest = false
@@ -109,6 +119,7 @@ private actor CountingArtifactDaemon: RecallDaemonServing {
     private(set) var requestCount = 0
 
     func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
     func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
 
@@ -130,6 +141,7 @@ private actor ConnectionFailingDaemon: RecallDaemonServing {
         throw DaemonClientError.connection("Connection refused")
     }
 
+    func timeline() async throws -> [RecallMoment] { [] }
     func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
     func artifact(id _: String) async throws -> ArtifactPayload {
@@ -143,14 +155,21 @@ private actor FakeDaemon: RecallDaemonServing {
     var favoriteCalls: [FavoriteCall] = []
 
     func sessions() async throws -> [RecallSession] {
-        [RecallSession(id: "s1", startedAtMs: 100)]
+        [
+            RecallSession(id: "s1", startedAtMs: 100),
+            RecallSession(id: "s2", startedAtMs: 200),
+        ]
+    }
+
+    func timeline() async throws -> [RecallMoment] {
+        [
+            RecallMoment(id: "m1", sessionId: "s1", capturedAtMs: 100, imageArtifactId: "a1"),
+            RecallMoment(id: "m2", sessionId: "s2", capturedAtMs: 200, imageArtifactId: "a2"),
+        ]
     }
 
     func moments(sessionID: String) async throws -> [RecallMoment] {
-        [
-            RecallMoment(id: "m1", sessionId: sessionID, capturedAtMs: 100, imageArtifactId: "a1"),
-            RecallMoment(id: "m2", sessionId: sessionID, capturedAtMs: 200, imageArtifactId: "a2"),
-        ]
+        try await timeline().filter { $0.sessionId == sessionID }
     }
 
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment] {

@@ -167,6 +167,26 @@ impl Vault {
         Ok(())
     }
 
+    /// Closes sessions left open by an interrupted daemon. Earlier sessions end
+    /// when the next one starts; the newest ends at its last captured moment.
+    pub fn close_orphaned_sessions_sync(&self, fallback_ms: i64) -> Result<usize, StoreError> {
+        let changed = self.connection.lock().unwrap().execute(
+            "UPDATE sessions
+                SET ended_at_ms = COALESCE(
+                    (SELECT MIN(next.started_at_ms)
+                       FROM sessions next
+                      WHERE next.started_at_ms > sessions.started_at_ms),
+                    (SELECT MAX(moment.captured_at_ms)
+                       FROM moments moment
+                      WHERE moment.session_id = sessions.id),
+                    ?1
+                )
+              WHERE ended_at_ms IS NULL",
+            [fallback_ms],
+        )?;
+        Ok(changed)
+    }
+
     pub fn sessions_sync(&self) -> Result<Vec<Session>, StoreError> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
@@ -207,6 +227,34 @@ impl Vault {
              FROM moments m WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
         )?;
         let rows = statement.query_map([session_id], moment_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn timeline_sync(&self) -> Result<Vec<Moment>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
+                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                    (SELECT group_concat(te.text, '\n')
+                       FROM text_evidence te
+                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
+                      WHERE audio.session_id = m.session_id
+                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                        AND te.source = 'transcript'),
+                    (SELECT audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
+                    m.accessibility_artifact_id,
+                    m.application_name,
+                    m.bundle_identifier
+             FROM moments m ORDER BY m.captured_at_ms, m.id",
+        )?;
+        let rows = statement.query_map([], moment_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1046,6 +1094,55 @@ mod tests {
             b"private-screen-text"
         );
         drop(directory);
+    }
+
+    #[test]
+    fn timeline_spans_sessions_in_capture_order() {
+        let (_directory, vault) = test_vault(10);
+        let first_session = vault.create_session_sync(100).unwrap();
+        let first = vault
+            .insert_moment(&first_session.id, 110, "image/jpeg", b"first")
+            .unwrap();
+        let second_session = vault.create_session_sync(200).unwrap();
+        let second = vault
+            .insert_moment(&second_session.id, 210, "image/jpeg", b"second")
+            .unwrap();
+
+        let timeline = vault.timeline_sync().unwrap();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|moment| moment.id.as_str())
+                .collect::<Vec<_>>(),
+            [first.id.as_str(), second.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn orphaned_sessions_close_at_next_start_or_last_moment() {
+        let (_directory, vault) = test_vault(10);
+        let first_session = vault.create_session_sync(100).unwrap();
+        vault
+            .insert_moment(&first_session.id, 150, "image/jpeg", b"first")
+            .unwrap();
+        let second_session = vault.create_session_sync(200).unwrap();
+        vault
+            .insert_moment(&second_session.id, 250, "image/jpeg", b"second")
+            .unwrap();
+
+        assert_eq!(vault.close_orphaned_sessions_sync(300).unwrap(), 2);
+        let sessions = vault.sessions_sync().unwrap();
+        let first = sessions
+            .iter()
+            .find(|session| session.id == first_session.id)
+            .unwrap();
+        let second = sessions
+            .iter()
+            .find(|session| session.id == second_session.id)
+            .unwrap();
+        assert_eq!(first.ended_at_ms, Some(200));
+        assert_eq!(second.ended_at_ms, Some(250));
+        assert_eq!(vault.close_orphaned_sessions_sync(400).unwrap(), 0);
     }
 
     #[test]

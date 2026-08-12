@@ -3,6 +3,14 @@ import XCTest
 @testable import AfterRayRecall
 
 final class DaemonWireTests: XCTestCase {
+    func testTimelineRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "timeline_list"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "timeline_list")
+        XCTAssertNil(json["session_id"])
+    }
+
     func testRecallWindowRequestMatchesRustShape() throws {
         let request = WireRequest(type: "recall_window", sessionID: "session-1", centerMs: 42, limit: 120)
         let data = try JSONEncoder().encode(request)

@@ -21,6 +21,7 @@ public enum DaemonClientError: LocalizedError, Equatable {
 
 public protocol RecallDaemonServing: Sendable {
     func sessions() async throws -> [RecallSession]
+    func timeline() async throws -> [RecallMoment]
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func artifact(id: String) async throws -> ArtifactPayload
@@ -46,6 +47,10 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func sessions() async throws -> [RecallSession] {
         try await request(WireRequest(type: "sessions_list"), as: [RecallSession].self)
+    }
+
+    public func timeline() async throws -> [RecallMoment] {
+        try await request(WireRequest(type: "timeline_list"), as: [RecallMoment].self)
     }
 
     public func status() async throws -> DaemonStatus {

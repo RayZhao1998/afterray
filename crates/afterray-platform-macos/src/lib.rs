@@ -359,6 +359,6 @@ mod tests {
             CaptureConfig::new(std::path::Path::new("shim"), std::path::Path::new("output"));
         assert_eq!(config.shim_path, std::path::Path::new("shim"));
         assert_eq!(config.output_dir, std::path::Path::new("output"));
-        assert_eq!(config.jpeg_quality, 0.95);
+        assert!((config.jpeg_quality - 0.95).abs() < f64::EPSILON);
     }
 }

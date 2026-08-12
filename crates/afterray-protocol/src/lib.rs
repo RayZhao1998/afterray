@@ -20,6 +20,7 @@ pub enum Request {
     RecordStart,
     RecordStop,
     SessionsList,
+    TimelineList,
     MomentsList {
         session_id: String,
     },

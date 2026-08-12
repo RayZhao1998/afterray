@@ -26,6 +26,20 @@ fn default_socket_path() -> PathBuf {
     )
 }
 
+fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(staging_dir)?;
+    let mut removed = 0;
+    for entry in std::fs::read_dir(staging_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let socket = default_socket_path();
@@ -43,6 +57,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let staging_dir = vault_config.data_dir.join("capture-staging");
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
+    let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
+    if repaired_sessions > 0 {
+        eprintln!("closed {repaired_sessions} session(s) left open by an earlier daemon");
+    }
+    let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
+    if removed_staging_files > 0 {
+        eprintln!("removed {removed_staging_files} stale capture staging file(s)");
+    }
 
     let shim_path = std::env::var_os("AFTERRAY_CAPTURE_SHIM").map_or_else(
         || PathBuf::from("apps/AfterRayCaptureShim/.build/debug/AfterRayCaptureShim"),
@@ -77,14 +99,54 @@ async fn main() -> anyhow::Result<()> {
     });
     println!("afterrayd listening on {}", socket.display());
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle(stream, state).await {
-                eprintln!("client error: {error:#}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(error) = handle(stream, state).await {
+                        eprintln!("client error: {error:#}");
+                    }
+                });
             }
-        });
+            () = &mut shutdown => break,
+        }
+    }
+
+    let response = record_stop(&state).await;
+    if !response.ok {
+        eprintln!(
+            "could not finish the active session during shutdown: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    drop(listener);
+    let _ = std::fs::remove_file(&socket);
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                eprintln!("Ctrl-C handler failed: {error}");
+            }
+        }
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("Ctrl-C handler failed: {error}");
     }
 }
 
@@ -161,6 +223,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::RecordStart => record_start(state).await,
         Request::RecordStop => record_stop(state).await,
         Request::SessionsList => into_response(state.store.sessions_sync()),
+        Request::TimelineList => into_response(state.store.timeline_sync()),
         Request::MomentsList { session_id } => into_response(state.store.moments_sync(&session_id)),
         Request::RecallWindow {
             session_id,
@@ -287,15 +350,20 @@ async fn record_stop(state: &Arc<AppState>) -> Response {
     if let Some(scheduler) = scheduler {
         scheduler.abort();
     }
-    if let Err(error) = state.capture.stop_capture().await {
-        return Response::failure(error.to_string());
-    }
+    let capture_error = state.capture.stop_capture().await.err();
     if let Some(consumer) = consumer {
         let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
     }
-    match state.store.end_session_sync(&session_id, now_ms()) {
-        Ok(()) => Response::success(serde_json::json!({"session_id": session_id})),
-        Err(error) => Response::failure(error.to_string()),
+    let store_result = state.store.end_session_sync(&session_id, now_ms());
+    match (capture_error, store_result) {
+        (None, Ok(())) => Response::success(serde_json::json!({"session_id": session_id})),
+        (Some(capture_error), Ok(())) => Response::failure(format!(
+            "session closed, but capture helper did not stop cleanly: {capture_error}"
+        )),
+        (None, Err(store_error)) => Response::failure(store_error.to_string()),
+        (Some(capture_error), Err(store_error)) => Response::failure(format!(
+            "capture stop failed: {capture_error}; session close failed: {store_error}"
+        )),
     }
 }
 
@@ -638,6 +706,18 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
+
+    #[test]
+    fn stale_capture_cleanup_only_removes_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("screen.jpg"), b"frame").unwrap();
+        std::fs::write(directory.path().join("microphone.m4a"), b"audio").unwrap();
+        std::fs::create_dir(directory.path().join("unexpected-directory")).unwrap();
+
+        assert_eq!(clear_stale_capture_files(directory.path()).unwrap(), 2);
+        assert!(directory.path().join("unexpected-directory").is_dir());
+        assert_eq!(clear_stale_capture_files(directory.path()).unwrap(), 0);
+    }
 
     fn test_vault() -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();

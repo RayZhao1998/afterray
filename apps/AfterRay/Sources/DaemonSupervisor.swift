@@ -114,7 +114,9 @@ final class DaemonSupervisor {
             process.terminate()
         }
         self.process = nil
-        try? FileManager.default.removeItem(atPath: socketPath)
+        // The daemon owns the socket and removes it only after its active
+        // recording session has been closed. A following launch can reuse the
+        // still-shutting-down daemon or remove a genuinely stale socket.
     }
 
     private func daemonIsReachable() async -> Bool {

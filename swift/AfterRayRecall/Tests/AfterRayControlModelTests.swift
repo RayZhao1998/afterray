@@ -88,6 +88,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
     }
 
     func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
     func moments(sessionID: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment] { [] }
     func artifact(id: String) async throws -> ArtifactPayload {
