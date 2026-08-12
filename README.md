@@ -178,6 +178,17 @@ for details.
 ## Development
 
 ```sh
+# Watch the complete app. Successful builds are signed and relaunched;
+# failed builds leave the previous instance running.
+make dev
+
+# Storybook-like mock-data UI loop. No recording permissions or real data.
+make dev-ui
+
+# Open the last successful build without rebuilding, or stop app + daemon.
+make open
+make stop
+
 # Build everything without launching the app
 make v0-build
 
