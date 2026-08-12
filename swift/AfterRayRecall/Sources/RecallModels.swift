@@ -271,4 +271,22 @@ public enum RecallGeometry {
     public static func liveScrollStep(delta: CGFloat) -> Int? {
         delta > 0 ? -1 : nil
     }
+
+    public static func accumulatedScrollDelta(
+        current: CGFloat,
+        incoming: CGFloat,
+        maximum: CGFloat = 160
+    ) -> CGFloat {
+        guard maximum > 0 else { return 0 }
+        return min(max(current + incoming, -maximum), maximum)
+    }
+
+    public static func drainScrollDelta(
+        _ accumulated: CGFloat,
+        maximumPerFrame: CGFloat = 40
+    ) -> (emitted: CGFloat, remaining: CGFloat) {
+        guard maximumPerFrame > 0 else { return (0, accumulated) }
+        let emitted = min(max(accumulated, -maximumPerFrame), maximumPerFrame)
+        return (emitted, accumulated - emitted)
+    }
 }

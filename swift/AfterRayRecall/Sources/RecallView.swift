@@ -940,7 +940,10 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 guard let self, event.window === self.hostView?.window else { return event }
                 let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
-                pendingDelta += delta
+                pendingDelta = RecallGeometry.accumulatedScrollDelta(
+                    current: pendingDelta,
+                    incoming: delta
+                )
                 pendingIsPrecise = event.hasPreciseScrollingDeltas
                 pendingEnd = event.phase == .ended || event.momentumPhase == .ended
                 lastEventTime = CACurrentMediaTime()
@@ -969,14 +972,18 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         }
 
         @objc private func displayLinkDidFire(_: CADisplayLink) {
-            let delta = pendingDelta
-            pendingDelta = 0
+            let drained = RecallGeometry.drainScrollDelta(pendingDelta)
+            let delta = drained.emitted
+            pendingDelta = drained.remaining
             if delta != 0 {
                 onScroll(delta, pendingIsPrecise, false)
             }
 
-            let wentIdle = isScrolling && CACurrentMediaTime() - lastEventTime >= 0.075
-            if pendingEnd || wentIdle {
+            let drainedCompletely = abs(pendingDelta) < 0.001
+            let wentIdle = isScrolling
+                && drainedCompletely
+                && CACurrentMediaTime() - lastEventTime >= 0.075
+            if drainedCompletely, pendingEnd || wentIdle {
                 pendingEnd = false
                 isScrolling = false
                 onScroll(0, pendingIsPrecise, true)

@@ -54,4 +54,20 @@ final class RecallGeometryTests: XCTestCase {
         XCTAssertEqual(RecallGeometry.liveScrollStep(delta: 0.1), -1)
         XCTAssertNil(RecallGeometry.liveScrollStep(delta: -0.1))
     }
+
+    func testScrollDeltaIsBoundedAndDrainedAcrossDisplayFrames() {
+        let accumulated = RecallGeometry.accumulatedScrollDelta(
+            current: 80,
+            incoming: 400
+        )
+        XCTAssertEqual(accumulated, 160)
+
+        let firstFrame = RecallGeometry.drainScrollDelta(accumulated)
+        XCTAssertEqual(firstFrame.emitted, 40)
+        XCTAssertEqual(firstFrame.remaining, 120)
+
+        let reverseFrame = RecallGeometry.drainScrollDelta(-95)
+        XCTAssertEqual(reverseFrame.emitted, -40)
+        XCTAssertEqual(reverseFrame.remaining, -55)
+    }
 }

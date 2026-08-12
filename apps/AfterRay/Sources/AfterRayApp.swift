@@ -512,7 +512,7 @@ private struct AfterRayRootView: View {
             while !Task.isCancelled, control.isRecording {
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled else { return }
-                await store.loadLatestSession()
+                await store.loadLatestSession(preservingSelection: !isLive)
                 await control.refreshStatus()
             }
         }
@@ -524,7 +524,7 @@ private struct AfterRayRootView: View {
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
-                    await store.loadLatestSession()
+                    await store.loadLatestSession(preservingSelection: !isLive)
                 }
             }
         }
@@ -552,7 +552,7 @@ private struct AfterRayRootView: View {
     private func toggleRecording() {
         Task {
             let changed = await control.toggleRecording()
-            if changed { await store.loadLatestSession() }
+            if changed { await store.loadLatestSession(preservingSelection: !isLive) }
         }
     }
 
@@ -562,11 +562,11 @@ private struct AfterRayRootView: View {
                 try await DaemonSupervisor.shared.startIfNeeded()
             } catch {
                 await control.refreshStatus()
-                await store.loadLatestSession()
+                await store.loadLatestSession(preservingSelection: !isLive)
                 return
             }
             async let status: Void = control.refreshStatus()
-            async let timeline: Void = store.loadLatestSession()
+            async let timeline: Void = store.loadLatestSession(preservingSelection: !isLive)
             _ = await (status, timeline)
         }
     }
@@ -582,7 +582,7 @@ private struct AfterRayRootView: View {
                     } else {
                         await control.refreshStatus()
                     }
-                    await store.loadLatestSession()
+                    await store.loadLatestSession(preservingSelection: !isLive)
                 }
             } catch {
                 // The next health tick retries. Daemon connectivity is an

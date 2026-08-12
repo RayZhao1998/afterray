@@ -18,7 +18,7 @@ public final class RecallStore: ObservableObject {
         return moments[selectedIndex]
     }
 
-    public func loadLatestSession() async {
+    public func loadLatestSession(preservingSelection: Bool = false) async {
         if moments.isEmpty {
             loadState = .loading
         }
@@ -30,7 +30,8 @@ public final class RecallStore: ObservableObject {
                 loadState = .ready
                 return
             }
-            try await loadSession(id: latest.id)
+            let sessionID = preservingSelection ? selectedMoment?.sessionId ?? latest.id : latest.id
+            try await loadSession(id: sessionID, preservingSelection: preservingSelection)
         } catch {
             if Self.isDaemonConnectionError(error) {
                 loadState = .loading
@@ -42,11 +43,24 @@ public final class RecallStore: ObservableObject {
         }
     }
 
-    public func loadSession(id: String, selecting momentID: String? = nil) async throws {
+    public func loadSession(
+        id: String,
+        selecting momentID: String? = nil,
+        preservingSelection: Bool = false
+    ) async throws {
         let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
+        // Read the selection after the daemon request returns. The user may
+        // continue scrubbing while that request is in flight, and the refresh
+        // must preserve their newest position rather than a stale snapshot.
+        let preservedMomentID = preservingSelection ? selectedMoment?.id : nil
+        let preservedIndex = selectedIndex
         moments = loaded
-        if let momentID, let index = loaded.firstIndex(where: { $0.id == momentID }) {
+        if let targetID = momentID ?? preservedMomentID,
+           let index = loaded.firstIndex(where: { $0.id == targetID })
+        {
             selectedIndex = index
+        } else if preservingSelection {
+            selectedIndex = min(max(preservedIndex, 0), max(loaded.count - 1, 0))
         } else {
             selectedIndex = max(loaded.count - 1, 0)
         }

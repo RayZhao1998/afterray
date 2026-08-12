@@ -37,6 +37,72 @@ final class RecallStoreTests: XCTestCase {
         let requestCount = await daemon.requestCount
         XCTAssertEqual(requestCount, 1)
     }
+
+    func testBackgroundRefreshPreservesLatestUserSelection() async {
+        let daemon = RefreshingDaemon()
+        let store = RecallStore(daemon: daemon)
+        await store.loadLatestSession()
+        XCTAssertEqual(store.selectedMoment?.id, "m2")
+
+        store.select(index: 0)
+        await daemon.appendMoment(id: "m3", capturedAtMs: 300)
+        await daemon.delayNextMomentsRequest()
+
+        let refresh = Task { @MainActor in
+            await store.loadLatestSession(preservingSelection: true)
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        store.select(index: 1)
+        await refresh.value
+
+        XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
+        XCTAssertEqual(store.selectedMoment?.id, "m2")
+    }
+}
+
+private actor RefreshingDaemon: RecallDaemonServing {
+    private var storedMoments = [
+        RecallMoment(id: "m1", sessionId: "s1", capturedAtMs: 100, imageArtifactId: "a1"),
+        RecallMoment(id: "m2", sessionId: "s1", capturedAtMs: 200, imageArtifactId: "a2"),
+    ]
+    private var shouldDelayNextMomentsRequest = false
+
+    func appendMoment(id: String, capturedAtMs: Int64) {
+        storedMoments.append(
+            RecallMoment(
+                id: id,
+                sessionId: "s1",
+                capturedAtMs: capturedAtMs,
+                imageArtifactId: "artifact-\(id)"
+            )
+        )
+    }
+
+    func delayNextMomentsRequest() {
+        shouldDelayNextMomentsRequest = true
+    }
+
+    func sessions() async throws -> [RecallSession] {
+        [RecallSession(id: "s1", startedAtMs: 100)]
+    }
+
+    func moments(sessionID _: String) async throws -> [RecallMoment] {
+        if shouldDelayNextMomentsRequest {
+            shouldDelayNextMomentsRequest = false
+            try await Task.sleep(for: .milliseconds(40))
+        }
+        return storedMoments
+    }
+
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] {
+        storedMoments
+    }
+
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "image/jpeg", bytesBase64: "")
+    }
+
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
 private actor CountingArtifactDaemon: RecallDaemonServing {
