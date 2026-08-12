@@ -69,7 +69,9 @@ private final class RecallOverlayController {
             backing: .buffered,
             defer: false
         )
-        panel.contentView = NSHostingView(rootView: AfterRayRootView())
+        let hostingView = NSHostingView(rootView: AfterRayRootView())
+        hostingView.autoresizingMask = [.width, .height]
+        panel.contentView = hostingView
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
@@ -475,6 +477,7 @@ private struct AfterRayRootView: View {
             },
             onReload: reload
         )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(isLive ? Color.clear : Color(red: 0.025, green: 0.022, blue: 0.026))
         .overlay(alignment: .top) {
             ImmersiveControlBar(
@@ -500,6 +503,7 @@ private struct AfterRayRootView: View {
         .overlay {
             if !permissions.allGranted {
                 PermissionPanel(coordinator: permissions)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     .transition(.opacity)
             }
         }
