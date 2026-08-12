@@ -7,6 +7,17 @@ private extension Notification.Name {
     static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
 }
 
+@MainActor
+private final class RecallOverlayLayout: ObservableObject {
+    static let shared = RecallOverlayLayout()
+
+    @Published private(set) var topSafeAreaInset: CGFloat = 0
+
+    func update(for screen: NSScreen) {
+        topSafeAreaInset = screen.safeAreaInsets.top
+    }
+}
+
 @main
 struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
@@ -135,7 +146,9 @@ private final class RecallOverlayController {
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
-        panel.setFrame(targetScreen.frame, display: true)
+        let screen = targetScreen
+        RecallOverlayLayout.shared.update(for: screen)
+        panel.setFrame(screen.frame, display: true)
         panel.alphaValue = 1
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -432,6 +445,7 @@ private struct AfterRayRootView: View {
     @StateObject private var control: AfterRayControlModel
     @StateObject private var audioPlayer: ArtifactAudioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
+    @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @State private var isLive = true
     private let images: RecallImageRepository
 
@@ -480,7 +494,7 @@ private struct AfterRayRootView: View {
                 onToggleRecording: toggleRecording,
                 onSearch: { Task { await control.search() } }
             )
-            .padding(.top, 22)
+            .padding(.top, controlBarTopPadding)
         }
         .overlay(alignment: .topTrailing) {
             if !control.searchHits.isEmpty {
@@ -490,7 +504,7 @@ private struct AfterRayRootView: View {
                     onDismiss: control.dismissSearch
                 )
                 .frame(width: 390)
-                .padding(.top, 74)
+                .padding(.top, controlBarTopPadding + 52)
                 .padding(.trailing, 24)
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
@@ -531,6 +545,10 @@ private struct AfterRayRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
             isLive = true
         }
+    }
+
+    private var controlBarTopPadding: CGFloat {
+        RecallGeometry.controlBarTopPadding(safeAreaTop: overlayLayout.topSafeAreaInset)
     }
 
     private func bootstrap() async {

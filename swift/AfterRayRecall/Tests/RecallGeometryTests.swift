@@ -2,6 +2,11 @@ import XCTest
 @testable import AfterRayRecall
 
 final class RecallGeometryTests: XCTestCase {
+    func testControlBarClearsMacBookCameraSafeArea() {
+        XCTAssertEqual(RecallGeometry.controlBarTopPadding(safeAreaTop: 0), 22)
+        XCTAssertEqual(RecallGeometry.controlBarTopPadding(safeAreaTop: 32), 44)
+    }
+
     func testDragLeftMovesForwardAndClamps() {
         XCTAssertEqual(
             RecallGeometry.index(fromDragTranslation: -120, originIndex: 3, count: 10, pointsPerMoment: 50),

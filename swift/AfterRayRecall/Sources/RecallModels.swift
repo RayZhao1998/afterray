@@ -237,6 +237,14 @@ public struct RecallVisualTuning: Equatable, Sendable {
 }
 
 public enum RecallGeometry {
+    public static func controlBarTopPadding(
+        safeAreaTop: CGFloat,
+        minimum: CGFloat = 22,
+        clearance: CGFloat = 12
+    ) -> CGFloat {
+        max(minimum, safeAreaTop + clearance)
+    }
+
     public static func clampedIndex(_ index: Int, count: Int) -> Int? {
         guard count > 0 else { return nil }
         return min(max(index, 0), count - 1)
