@@ -7,7 +7,7 @@ import Foundation
 @MainActor
 final class SystemPermissionCoordinator: ObservableObject {
     private static let automaticRequestLedgerKey =
-        "dev.afterray.permissions.automatic-requested.v1"
+        "dev.afterray.permissions.automatic-requested.v2"
 
     @Published private(set) var screenRecording = false
     @Published private(set) var microphone = false
@@ -55,6 +55,23 @@ final class SystemPermissionCoordinator: ObservableObject {
         screenRecording = CGPreflightScreenCaptureAccess()
         microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         accessibility = AXIsProcessTrusted()
+    }
+
+    /// Retries a permission only after an explicit user action. Automatic
+    /// prompts stay guarded by the ledger above, while a permission removed in
+    /// System Settings can still be requested again without reinstalling.
+    func requestAgain(_ permission: RequiredPermission) async {
+        switch permission {
+        case .screenRecording:
+            screenRecording = CGRequestScreenCaptureAccess()
+        case .microphone:
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                microphone = await AVCaptureDevice.requestAccess(for: .audio)
+            }
+        case .accessibility:
+            requestAccessibilityAccess()
+        }
+        refresh()
     }
 
     func openSettings(for permission: RequiredPermission) {

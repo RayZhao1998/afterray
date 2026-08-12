@@ -59,6 +59,28 @@ native_model_worker="$repo_root/.build/debug/afterray-native-model-worker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
+resolve_codesign_identity() {
+  if [[ -n "${AFTERRAY_CODESIGN_IDENTITY:-}" ]]; then
+    printf '%s\n' "$AFTERRAY_CODESIGN_IDENTITY"
+    return
+  fi
+
+  local identities
+  local line
+  local prefix
+  identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  for prefix in 'Apple Development' 'Developer ID Application'; do
+    while IFS= read -r line; do
+      [[ "$line" == *\"$prefix:* ]] || continue
+      line="${line#*\"}"
+      printf '%s\n' "${line%%\"*}"
+      return
+    done <<<"$identities"
+  done
+
+  printf '%s\n' '-'
+}
+
 stop_development_processes() {
   local executable
   local pid
@@ -132,19 +154,34 @@ cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-wo
 cp "$repo_root/scripts/download-models/afterray_model_worker.py" \
   "$app_bundle/Contents/Helpers/afterray_model_worker.py"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
-codesign --force --sign - "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
-codesign --force --sign - "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
-codesign --force --sign - "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
-codesign --force --sign - "$app_bundle/Contents/Helpers/afterray_model_worker.py" >/dev/null
-# Keep the development app's designated requirement stable across rebuilds. The
-# default ad-hoc requirement is its cdhash, which changes every build and makes
-# macOS TCC treat the same bundle as a new permission subject.
-codesign \
-  --force \
-  --sign - \
-  --identifier dev.afterray.app \
-  --requirements '=designated => identifier "dev.afterray.app"' \
-  "$app_bundle" >/dev/null
+codesign_identity="$(resolve_codesign_identity)"
+if [[ "$codesign_identity" == '-' ]]; then
+  printf '%s\n' \
+    'WARNING: No Apple Development or Developer ID signing identity was found.' \
+    'Screen Recording permission may be lost after every ad-hoc rebuild.' >&2
+fi
+printf '==> Signing with: %s\n' "$codesign_identity"
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray_model_worker.py" >/dev/null
+if [[ "$codesign_identity" == '-' ]]; then
+  codesign \
+    --force \
+    --sign - \
+    --identifier dev.afterray.app \
+    --requirements '=designated => identifier "dev.afterray.app"' \
+    "$app_bundle" >/dev/null
+else
+  # Certificate-backed signing gives TCC a stable identity across rebuilds.
+  # Let codesign synthesize the designated requirement from the certificate,
+  # team identifier, and bundle identifier.
+  codesign \
+    --force \
+    --sign "$codesign_identity" \
+    "$app_bundle" >/dev/null
+fi
+codesign --verify --deep --strict "$app_bundle"
 
 if [[ "$mode" == 'build' ]]; then
   printf '%s\n' 'AfterRay V0 build completed.'

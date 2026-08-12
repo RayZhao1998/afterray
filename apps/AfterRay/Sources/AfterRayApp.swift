@@ -328,19 +328,8 @@ private struct PermissionDropGuide: View {
                     .stroke(.red.opacity(0.48), lineWidth: 1)
             }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .onDrag {
-                NSItemProvider(contentsOf: applicationURL)
-                    ?? NSItemProvider(object: applicationURL as NSURL)
-            } preview: {
-                HStack(spacing: 9) {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: applicationURL.path))
-                        .resizable()
-                        .frame(width: 34, height: 34)
-                    Text("AfterRay")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                .padding(10)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                ApplicationBundleDragSource(applicationURL: applicationURL)
             }
 
             Text("After granting access, press ⌘⇧Space to return.")
@@ -358,6 +347,57 @@ private struct PermissionDropGuide: View {
         }
         .preferredColorScheme(.dark)
     }
+}
+
+/// Uses AppKit's native file-URL pasteboard writer. System Settings' privacy
+/// lists do not reliably accept SwiftUI content providers whose first declared
+/// type is a dynamically generated bundle-content UTI.
+private struct ApplicationBundleDragSource: NSViewRepresentable {
+    let applicationURL: URL
+
+    func makeNSView(context _: Context) -> ApplicationBundleDragSourceView {
+        ApplicationBundleDragSourceView(applicationURL: applicationURL)
+    }
+
+    func updateNSView(_ view: ApplicationBundleDragSourceView, context _: Context) {
+        view.applicationURL = applicationURL
+    }
+}
+
+private final class ApplicationBundleDragSourceView: NSView, NSDraggingSource {
+    var applicationURL: URL
+
+    init(applicationURL: URL) {
+        self.applicationURL = applicationURL
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+
+    override func mouseDragged(with event: NSEvent) {
+        let icon = NSWorkspace.shared.icon(forFile: applicationURL.path)
+        icon.size = NSSize(width: 52, height: 52)
+        let point = convert(event.locationInWindow, from: nil)
+        let frame = NSRect(
+            x: point.x - 26,
+            y: point.y - 26,
+            width: 52,
+            height: 52
+        )
+        let item = NSDraggingItem(pasteboardWriter: applicationURL as NSURL)
+        item.setDraggingFrame(frame, contents: icon)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    func draggingSession(
+        _: NSDraggingSession,
+        sourceOperationMaskFor _: NSDraggingContext
+    ) -> NSDragOperation {
+        .copy
+    }
+
+    func ignoreModifierKeys(for _: NSDraggingSession) -> Bool { true }
 }
 
 private struct AfterRayRootView: View {
@@ -561,9 +601,13 @@ private struct PermissionPanel: View {
                     .foregroundStyle(.green)
             } else {
                 Button("Open Settings") {
-                    RecallOverlayController.shared.hide(returnFocus: false)
-                    PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
-                    coordinator.openSettings(for: permission)
+                    Task {
+                        await coordinator.requestAgain(permission)
+                        guard !isGranted(permission) else { return }
+                        RecallOverlayController.shared.hide(returnFocus: false)
+                        PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
+                        coordinator.openSettings(for: permission)
+                    }
                 }
                     .buttonStyle(.borderless)
                     .font(.caption.weight(.semibold))
