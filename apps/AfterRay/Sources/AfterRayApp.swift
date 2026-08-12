@@ -453,7 +453,7 @@ private struct AfterRayRootView: View {
             ),
             isLive: $isLive,
             loadState: store.loadState,
-            imageLoader: { artifactID, _ in
+            imageLoader: { artifactID in
                 try await images.data(artifactID: artifactID)
             },
             artifactLoader: { artifactID in

@@ -36,7 +36,7 @@ Run a real smoke test (macOS prompts for Screen Recording and Microphone):
 apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim \
   --output-dir /tmp/afterray-capture-smoke \
   --audio-segment-seconds 30 \
-  --jpeg-quality 0.78
+  --jpeg-quality 0.95
 ```
 
 After the `ready` event, enter one command per line:

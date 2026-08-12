@@ -34,7 +34,7 @@ impl CaptureConfig {
             shim_path: shim_path.into(),
             output_dir: output_dir.into(),
             audio_segment_seconds: 300,
-            jpeg_quality: 0.78,
+            jpeg_quality: 0.95,
         }
     }
 
@@ -359,5 +359,6 @@ mod tests {
             CaptureConfig::new(std::path::Path::new("shim"), std::path::Path::new("output"));
         assert_eq!(config.shim_path, std::path::Path::new("shim"));
         assert_eq!(config.output_dir, std::path::Path::new("output"));
+        assert_eq!(config.jpeg_quality, 0.95);
     }
 }

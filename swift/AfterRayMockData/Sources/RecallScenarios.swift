@@ -78,13 +78,13 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum MockArtifactFactory {
-    public static let loader: RecallImageLoader = { artifactID, quality in
+    public static let loader: RecallImageLoader = { artifactID in
         let index = Int(artifactID.split(separator: "/").last ?? "0") ?? 0
-        return try renderFrame(index: index, quality: quality)
+        return try renderFrame(index: index)
     }
 
-    private static func renderFrame(index: Int, quality: RecallImageQuality) throws -> Data {
-        let size = quality == .thumbnail ? NSSize(width: 320, height: 200) : NSSize(width: 1_280, height: 800)
+    private static func renderFrame(index: Int) throws -> Data {
+        let size = NSSize(width: 1_280, height: 800)
         let image = NSImage(size: size)
         image.lockFocus()
 

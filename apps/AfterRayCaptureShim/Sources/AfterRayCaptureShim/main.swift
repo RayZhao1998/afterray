@@ -16,7 +16,7 @@ private struct Options {
     static func parse(_ arguments: [String]) throws -> Self {
         var outputDirectory: URL?
         var audioSegmentSeconds = 300.0
-        var jpegQuality = 0.78
+        var jpegQuality = 0.95
         var index = 1
         while index < arguments.count {
             let key = arguments[index]
@@ -599,8 +599,10 @@ private enum AfterRayCaptureShim {
             configuration.captureMicrophone = true
 
             let screenshotConfiguration = SCStreamConfiguration()
-            screenshotConfiguration.width = display.width
-            screenshotConfiguration.height = display.height
+            let screenshotPixelSize = nativePixelSize(for: display)
+            screenshotConfiguration.width = screenshotPixelSize.width
+            screenshotConfiguration.height = screenshotPixelSize.height
+            screenshotConfiguration.captureResolution = .best
             screenshotConfiguration.showsCursor = true
 
             let excludedApplications = content.applications.filter {
@@ -657,4 +659,23 @@ private enum AfterRayCaptureShim {
             Foundation.exit(EXIT_FAILURE)
         }
     }
+}
+
+private func nativePixelSize(for display: SCDisplay) -> (width: Int, height: Int) {
+    if let mode = CGDisplayCopyDisplayMode(display.displayID) {
+        return (
+            width: max(mode.pixelWidth, display.width),
+            height: max(mode.pixelHeight, display.height)
+        )
+    }
+
+    let screen = NSScreen.screens.first { screen in
+        let screenNumber = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber
+        return screenNumber?.uint32Value == display.displayID
+    }
+    let scale = max(screen?.backingScaleFactor ?? 1, 1)
+    return (
+        width: Int((CGFloat(display.width) * scale).rounded()),
+        height: Int((CGFloat(display.height) * scale).rounded())
+    )
 }

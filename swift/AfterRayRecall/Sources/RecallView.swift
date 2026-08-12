@@ -3,12 +3,7 @@ import ImageIO
 import QuartzCore
 import SwiftUI
 
-public enum RecallImageQuality: Sendable, Hashable {
-    case thumbnail
-    case full
-}
-
-public typealias RecallImageLoader = (String, RecallImageQuality) async throws -> Data
+public typealias RecallImageLoader = (String) async throws -> Data
 public typealias RecallArtifactLoader = (String) async throws -> Data
 
 public struct RecallView: View {
@@ -25,7 +20,6 @@ public struct RecallView: View {
 
     @State private var dragOriginPosition: Int?
     @State private var scrollAccumulator: CGFloat = 0
-    @State private var isScrubbing = false
     @State private var movementDirection = -1
     @State private var showsDetails = false
 
@@ -108,7 +102,6 @@ public struct RecallView: View {
             if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
                     artifactID: moment.imageArtifactId,
-                    quality: isScrubbing ? .thumbnail : .full,
                     blur: tuning.backdropBlur,
                     backdropOpacity: tuning.backdropOpacity,
                     loader: imageLoader
@@ -314,11 +307,9 @@ public struct RecallView: View {
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
         if ended {
             scrollAccumulator = 0
-            isScrubbing = false
             return
         }
         guard delta != 0 else { return }
-        isScrubbing = true
         if isLive, let step = RecallGeometry.liveScrollStep(delta: delta) {
             moveSelection(by: step)
             scrollAccumulator = 0
@@ -375,7 +366,7 @@ public struct RecallView: View {
         guard !moments.isEmpty else { return }
         let center = min(max(selectedIndex, 0), moments.count - 1)
         var offsets = [0]
-        for distance in 1...24 {
+        for distance in 1...20 {
             offsets.append(distance * movementDirection)
             offsets.append(-distance * movementDirection)
         }
@@ -385,7 +376,6 @@ public struct RecallView: View {
         }
         RecallDecodedImageCache.shared.prefetch(
             artifactIDs: artifactIDs,
-            quality: .thumbnail,
             loader: imageLoader
         )
     }
@@ -393,17 +383,13 @@ public struct RecallView: View {
 
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
-    let quality: RecallImageQuality
     let blur: Double
     let backdropOpacity: Double
     let loader: RecallImageLoader
     @State private var image: NSImage?
 
     var body: some View {
-        let cachedImage = RecallDecodedImageCache.shared.cached(
-            artifactID: artifactID,
-            quality: quality
-        )
+        let cachedImage = RecallDecodedImageCache.shared.cached(artifactID: artifactID)
         GeometryReader { geometry in
             ZStack {
                 if let image = cachedImage ?? image {
@@ -429,17 +415,13 @@ private struct ImmersiveArtifactImage: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
         }
-        .task(id: "\(artifactID):\(quality)") {
-            if let cached = RecallDecodedImageCache.shared.cached(
-                artifactID: artifactID,
-                quality: quality
-            ) {
+        .task(id: artifactID) {
+            if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
                 image = cached
                 return
             }
             guard let loaded = await RecallDecodedImageCache.shared.image(
                 artifactID: artifactID,
-                quality: quality,
                 loader: loader
             ), !Task.isCancelled else { return }
             image = loaded
@@ -458,57 +440,48 @@ private final class RecallDecodedImageCache {
     private let maximumConcurrentPrefetches = 6
 
     private init() {
-        images.countLimit = 72
-        images.totalCostLimit = 768 * 1_024 * 1_024
+        images.countLimit = 48
+        images.totalCostLimit = 1_536 * 1_024 * 1_024
     }
 
-    func cached(artifactID: String, quality: RecallImageQuality) -> NSImage? {
-        if quality == .thumbnail,
-           let full = images.object(forKey: cacheKey(artifactID: artifactID, quality: .full) as NSString)
-        {
-            return full
-        }
-        return images.object(forKey: cacheKey(artifactID: artifactID, quality: quality) as NSString)
+    func cached(artifactID: String) -> NSImage? {
+        images.object(forKey: artifactID as NSString)
     }
 
     func image(
         artifactID: String,
-        quality: RecallImageQuality,
         loader: @escaping RecallImageLoader
     ) async -> NSImage? {
-        if let cached = cached(artifactID: artifactID, quality: quality) { return cached }
-        let key = cacheKey(artifactID: artifactID, quality: quality)
-        if let existing = inFlight[key] { return await existing.value }
+        if let cached = cached(artifactID: artifactID) { return cached }
+        if let existing = inFlight[artifactID] { return await existing.value }
 
         let task = Task { @MainActor () -> NSImage? in
-            guard let data = try? await loader(artifactID, quality) else { return nil }
+            guard let data = try? await loader(artifactID) else { return nil }
             let decoded = await Task.detached(priority: .userInitiated) {
-                Self.decode(data: data, quality: quality)
+                Self.decode(data: data)
             }.value
             guard let decoded else { return nil }
             return NSImage(cgImage: decoded, size: .zero)
         }
-        inFlight[key] = task
+        inFlight[artifactID] = task
         let decoded = await task.value
-        inFlight[key] = nil
+        inFlight[artifactID] = nil
         if let decoded {
-            images.setObject(decoded, forKey: key as NSString, cost: estimatedCost(decoded))
+            images.setObject(decoded, forKey: artifactID as NSString, cost: estimatedCost(decoded))
         }
         return decoded
     }
 
     func prefetch(
         artifactIDs: [String],
-        quality: RecallImageQuality,
         loader: @escaping RecallImageLoader
     ) {
         pendingPrefetches = artifactIDs.compactMap { artifactID in
-            let key = cacheKey(artifactID: artifactID, quality: quality)
             guard
-                cached(artifactID: artifactID, quality: quality) == nil,
-                inFlight[key] == nil
+                cached(artifactID: artifactID) == nil,
+                inFlight[artifactID] == nil
             else { return nil }
-            return PrefetchRequest(artifactID: artifactID, quality: quality, loader: loader)
+            return PrefetchRequest(artifactID: artifactID, loader: loader)
         }
         pumpPrefetches()
     }
@@ -517,15 +490,14 @@ private final class RecallDecodedImageCache {
         while activePrefetches < maximumConcurrentPrefetches, !pendingPrefetches.isEmpty {
             let request = pendingPrefetches.removeFirst()
             guard
-                cached(artifactID: request.artifactID, quality: request.quality) == nil,
-                inFlight[request.key] == nil
+                cached(artifactID: request.artifactID) == nil,
+                inFlight[request.artifactID] == nil
             else { continue }
             activePrefetches += 1
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 _ = await image(
                     artifactID: request.artifactID,
-                    quality: request.quality,
                     loader: request.loader
                 )
                 activePrefetches -= 1
@@ -534,21 +506,8 @@ private final class RecallDecodedImageCache {
         }
     }
 
-    private func cacheKey(artifactID: String, quality: RecallImageQuality) -> String {
-        "\(artifactID):\(quality)"
-    }
-
-    nonisolated private static func decode(data: Data, quality: RecallImageQuality) -> CGImage? {
+    nonisolated private static func decode(data: Data) -> CGImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        if quality == .thumbnail {
-            let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: 1_600,
-                kCGImageSourceShouldCacheImmediately: true,
-            ]
-            return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        }
         let options: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: true]
         return CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary)
     }
@@ -560,10 +519,7 @@ private final class RecallDecodedImageCache {
 
     private struct PrefetchRequest {
         let artifactID: String
-        let quality: RecallImageQuality
         let loader: RecallImageLoader
-
-        var key: String { "\(artifactID):\(quality)" }
     }
 }
 
