@@ -478,7 +478,12 @@ private struct AfterRayRootView: View {
             onReload: reload
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(isLive ? Color.clear : Color(red: 0.025, green: 0.022, blue: 0.026))
+        .opacity(permissions.allGranted ? 1 : 0)
+        .background(
+            isLive || !permissions.allGranted
+                ? Color.clear
+                : Color(red: 0.025, green: 0.022, blue: 0.026)
+        )
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
