@@ -59,6 +59,35 @@ native_model_worker="$repo_root/.build/debug/afterray-native-model-worker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
+stop_development_processes() {
+  local executable
+  local pid
+  local -a pids=()
+  for executable in \
+    "$app_bundle/Contents/MacOS/AfterRay" \
+    "$app_bundle/Contents/Helpers/afterrayd"
+  do
+    pids=()
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] && pids+=("$pid")
+    done < <(pgrep -f -x "$executable" 2>/dev/null || true)
+    if ((${#pids[@]} > 0)); then
+      kill "${pids[@]}" 2>/dev/null || true
+    fi
+  done
+
+  # Give applicationWillTerminate time to unregister its global shortcut and
+  # stop the child daemon before replacing the development app bundle.
+  for _ in {1..30}; do
+    if ! pgrep -f -x "$app_bundle/Contents/MacOS/AfterRay" >/dev/null 2>&1 \
+      && ! pgrep -f -x "$app_bundle/Contents/Helpers/afterrayd" >/dev/null 2>&1
+    then
+      return
+    fi
+    sleep 0.1
+  done
+}
+
 mkdir -p "$swift_cache/clang" "$swift_cache/swiftpm"
 export CLANG_MODULE_CACHE_PATH="$swift_cache/clang"
 export SWIFTPM_MODULECACHE_OVERRIDE="$swift_cache/clang"
@@ -84,6 +113,7 @@ swift build \
   --product afterray-native-model-worker
 
 printf '%s\n' '==> Assembling AfterRay.app'
+stop_development_processes
 case "$app_bundle" in
   "$repo_root"/.afterray-dev/AfterRay.app) rm -rf -- "$app_bundle" ;;
   *) printf 'Refusing to replace unexpected app bundle: %s\n' "$app_bundle" >&2; exit 1 ;;
@@ -184,7 +214,10 @@ if [[ "$mode" == 'app' ]]; then
     'The app will request Screen Recording, Microphone, and Accessibility access.' \
     'Recording starts automatically once all three permissions are enabled.'
 
-  open_args=(-n -W -F --stderr "$app_log")
+  # LaunchServices now reuses the bundle if a second runner is started. The
+  # preflight above removes stale development instances before this build, so
+  # only one process can own the global shortcut and permission flow.
+  open_args=(-W -F --stderr "$app_log")
   launch_environment=(
     AFTERRAY_SOCKET
     AFTERRAY_DATA_DIR
