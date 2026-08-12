@@ -19,7 +19,9 @@ public final class RecallStore: ObservableObject {
     }
 
     public func loadLatestSession() async {
-        loadState = .loading
+        if moments.isEmpty {
+            loadState = .loading
+        }
         do {
             sessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
             guard let latest = sessions.last else {
@@ -90,22 +92,38 @@ public final class RecallStore: ObservableObject {
 
 public actor RecallImageRepository {
     private let daemon: any RecallDaemonServing
-    private var cache: [String: Data] = [:]
+    private let cache = NSCache<NSString, NSData>()
+    private var inFlight: [String: Task<Data, Error>] = [:]
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
+        cache.countLimit = 128
+        cache.totalCostLimit = 512 * 1_024 * 1_024
     }
 
     public func data(artifactID: String) async throws -> Data {
-        if let cached = cache[artifactID] { return cached }
-        let payload = try await daemon.artifact(id: artifactID)
-        guard let bytes = payload.bytes else { throw DaemonClientError.invalidResponse }
-        cache[artifactID] = bytes
-        return bytes
+        if let cached = cache.object(forKey: artifactID as NSString) { return cached as Data }
+        if let existing = inFlight[artifactID] { return try await existing.value }
+        let daemon = daemon
+        let task = Task<Data, Error> {
+            let payload = try await daemon.artifact(id: artifactID)
+            guard let bytes = payload.bytes else { throw DaemonClientError.invalidResponse }
+            return bytes
+        }
+        inFlight[artifactID] = task
+        do {
+            let bytes = try await task.value
+            inFlight[artifactID] = nil
+            cache.setObject(bytes as NSData, forKey: artifactID as NSString, cost: bytes.count)
+            return bytes
+        } catch {
+            inFlight[artifactID] = nil
+            throw error
+        }
     }
 
     public func prefetch(artifactIDs: [String]) async {
-        for id in artifactIDs where cache[id] == nil {
+        for id in artifactIDs where cache.object(forKey: id as NSString) == nil {
             _ = try? await data(artifactID: id)
         }
     }

@@ -1,7 +1,9 @@
 import AppKit
+import ImageIO
+import QuartzCore
 import SwiftUI
 
-public enum RecallImageQuality: Sendable {
+public enum RecallImageQuality: Sendable, Hashable {
     case thumbnail
     case full
 }
@@ -23,6 +25,8 @@ public struct RecallView: View {
 
     @State private var dragOriginPosition: Int?
     @State private var scrollAccumulator: CGFloat = 0
+    @State private var isScrubbing = false
+    @State private var movementDirection = -1
     @State private var showsDetails = false
 
     public init(
@@ -104,6 +108,7 @@ public struct RecallView: View {
             if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
                     artifactID: moment.imageArtifactId,
+                    quality: isScrubbing ? .thumbnail : .full,
                     blur: tuning.backdropBlur,
                     backdropOpacity: tuning.backdropOpacity,
                     loader: imageLoader
@@ -151,8 +156,8 @@ public struct RecallView: View {
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
         .animation(.easeOut(duration: 0.18), value: showsDetails)
-        .task(id: selectedIndex) {
-            await prefetchAroundSelection()
+        .task(id: "\(selectedIndex):\(movementDirection)") {
+            prefetchAroundSelection()
         }
     }
 
@@ -309,9 +314,11 @@ public struct RecallView: View {
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
         if ended {
             scrollAccumulator = 0
+            isScrubbing = false
             return
         }
         guard delta != 0 else { return }
+        isScrubbing = true
         if isLive, let step = RecallGeometry.liveScrollStep(delta: delta) {
             moveSelection(by: step)
             scrollAccumulator = 0
@@ -347,9 +354,13 @@ public struct RecallView: View {
 
     private func selectTimeline(position: Int) {
         guard !moments.isEmpty else { return }
+        let currentPosition = isLive ? moments.count : selectedIndex
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
+            if position != currentPosition {
+                movementDirection = position > currentPosition ? 1 : -1
+            }
             if position == moments.count {
                 selectedIndex = moments.count - 1
                 isLive = true
@@ -360,33 +371,42 @@ public struct RecallView: View {
         }
     }
 
-    private func prefetchAroundSelection() async {
+    private func prefetchAroundSelection() {
         guard !moments.isEmpty else { return }
         let center = min(max(selectedIndex, 0), moments.count - 1)
-        let offsets = [0, -1, 1, -2, 2, -3, 3]
-        for offset in offsets {
-            guard !Task.isCancelled else { return }
-            let index = center + offset
-            guard moments.indices.contains(index) else { continue }
-            _ = await RecallDecodedImageCache.shared.image(
-                artifactID: moments[index].imageArtifactId,
-                loader: imageLoader
-            )
+        var offsets = [0]
+        for distance in 1...24 {
+            offsets.append(distance * movementDirection)
+            offsets.append(-distance * movementDirection)
         }
+        let artifactIDs = offsets.compactMap { offset -> String? in
+            let index = center + offset
+            return moments.indices.contains(index) ? moments[index].imageArtifactId : nil
+        }
+        RecallDecodedImageCache.shared.prefetch(
+            artifactIDs: artifactIDs,
+            quality: .thumbnail,
+            loader: imageLoader
+        )
     }
 }
 
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
+    let quality: RecallImageQuality
     let blur: Double
     let backdropOpacity: Double
     let loader: RecallImageLoader
     @State private var image: NSImage?
 
     var body: some View {
+        let cachedImage = RecallDecodedImageCache.shared.cached(
+            artifactID: artifactID,
+            quality: quality
+        )
         GeometryReader { geometry in
             ZStack {
-                if let image {
+                if let image = cachedImage ?? image {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFill()
@@ -409,13 +429,17 @@ private struct ImmersiveArtifactImage: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
         }
-        .task(id: artifactID) {
-            if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
+        .task(id: "\(artifactID):\(quality)") {
+            if let cached = RecallDecodedImageCache.shared.cached(
+                artifactID: artifactID,
+                quality: quality
+            ) {
                 image = cached
                 return
             }
             guard let loaded = await RecallDecodedImageCache.shared.image(
                 artifactID: artifactID,
+                quality: quality,
                 loader: loader
             ), !Task.isCancelled else { return }
             image = loaded
@@ -429,39 +453,117 @@ private final class RecallDecodedImageCache {
 
     private let images = NSCache<NSString, NSImage>()
     private var inFlight: [String: Task<NSImage?, Never>] = [:]
+    private var pendingPrefetches: [PrefetchRequest] = []
+    private var activePrefetches = 0
+    private let maximumConcurrentPrefetches = 6
 
     private init() {
-        images.countLimit = 18
-        images.totalCostLimit = 512 * 1_024 * 1_024
+        images.countLimit = 72
+        images.totalCostLimit = 768 * 1_024 * 1_024
     }
 
-    func cached(artifactID: String) -> NSImage? {
-        images.object(forKey: artifactID as NSString)
+    func cached(artifactID: String, quality: RecallImageQuality) -> NSImage? {
+        if quality == .thumbnail,
+           let full = images.object(forKey: cacheKey(artifactID: artifactID, quality: .full) as NSString)
+        {
+            return full
+        }
+        return images.object(forKey: cacheKey(artifactID: artifactID, quality: quality) as NSString)
     }
 
-    func image(artifactID: String, loader: @escaping RecallImageLoader) async -> NSImage? {
-        if let cached = cached(artifactID: artifactID) { return cached }
-        if let existing = inFlight[artifactID] { return await existing.value }
+    func image(
+        artifactID: String,
+        quality: RecallImageQuality,
+        loader: @escaping RecallImageLoader
+    ) async -> NSImage? {
+        if let cached = cached(artifactID: artifactID, quality: quality) { return cached }
+        let key = cacheKey(artifactID: artifactID, quality: quality)
+        if let existing = inFlight[key] { return await existing.value }
 
         let task = Task { @MainActor () -> NSImage? in
-            guard
-                let data = try? await loader(artifactID, .full),
-                let decoded = NSImage(data: data)
-            else { return nil }
-            return decoded
+            guard let data = try? await loader(artifactID, quality) else { return nil }
+            let decoded = await Task.detached(priority: .userInitiated) {
+                Self.decode(data: data, quality: quality)
+            }.value
+            guard let decoded else { return nil }
+            return NSImage(cgImage: decoded, size: .zero)
         }
-        inFlight[artifactID] = task
+        inFlight[key] = task
         let decoded = await task.value
-        inFlight[artifactID] = nil
+        inFlight[key] = nil
         if let decoded {
-            images.setObject(decoded, forKey: artifactID as NSString, cost: estimatedCost(decoded))
+            images.setObject(decoded, forKey: key as NSString, cost: estimatedCost(decoded))
         }
         return decoded
+    }
+
+    func prefetch(
+        artifactIDs: [String],
+        quality: RecallImageQuality,
+        loader: @escaping RecallImageLoader
+    ) {
+        pendingPrefetches = artifactIDs.compactMap { artifactID in
+            let key = cacheKey(artifactID: artifactID, quality: quality)
+            guard
+                cached(artifactID: artifactID, quality: quality) == nil,
+                inFlight[key] == nil
+            else { return nil }
+            return PrefetchRequest(artifactID: artifactID, quality: quality, loader: loader)
+        }
+        pumpPrefetches()
+    }
+
+    private func pumpPrefetches() {
+        while activePrefetches < maximumConcurrentPrefetches, !pendingPrefetches.isEmpty {
+            let request = pendingPrefetches.removeFirst()
+            guard
+                cached(artifactID: request.artifactID, quality: request.quality) == nil,
+                inFlight[request.key] == nil
+            else { continue }
+            activePrefetches += 1
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await image(
+                    artifactID: request.artifactID,
+                    quality: request.quality,
+                    loader: request.loader
+                )
+                activePrefetches -= 1
+                pumpPrefetches()
+            }
+        }
+    }
+
+    private func cacheKey(artifactID: String, quality: RecallImageQuality) -> String {
+        "\(artifactID):\(quality)"
+    }
+
+    nonisolated private static func decode(data: Data, quality: RecallImageQuality) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        if quality == .thumbnail {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 1_600,
+                kCGImageSourceShouldCacheImmediately: true,
+            ]
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        }
+        let options: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: true]
+        return CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary)
     }
 
     private func estimatedCost(_ image: NSImage) -> Int {
         guard let representation = image.representations.first else { return 1 }
         return max(representation.pixelsWide * representation.pixelsHigh * 4, 1)
+    }
+
+    private struct PrefetchRequest {
+        let artifactID: String
+        let quality: RecallImageQuality
+        let loader: RecallImageLoader
+
+        var key: String { "\(artifactID):\(quality)" }
     }
 }
 
@@ -496,8 +598,22 @@ private struct AppUsageTimeline: View {
     let isLive: Bool
     let tuning: RecallVisualTuning
     let onSelect: (Int) -> Void
+    @State private var model: TimelineModel
 
-    private var model: TimelineModel { TimelineModel(moments: moments) }
+    init(
+        moments: [RecallMoment],
+        selectedIndex: Int,
+        isLive: Bool,
+        tuning: RecallVisualTuning,
+        onSelect: @escaping (Int) -> Void
+    ) {
+        self.moments = moments
+        self.selectedIndex = selectedIndex
+        self.isLive = isLive
+        self.tuning = tuning
+        self.onSelect = onSelect
+        _model = State(initialValue: TimelineModel(moments: moments))
+    }
 
     var body: some View {
         VStack(spacing: 9) {
@@ -530,6 +646,13 @@ private struct AppUsageTimeline: View {
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
         }
+        .onChange(of: momentsRevision) {
+            model = TimelineModel(moments: moments)
+        }
+    }
+
+    private var momentsRevision: String {
+        "\(moments.count):\(moments.first?.id ?? "-"):\(moments.last?.id ?? "-")"
     }
 
     private var timestamp: some View {
@@ -801,6 +924,12 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         weak var hostView: NSView?
         var onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
         private var monitor: Any?
+        private var displayLink: CADisplayLink?
+        private var pendingDelta: CGFloat = 0
+        private var pendingIsPrecise = true
+        private var pendingEnd = false
+        private var isScrolling = false
+        private var lastEventTime: CFTimeInterval = 0
 
         init(onScroll: @escaping (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void) {
             self.onScroll = onScroll
@@ -811,15 +940,47 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 guard let self, event.window === self.hostView?.window else { return event }
                 let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
-                let ended = event.phase == .ended || event.momentumPhase == .ended
-                self.onScroll(delta, event.hasPreciseScrollingDeltas, ended)
+                pendingDelta += delta
+                pendingIsPrecise = event.hasPreciseScrollingDeltas
+                pendingEnd = event.phase == .ended || event.momentumPhase == .ended
+                lastEventTime = CACurrentMediaTime()
+                isScrolling = true
                 return event
             }
+            guard let hostView else { return }
+            let displayLink = hostView.displayLink(
+                target: self,
+                selector: #selector(displayLinkDidFire(_:))
+            )
+            displayLink.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 60,
+                maximum: 120,
+                preferred: 120
+            )
+            displayLink.add(to: .main, forMode: .common)
+            self.displayLink = displayLink
         }
 
         func stop() {
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
+            displayLink?.invalidate()
+            displayLink = nil
+        }
+
+        @objc private func displayLinkDidFire(_: CADisplayLink) {
+            let delta = pendingDelta
+            pendingDelta = 0
+            if delta != 0 {
+                onScroll(delta, pendingIsPrecise, false)
+            }
+
+            let wentIdle = isScrolling && CACurrentMediaTime() - lastEventTime >= 0.075
+            if pendingEnd || wentIdle {
+                pendingEnd = false
+                isScrolling = false
+                onScroll(0, pendingIsPrecise, true)
+            }
         }
     }
 }

@@ -23,6 +23,40 @@ final class RecallStoreTests: XCTestCase {
 
         XCTAssertEqual(store.loadState, .loading)
     }
+
+    func testImageRepositoryCoalescesConcurrentArtifactLoads() async throws {
+        let daemon = CountingArtifactDaemon()
+        let repository = RecallImageRepository(daemon: daemon)
+
+        async let first = repository.data(artifactID: "frame-1")
+        async let second = repository.data(artifactID: "frame-1")
+        let (firstData, secondData) = try await (first, second)
+
+        XCTAssertEqual(firstData, Data("frame".utf8))
+        XCTAssertEqual(secondData, firstData)
+        let requestCount = await daemon.requestCount
+        XCTAssertEqual(requestCount, 1)
+    }
+}
+
+private actor CountingArtifactDaemon: RecallDaemonServing {
+    private(set) var requestCount = 0
+
+    func sessions() async throws -> [RecallSession] { [] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+
+    func artifact(id: String) async throws -> ArtifactPayload {
+        requestCount += 1
+        try await Task.sleep(for: .milliseconds(20))
+        return ArtifactPayload(
+            id: id,
+            contentType: "image/jpeg",
+            bytesBase64: Data("frame".utf8).base64EncodedString()
+        )
+    }
+
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
 private actor ConnectionFailingDaemon: RecallDaemonServing {

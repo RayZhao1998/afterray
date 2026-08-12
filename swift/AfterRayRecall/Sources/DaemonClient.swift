@@ -45,45 +45,45 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     }
 
     public func sessions() async throws -> [RecallSession] {
-        try request(WireRequest(type: "sessions_list"), as: [RecallSession].self)
+        try await request(WireRequest(type: "sessions_list"), as: [RecallSession].self)
     }
 
     public func status() async throws -> DaemonStatus {
-        try request(WireRequest(type: "status"), as: DaemonStatus.self)
+        try await request(WireRequest(type: "status"), as: DaemonStatus.self)
     }
 
     public func recordStart() async throws -> RecordStartResult {
-        try request(WireRequest(type: "record_start"), as: RecordStartResult.self)
+        try await request(WireRequest(type: "record_start"), as: RecordStartResult.self)
     }
 
     public func recordStop() async throws -> RecordStopResult {
-        try request(WireRequest(type: "record_stop"), as: RecordStopResult.self)
+        try await request(WireRequest(type: "record_stop"), as: RecordStopResult.self)
     }
 
     public func search(query: String, limit: Int = 30) async throws -> [RecallSearchHit] {
-        try request(
+        try await request(
             WireRequest(type: "search", limit: limit, query: query),
             as: [RecallSearchHit].self
         )
     }
 
     public func moments(sessionID: String) async throws -> [RecallMoment] {
-        try request(WireRequest(type: "moments_list", sessionID: sessionID), as: [RecallMoment].self)
+        try await request(WireRequest(type: "moments_list", sessionID: sessionID), as: [RecallMoment].self)
     }
 
     public func recallWindow(sessionID: String, centerMs: Int64, limit: Int = 120) async throws -> [RecallMoment] {
-        try request(
+        try await request(
             WireRequest(type: "recall_window", sessionID: sessionID, centerMs: centerMs, limit: limit),
             as: [RecallMoment].self
         )
     }
 
     public func artifact(id: String) async throws -> ArtifactPayload {
-        try request(WireRequest(type: "read_artifact", artifactID: id), as: ArtifactPayload.self)
+        try await request(WireRequest(type: "read_artifact", artifactID: id), as: ArtifactPayload.self)
     }
 
     public func setFavorite(momentID: String, favorite: Bool) async throws {
-        let _: EmptyResponse = try request(
+        let _: EmptyResponse = try await request(
             WireRequest(type: "favorite_set", momentID: momentID, favorite: favorite),
             as: EmptyResponse.self,
             allowEmptyObject: true
@@ -94,11 +94,14 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         _ request: WireRequest,
         as type: T.Type,
         allowEmptyObject: Bool = false
-    ) throws -> T {
+    ) async throws -> T {
         let encoder = JSONEncoder()
         var payload = try encoder.encode(request)
         payload.append(0x0A)
-        let responseData = try UnixLineTransport.exchange(path: socketPath, payload: payload)
+        let path = socketPath
+        let responseData = try await Task.detached(priority: .userInitiated) {
+            try UnixLineTransport.exchange(path: path, payload: payload)
+        }.value
 
         guard
             let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
@@ -184,13 +187,19 @@ private enum UnixLineTransport {
             }
         }
 
+        let maximumResponseBytes = 64 * 1_024 * 1_024
         var response = Data()
-        var byte: UInt8 = 0
-        while response.count < 64 * 1_024 * 1_024 {
-            let count = Darwin.read(descriptor, &byte, 1)
+        response.reserveCapacity(256 * 1_024)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while response.count < maximumResponseBytes {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
             guard count > 0 else { break }
-            if byte == 0x0A { break }
-            response.append(byte)
+            let bytes = buffer[..<count]
+            if let newline = bytes.firstIndex(of: 0x0A) {
+                response.append(contentsOf: bytes[..<newline])
+                break
+            }
+            response.append(contentsOf: bytes)
         }
         guard !response.isEmpty else { throw DaemonClientError.connection("empty response") }
         return response
