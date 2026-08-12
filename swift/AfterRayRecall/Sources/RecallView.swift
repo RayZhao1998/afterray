@@ -21,6 +21,8 @@ public struct RecallView: View {
     public var onReload: (() -> Void)?
 
     @State private var dragOriginIndex: Int?
+    @State private var scrollAccumulator: CGFloat = 0
+    @State private var showsDetails = false
 
     public init(
         moments: [RecallMoment],
@@ -52,13 +54,10 @@ public struct RecallView: View {
     public var body: some View {
         ZStack {
             RecallPalette.background.ignoresSafeArea()
-            radialAtmosphere
 
             switch loadState {
             case .loading:
-                ProgressView("Opening your memory…")
-                    .controlSize(.large)
-                    .foregroundStyle(.secondary)
+                loadingView
             case .failed(let message):
                 FailureView(message: message, onReload: onReload)
             case .ready, .processing:
@@ -77,104 +76,159 @@ public struct RecallView: View {
         return false
     }
 
-    private var radialAtmosphere: some View {
-        RadialGradient(
-            colors: [RecallPalette.ray.opacity(tuning.glowStrength * 0.22), .clear],
-            center: .init(x: 0.5, y: 0.42),
-            startRadius: 20,
-            endRadius: 520
-        )
-        .allowsHitTesting(false)
+    private var loadingView: some View {
+        VStack(spacing: 14) {
+            ProgressView().controlSize(.large)
+            Text("Opening your memory…")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var recallContent: some View {
-        VStack(spacing: 0) {
-            topBar
-                .padding(.horizontal, 24)
-                .padding(.top, 18)
-
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 28) {
-                    hero
-                    evidencePanel.frame(width: 300)
-                }
-                VStack(spacing: 20) {
-                    hero
-                    evidencePanel.frame(maxHeight: 210)
-                }
+        ZStack {
+            if let moment = selectedMoment {
+                ImmersiveArtifactImage(
+                    artifactID: moment.imageArtifactId,
+                    blur: tuning.backdropBlur,
+                    backdropOpacity: tuning.backdropOpacity,
+                    loader: imageLoader
+                )
+                .id(moment.imageArtifactId)
+                .transition(.opacity)
             }
-            .padding(.horizontal, 24)
-            .padding(.top, 18)
-            .frame(maxHeight: .infinity)
 
-            timeline
-                .padding(.top, 20)
-                .padding(.bottom, 22)
+            chromeGradients
+
+            VStack(spacing: 0) {
+                momentHeader
+                    .padding(.horizontal, 26)
+                    .padding(.top, 22)
+
+                Spacer(minLength: 100)
+
+                AppUsageTimeline(
+                    moments: moments,
+                    selectedIndex: selectedIndex,
+                    tuning: tuning,
+                    onSelect: { selectedIndex = $0 }
+                )
+                .padding(.horizontal, 26)
+                .padding(.bottom, 18)
+            }
+
+            if showsDetails {
+                detailsPanel
+                    .frame(width: 340)
+                    .padding(.top, 76)
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 154)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+
+            ScrollWheelMonitor(onScroll: handleScroll)
+                .allowsHitTesting(false)
         }
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
+        .onMoveCommand(perform: handleMoveCommand)
+        .animation(.easeOut(duration: 0.18), value: selectedIndex)
+        .animation(.easeOut(duration: 0.18), value: showsDetails)
     }
 
-    private var topBar: some View {
+    private var chromeGradients: some View {
+        ZStack {
+            LinearGradient(
+                colors: [.black.opacity(tuning.topScrimOpacity), .clear],
+                startPoint: .top,
+                endPoint: UnitPoint(x: 0.5, y: 0.23)
+            )
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.52),
+                    .init(color: .black.opacity(0.35), location: 0.72),
+                    .init(color: .black.opacity(tuning.bottomScrimOpacity), location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            LinearGradient(
+                colors: [.black.opacity(0.34), .clear, .black.opacity(0.22)],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+        .allowsHitTesting(false)
+        .ignoresSafeArea()
+    }
+
+    private var momentHeader: some View {
         HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("AFTER RAY")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .tracking(2.4)
-                    .foregroundStyle(RecallPalette.ray)
-                Text(selectedMoment.map(formatTimestamp) ?? "No moment")
-                    .font(.system(size: 17, weight: .medium, design: .rounded))
-                    .monospacedDigit()
-            }
+            AppIdentity(moment: selectedMoment)
 
             Spacer(minLength: 24)
 
             if isProcessing {
                 Label("Understanding", systemImage: "sparkles")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .padding(.horizontal, 11)
+                    .frame(height: 34)
+                    .background(.black.opacity(0.34), in: Capsule())
             }
 
-            Button(action: { onToggleFavorite?() }) {
-                Image(systemName: selectedMoment?.isFavorite == true ? "star.fill" : "star")
-                    .symbolRenderingMode(.monochrome)
-                    .foregroundStyle(selectedMoment?.isFavorite == true ? RecallPalette.ray : .white)
-                    .frame(width: 32, height: 32)
-                    .background(.white.opacity(0.08), in: Circle())
-            }
-            .buttonStyle(RecallPressButtonStyle())
+            chromeButton(
+                symbol: selectedMoment?.isFavorite == true ? "star.fill" : "star",
+                help: selectedMoment?.isFavorite == true ? "Remove favorite" : "Keep this moment",
+                tint: selectedMoment?.isFavorite == true ? RecallPalette.ray : .white,
+                action: { onToggleFavorite?() }
+            )
             .disabled(selectedMoment == nil || onToggleFavorite == nil)
-            .help(selectedMoment?.isFavorite == true ? "Remove favorite" : "Keep this moment")
+
+            chromeButton(
+                symbol: showsDetails ? "sidebar.right" : "info.circle",
+                help: showsDetails ? "Hide captured context" : "Show captured context",
+                tint: .white,
+                action: { showsDetails.toggle() }
+            )
         }
     }
 
-    private var hero: some View {
-        Group {
-            if let moment = selectedMoment {
-                ArtifactImage(
-                    artifactID: moment.imageArtifactId,
-                    quality: .full,
-                    loader: imageLoader
-                )
-                .id(moment.id)
-                .aspectRatio(16 / 10, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(.white.opacity(0.12), lineWidth: 1)
-                }
-                .shadow(color: RecallPalette.ray.opacity(tuning.glowStrength * 0.34), radius: 36)
-                .shadow(color: .black.opacity(0.55), radius: 24, y: 12)
-                .scaleEffect(tuning.selectedScale)
-            }
+    private func chromeButton(
+        symbol: String,
+        help: String,
+        tint: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 38, height: 38)
+                .background(.black.opacity(0.36), in: Circle())
+                .overlay { Circle().stroke(.white.opacity(0.13), lineWidth: 1) }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.easeOut(duration: 0.16), value: selectedIndex)
+        .buttonStyle(RecallPressButtonStyle())
+        .help(help)
     }
 
-    private var evidencePanel: some View {
+    private var detailsPanel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    Text("CAPTURED CONTEXT")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.4)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button { showsDetails = false } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+
                 EvidenceBlock(
                     eyebrow: "ON SCREEN",
                     icon: "text.viewfinder",
@@ -186,10 +240,7 @@ public struct RecallView: View {
                     let artifactID = selectedMoment?.accessibilityArtifactId,
                     let artifactLoader
                 {
-                    AccessibilitySnapshotBlock(
-                        artifactID: artifactID,
-                        loader: artifactLoader
-                    )
+                    AccessibilitySnapshotBlock(artifactID: artifactID, loader: artifactLoader)
                 }
 
                 EvidenceBlock(
@@ -200,9 +251,7 @@ public struct RecallView: View {
                 )
 
                 if let moment = selectedMoment, moment.audioArtifactId != nil {
-                    Button {
-                        onToggleAudio?(moment)
-                    } label: {
+                    Button { onToggleAudio?(moment) } label: {
                         Label("Play from this moment", systemImage: "play.fill")
                             .frame(maxWidth: .infinity)
                     }
@@ -210,60 +259,14 @@ public struct RecallView: View {
                     .disabled(onToggleAudio == nil)
                 }
             }
-            .padding(18)
+            .padding(20)
         }
-        .background(.black.opacity(0.24), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-    }
-
-    private var timeline: some View {
-        ZStack {
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(spacing: tuning.thumbnailSpacing) {
-                        Color.clear.frame(width: 180)
-                        ForEach(Array(moments.enumerated()), id: \.element.id) { index, moment in
-                            TimelineThumbnail(
-                                moment: moment,
-                                distance: abs(selectedIndex - index),
-                                width: tuning.thumbnailWidth,
-                                neighborScale: tuning.neighborScale,
-                                dimOpacity: tuning.dimOpacity,
-                                loader: imageLoader
-                            )
-                            .id(moment.id)
-                            .onTapGesture { selectedIndex = index }
-                        }
-                        Color.clear.frame(width: 180)
-                    }
-                    .padding(.vertical, 18)
-                }
-                .onChange(of: selectedIndex) { _, newIndex in
-                    guard moments.indices.contains(newIndex) else { return }
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        proxy.scrollTo(moments[newIndex].id, anchor: .center)
-                    }
-                }
-                .onAppear {
-                    guard moments.indices.contains(selectedIndex) else { return }
-                    proxy.scrollTo(moments[selectedIndex].id, anchor: .center)
-                }
-            }
-
-            VStack(spacing: 4) {
-                Capsule()
-                    .fill(RecallPalette.ray)
-                    .frame(width: 2, height: 86)
-                    .shadow(color: RecallPalette.ray, radius: 9)
-                Circle()
-                    .fill(.white)
-                    .frame(width: 5, height: 5)
-            }
-            .allowsHitTesting(false)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(.white.opacity(0.13), lineWidth: 1)
         }
-        .frame(height: 126)
-        .background(
-            LinearGradient(colors: [.clear, .black.opacity(0.34), .clear], startPoint: .leading, endPoint: .trailing)
-        )
+        .shadow(color: .black.opacity(0.5), radius: 28, y: 12)
     }
 
     private var recallDrag: some Gesture {
@@ -283,9 +286,430 @@ public struct RecallView: View {
             .onEnded { _ in dragOriginIndex = nil }
     }
 
-    private func formatTimestamp(_ moment: RecallMoment) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(moment.capturedAtMs) / 1_000)
-        return date.formatted(date: .abbreviated, time: .standard)
+    private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
+        if ended {
+            scrollAccumulator = 0
+            return
+        }
+        guard delta != 0 else { return }
+        if !isPrecise {
+            moveSelection(by: delta > 0 ? -1 : 1)
+            return
+        }
+
+        scrollAccumulator += delta
+        let threshold: CGFloat = 24
+        let steps = Int(abs(scrollAccumulator) / threshold)
+        guard steps > 0 else { return }
+        moveSelection(by: scrollAccumulator > 0 ? -steps : steps)
+        scrollAccumulator.formTruncatingRemainder(dividingBy: threshold)
+    }
+
+    private func handleMoveCommand(_ direction: MoveCommandDirection) {
+        switch direction {
+        case .left: moveSelection(by: -1)
+        case .right: moveSelection(by: 1)
+        default: break
+        }
+    }
+
+    private func moveSelection(by delta: Int) {
+        guard let next = RecallGeometry.clampedIndex(selectedIndex + delta, count: moments.count) else { return }
+        selectedIndex = next
+    }
+}
+
+private struct ImmersiveArtifactImage: View {
+    let artifactID: String
+    let blur: Double
+    let backdropOpacity: Double
+    let loader: RecallImageLoader
+    @State private var image: NSImage?
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .blur(radius: blur)
+                        .saturation(0.8)
+                        .opacity(backdropOpacity)
+
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .shadow(color: .black.opacity(0.28), radius: 32)
+                } else {
+                    Rectangle().fill(RecallPalette.background)
+                    ProgressView().controlSize(.small).tint(.white.opacity(0.65))
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+        }
+        .task(id: artifactID) {
+            guard let data = try? await loader(artifactID, .full), let loaded = NSImage(data: data) else { return }
+            image = loaded
+        }
+    }
+}
+
+private struct AppIdentity: View {
+    let moment: RecallMoment?
+
+    var body: some View {
+        HStack(spacing: 11) {
+            ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(moment?.applicationName ?? "Unknown app")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                Text("AFTER RAY")
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .tracking(1.6)
+                    .foregroundStyle(RecallPalette.ray)
+            }
+        }
+        .padding(.leading, 6)
+        .padding(.trailing, 14)
+        .frame(height: 44)
+        .background(.black.opacity(0.38), in: Capsule())
+        .overlay { Capsule().stroke(.white.opacity(0.12), lineWidth: 1) }
+        .shadow(color: .black.opacity(0.25), radius: 14, y: 5)
+    }
+}
+
+private struct AppUsageTimeline: View {
+    let moments: [RecallMoment]
+    let selectedIndex: Int
+    let tuning: RecallVisualTuning
+    let onSelect: (Int) -> Void
+
+    private var model: TimelineModel { TimelineModel(moments: moments) }
+
+    var body: some View {
+        VStack(spacing: 9) {
+            timestamp
+            GeometryReader { geometry in
+                let width = geometry.size.width
+                let contentWidth = model.contentWidth(for: width, density: tuning.timelineDensity)
+                let selectedX = model.x(forMomentAt: selectedIndex, width: contentWidth)
+
+                ZStack(alignment: .leading) {
+                    timelineTrack(width: contentWidth)
+                        .offset(x: width / 2 - selectedX)
+
+                    edgeFade
+
+                    Rectangle()
+                        .fill(RecallPalette.ray)
+                        .frame(width: 2, height: tuning.timelineSegmentHeight + 10)
+                        .position(x: width / 2, y: (tuning.timelineSegmentHeight + 20) / 2)
+                        .shadow(color: RecallPalette.ray.opacity(0.9), radius: 7)
+                }
+                .clipped()
+            }
+            .frame(height: tuning.timelineSegmentHeight + 20)
+
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.left.and.right")
+                Text("Swipe left or right · scroll to travel through time")
+            }
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundStyle(.white.opacity(0.42))
+        }
+    }
+
+    private var timestamp: some View {
+        VStack(spacing: 2) {
+            Text(selectedDate.formatted(date: .omitted, time: .standard))
+                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(selectedDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.58))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.46), in: Capsule())
+        .overlay { Capsule().stroke(.white.opacity(0.12), lineWidth: 1) }
+        .overlay(alignment: .bottom) {
+            Circle()
+                .fill(RecallPalette.ray)
+                .frame(width: 5, height: 5)
+                .offset(y: 11)
+                .shadow(color: RecallPalette.ray, radius: 6)
+        }
+    }
+
+    private var selectedDate: Date {
+        guard moments.indices.contains(selectedIndex) else { return .now }
+        return Date(timeIntervalSince1970: TimeInterval(moments[selectedIndex].capturedAtMs) / 1_000)
+    }
+
+    private func timelineTrack(width: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            HStack(spacing: tuning.timelineSegmentGap) {
+                ForEach(model.runs) { run in
+                    let runWidth = model.width(
+                        for: run,
+                        contentWidth: width,
+                        segmentGap: tuning.timelineSegmentGap
+                    )
+                    Button { onSelect(run.centerIndex) } label: {
+                        AppUsageSegmentView(
+                            run: run,
+                            width: runWidth,
+                            height: tuning.timelineSegmentHeight
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: runWidth)
+                    .help("\(run.applicationName) · \(run.durationLabel)")
+                }
+            }
+            .frame(width: width, alignment: .leading)
+
+            ForEach(Array(moments.enumerated()).filter(\.element.isFavorite), id: \.element.id) { index, _ in
+                Image(systemName: "star.fill")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.white)
+                    .position(x: model.x(forMomentAt: index, width: width), y: 2)
+            }
+        }
+        .frame(width: width, height: 56)
+        .padding(.vertical, 6)
+    }
+
+    private var edgeFade: some View {
+        HStack(spacing: 0) {
+            LinearGradient(colors: [.black.opacity(0.72), .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 42)
+            Spacer()
+            LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 42)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct AppUsageSegmentView: View {
+    let run: AppUsageRun
+    let width: CGFloat
+    let height: Double
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [run.color.opacity(0.92), run.color.opacity(0.62)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(.white.opacity(0.15), lineWidth: 1)
+                }
+
+            if width >= 42 {
+                HStack(spacing: 7) {
+                    ApplicationIcon(bundleIdentifier: run.bundleIdentifier, size: 22)
+                    if width >= 92 {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(run.applicationName)
+                                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                .lineLimit(1)
+                            Text(run.durationLabel)
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.66))
+                                .monospacedDigit()
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+        }
+        .frame(height: height)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct ApplicationIcon: View {
+    let bundleIdentifier: String?
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                Image(systemName: "macwindow")
+                    .font(.system(size: size * 0.46, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.white.opacity(0.12))
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.24, style: .continuous))
+    }
+
+    private var icon: NSImage? {
+        guard
+            let bundleIdentifier,
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        else { return nil }
+        return NSWorkspace.shared.icon(forFile: url.path)
+    }
+}
+
+private struct AppUsageRun: Identifiable {
+    let id: Int
+    let applicationName: String
+    let bundleIdentifier: String?
+    let startMs: Int64
+    let endMs: Int64
+    let startIndex: Int
+    let endIndex: Int
+    let color: Color
+
+    var centerIndex: Int { startIndex + (endIndex - startIndex) / 2 }
+    var durationMs: Int64 { max(endMs - startMs, 1_000) }
+    var durationLabel: String { DurationFormatter.short(milliseconds: durationMs) }
+}
+
+private struct TimelineModel {
+    let moments: [RecallMoment]
+    let runs: [AppUsageRun]
+    let startMs: Int64
+    let endMs: Int64
+
+    init(moments: [RecallMoment]) {
+        self.moments = moments
+        guard let first = moments.first, let last = moments.last else {
+            runs = []
+            startMs = 0
+            endMs = 1
+            return
+        }
+
+        let intervals = zip(moments, moments.dropFirst())
+            .map { max($1.capturedAtMs - $0.capturedAtMs, 1_000) }
+            .sorted()
+        let trailingInterval = intervals.isEmpty ? 10_000 : intervals[intervals.count / 2]
+        startMs = first.capturedAtMs
+        endMs = last.capturedAtMs + min(trailingInterval, 60_000)
+
+        var collected: [AppUsageRun] = []
+        var runStart = 0
+        for index in 1...moments.count {
+            let endsRun = index == moments.count || Self.identity(of: moments[index]) != Self.identity(of: moments[runStart])
+            guard endsRun else { continue }
+            let runEndMs = index < moments.count ? moments[index].capturedAtMs : endMs
+            let identity = Self.identity(of: moments[runStart])
+            collected.append(
+                AppUsageRun(
+                    id: collected.count,
+                    applicationName: identity.name,
+                    bundleIdentifier: identity.bundle,
+                    startMs: moments[runStart].capturedAtMs,
+                    endMs: runEndMs,
+                    startIndex: runStart,
+                    endIndex: index - 1,
+                    color: RecallPalette.appColor(seed: identity.bundle ?? identity.name)
+                )
+            )
+            runStart = index
+        }
+        runs = collected
+    }
+
+    func contentWidth(for viewportWidth: CGFloat, density: Double) -> CGFloat {
+        let seconds = CGFloat(max(endMs - startMs, 1)) / 1_000
+        return max(viewportWidth * 1.18, min(seconds * density, 9_000))
+    }
+
+    func width(for run: AppUsageRun, contentWidth: CGFloat, segmentGap: Double) -> CGFloat {
+        let fraction = CGFloat(run.durationMs) / CGFloat(max(endMs - startMs, 1))
+        return max(contentWidth * fraction - segmentGap, 5)
+    }
+
+    func x(forMomentAt index: Int, width: CGFloat) -> CGFloat {
+        guard moments.indices.contains(index) else { return 0 }
+        let elapsed = moments[index].capturedAtMs - startMs
+        return width * CGFloat(elapsed) / CGFloat(max(endMs - startMs, 1))
+    }
+
+    private static func identity(of moment: RecallMoment) -> (name: String, bundle: String?) {
+        (moment.applicationName ?? "Unknown app", moment.bundleIdentifier)
+    }
+}
+
+private enum DurationFormatter {
+    static func short(milliseconds: Int64) -> String {
+        let totalMinutes = max(Int((Double(milliseconds) / 60_000).rounded()), 1)
+        if totalMinutes < 60 { return "\(totalMinutes)m" }
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+    }
+}
+
+private struct ScrollWheelMonitor: NSViewRepresentable {
+    let onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onScroll: onScroll) }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.hostView = view
+        context.coordinator.start()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.hostView = nsView
+        context.coordinator.onScroll = onScroll
+    }
+
+    static func dismantleNSView(_: NSView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    @MainActor
+    final class Coordinator {
+        weak var hostView: NSView?
+        var onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
+        private var monitor: Any?
+
+        init(onScroll: @escaping (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void) {
+            self.onScroll = onScroll
+        }
+
+        func start() {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, event.window === self.hostView?.window else { return event }
+                let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+                let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
+                let ended = event.phase == .ended || event.momentumPhase == .ended
+                self.onScroll(delta, event.hasPreciseScrollingDeltas, ended)
+                return event
+            }
+        }
+
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
     }
 }
 
@@ -330,64 +754,6 @@ private struct AccessibilitySnapshotBlock: View {
     }
 }
 
-private struct TimelineThumbnail: View {
-    let moment: RecallMoment
-    let distance: Int
-    let width: Double
-    let neighborScale: Double
-    let dimOpacity: Double
-    let loader: RecallImageLoader
-
-    var body: some View {
-        ArtifactImage(artifactID: moment.imageArtifactId, quality: .thumbnail, loader: loader)
-            .frame(width: width, height: width * 0.625)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(alignment: .topTrailing) {
-                if moment.isFavorite {
-                    Image(systemName: "star.fill")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(6)
-                        .background(RecallPalette.ray, in: Circle())
-                        .padding(5)
-                }
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(.white.opacity(distance == 0 ? 0.32 : 0.10), lineWidth: 1)
-            }
-            .scaleEffect(distance == 0 ? 1 : max(neighborScale - Double(distance) * 0.035, 0.72))
-            .opacity(distance == 0 ? 1 : max(1 - dimOpacity - Double(distance) * 0.08, 0.28))
-            .animation(.easeOut(duration: 0.14), value: distance)
-    }
-}
-
-private struct ArtifactImage: View {
-    let artifactID: String
-    let quality: RecallImageQuality
-    let loader: RecallImageLoader
-
-    @State private var data: Data?
-
-    var body: some View {
-        ZStack {
-            Rectangle().fill(.white.opacity(0.04))
-            if let data, let image = NSImage(data: data) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                ProgressView().controlSize(.small).tint(.white.opacity(0.6))
-            }
-        }
-        .clipped()
-        .task(id: artifactID) {
-            data = nil
-            data = try? await loader(artifactID, quality)
-        }
-    }
-}
-
 private struct EvidenceBlock: View {
     let eyebrow: String
     let icon: String
@@ -401,7 +767,7 @@ private struct EvidenceBlock: View {
                 .tracking(1.3)
                 .foregroundStyle(RecallPalette.ray.opacity(0.9))
             Text(text?.isEmpty == false ? text! : emptyText)
-                .font(.system(size: 14, weight: .regular, design: .rounded))
+                .font(.system(size: 13, weight: .regular, design: .rounded))
                 .foregroundStyle(text?.isEmpty == false ? .primary : .secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -413,18 +779,26 @@ private struct EmptyRecallView: View {
     let isProcessing: Bool
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: isProcessing ? "sparkles.rectangle.stack" : "rectangle.stack")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(RecallPalette.ray)
-            Text(isProcessing ? "The first moments are being prepared" : "Nothing to look back on yet")
-                .font(.title3.weight(.medium))
-            Text(isProcessing ? "Keep AfterRay running for a moment." : "Start a recording session from the CLI, then return here.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        ZStack {
+            RadialGradient(
+                colors: [RecallPalette.ray.opacity(0.18), .clear],
+                center: .center,
+                startRadius: 20,
+                endRadius: 420
+            )
+            VStack(spacing: 14) {
+                Image(systemName: isProcessing ? "sparkles.rectangle.stack" : "rectangle.stack")
+                    .font(.system(size: 36, weight: .light))
+                    .foregroundStyle(RecallPalette.ray)
+                Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
+                    .font(.title2.weight(.medium))
+                Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .multilineTextAlignment(.center)
+            .padding(40)
         }
-        .multilineTextAlignment(.center)
-        .padding(40)
     }
 }
 
@@ -451,8 +825,8 @@ private struct FailureView: View {
 private struct RecallPressButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-            .opacity(configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .opacity(configuration.isPressed ? 0.76 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
@@ -471,6 +845,19 @@ private struct RecallCapsuleButtonStyle: ButtonStyle {
 }
 
 private enum RecallPalette {
-    static let background = Color(red: 0.025, green: 0.022, blue: 0.026)
-    static let ray = Color(red: 1.0, green: 0.22, blue: 0.16)
+    static let background = Color(red: 0.018, green: 0.016, blue: 0.020)
+    static let ray = Color(red: 1.0, green: 0.20, blue: 0.14)
+
+    static func appColor(seed: String) -> Color {
+        let palette = [
+            Color(red: 0.93, green: 0.20, blue: 0.14),
+            Color(red: 0.86, green: 0.34, blue: 0.16),
+            Color(red: 0.68, green: 0.23, blue: 0.42),
+            Color(red: 0.38, green: 0.34, blue: 0.72),
+            Color(red: 0.19, green: 0.46, blue: 0.58),
+            Color(red: 0.26, green: 0.52, blue: 0.39),
+        ]
+        let hash = seed.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
+        return palette[Int(UInt(bitPattern: hash) % UInt(palette.count))]
+    }
 }

@@ -449,7 +449,8 @@ async fn import_artifact(
             });
         }
         ArtifactKind::Accessibility => {
-            let attached = state.store.attach_accessibility_snapshot(
+            let attached = attach_accessibility_artifact(
+                &state.store,
                 session_id,
                 started_at_ms,
                 content_type,
@@ -464,6 +465,30 @@ async fn import_artifact(
         }
     }
     Ok(())
+}
+
+#[derive(Default, serde::Deserialize)]
+struct AccessibilityMetadata {
+    application_name: Option<String>,
+    bundle_identifier: Option<String>,
+}
+
+fn attach_accessibility_artifact(
+    store: &Vault,
+    session_id: &str,
+    captured_at_ms: i64,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<Option<String>, StoreError> {
+    let metadata = serde_json::from_slice::<AccessibilityMetadata>(bytes).unwrap_or_default();
+    store.attach_accessibility_snapshot(
+        session_id,
+        captured_at_ms,
+        content_type,
+        bytes,
+        metadata.application_name.as_deref(),
+        metadata.bundle_identifier.as_deref(),
+    )
 }
 
 async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {

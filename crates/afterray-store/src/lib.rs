@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::{collections::HashMap, fs, path::PathBuf, process::Command, sync::Mutex};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const KEYCHAIN_SERVICE: &str = "dev.afterray.v0.vault";
 
@@ -201,7 +201,9 @@ impl Vault {
                       ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
                         audio.started_at_ms DESC
                       LIMIT 1),
-                    m.accessibility_artifact_id
+                    m.accessibility_artifact_id,
+                    m.application_name,
+                    m.bundle_identifier
              FROM moments m WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
         )?;
         let rows = statement.query_map([session_id], moment_from_row)?;
@@ -226,6 +228,8 @@ impl Vault {
             transcript_text: None,
             audio_artifact_id: None,
             accessibility_artifact_id: None,
+            application_name: None,
+            bundle_identifier: None,
         };
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO moments (id, session_id, captured_at_ms, image_artifact_id, is_favorite)
@@ -285,6 +289,8 @@ impl Vault {
         captured_at_ms: i64,
         content_type: &str,
         snapshot: &[u8],
+        application_name: Option<&str>,
+        bundle_identifier: Option<&str>,
     ) -> Result<Option<String>, StoreError> {
         let candidate = self
             .connection
@@ -317,8 +323,12 @@ impl Vault {
         let update_result = {
             let connection = self.connection.lock().unwrap();
             connection.execute(
-                "UPDATE moments SET accessibility_artifact_id = ?2 WHERE id = ?1",
-                params![moment_id, artifact_id],
+                "UPDATE moments
+                    SET accessibility_artifact_id = ?2,
+                        application_name = ?3,
+                        bundle_identifier = ?4
+                  WHERE id = ?1",
+                params![moment_id, artifact_id, application_name, bundle_identifier],
             )
         };
         if let Err(error) = update_result {
@@ -832,7 +842,9 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
            captured_at_ms INTEGER NOT NULL,
            image_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
            is_favorite INTEGER NOT NULL DEFAULT 0,
-           accessibility_artifact_id TEXT REFERENCES artifacts(id)
+           accessibility_artifact_id TEXT REFERENCES artifacts(id),
+           application_name TEXT,
+           bundle_identifier TEXT
          );
          CREATE INDEX IF NOT EXISTS moments_session_time ON moments(session_id, captured_at_ms);
          CREATE TABLE IF NOT EXISTS audio_segments (
@@ -884,6 +896,24 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [],
         )?;
     }
+    let moment_columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if !moment_columns
+        .iter()
+        .any(|column| column == "application_name")
+    {
+        connection.execute("ALTER TABLE moments ADD COLUMN application_name TEXT", [])?;
+    }
+    if !moment_columns
+        .iter()
+        .any(|column| column == "bundle_identifier")
+    {
+        connection.execute("ALTER TABLE moments ADD COLUMN bundle_identifier TEXT", [])?;
+    }
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
 }
@@ -899,6 +929,8 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         transcript_text: row.get(6)?,
         audio_artifact_id: row.get(7)?,
         accessibility_artifact_id: row.get(8)?,
+        application_name: row.get(9)?,
+        bundle_identifier: row.get(10)?,
     })
 }
 
@@ -1029,12 +1061,15 @@ mod tests {
                 11_500,
                 "application/vnd.afterray.ax+json",
                 br#"{"root":{"role":"AXWindow"}}"#,
+                Some("Xcode"),
+                Some("com.apple.dt.Xcode"),
             )
             .unwrap();
         assert!(artifact.is_some());
         let loaded = vault.moments_sync(&session.id).unwrap();
         assert_eq!(loaded[0].id, moment.id);
         assert_eq!(loaded[0].accessibility_artifact_id, artifact);
+        assert_eq!(loaded[0].application_name.as_deref(), Some("Xcode"));
 
         let too_late = vault
             .attach_accessibility_snapshot(
@@ -1042,6 +1077,8 @@ mod tests {
                 12_001,
                 "application/vnd.afterray.ax+json",
                 b"{}",
+                None,
+                None,
             )
             .unwrap();
         assert!(too_late.is_none());

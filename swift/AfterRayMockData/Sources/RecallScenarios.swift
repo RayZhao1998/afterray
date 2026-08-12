@@ -52,8 +52,16 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
             "The daemon should own storage while the interface stays replaceable.",
             "We can validate this with a real day of recording before adding more product surface.",
         ]
+        let applications = [
+            ("Figma", "com.figma.Desktop"),
+            ("Safari", "com.apple.Safari"),
+            ("Xcode", "com.apple.dt.Xcode"),
+            ("Slack", "com.tinyspeck.slackmacgap"),
+            ("Notion", "notion.id"),
+        ]
         return (0..<count).map { index in
-            RecallMoment(
+            let app = applications[min(index / 7, applications.count - 1) % applications.count]
+            return RecallMoment(
                 id: "moment-\(index)",
                 sessionId: "session-today",
                 capturedAtMs: base + Int64(index * 42_000),
@@ -61,7 +69,9 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
                 isFavorite: favoriteEvery.map { index.isMultiple(of: $0) } ?? false,
                 ocrText: processing && index > count - 4 ? nil : screenCopy[index % screenCopy.count],
                 transcriptText: processing && index > count - 6 ? nil : transcriptCopy[index % transcriptCopy.count],
-                audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil
+                audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil,
+                applicationName: app.0,
+                bundleIdentifier: app.1
             )
         }
     }

@@ -30,6 +30,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     /// Optional until the daemon's recall read model attaches the nearest audio segment.
     public let audioArtifactId: String?
     public let accessibilityArtifactId: String?
+    public let applicationName: String?
+    public let bundleIdentifier: String?
 
     public init(
         id: String,
@@ -40,7 +42,9 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         ocrText: String? = nil,
         transcriptText: String? = nil,
         audioArtifactId: String? = nil,
-        accessibilityArtifactId: String? = nil
+        accessibilityArtifactId: String? = nil,
+        applicationName: String? = nil,
+        bundleIdentifier: String? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -51,6 +55,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.transcriptText = transcriptText
         self.audioArtifactId = audioArtifactId
         self.accessibilityArtifactId = accessibilityArtifactId
+        self.applicationName = applicationName
+        self.bundleIdentifier = bundleIdentifier
     }
 
     enum CodingKeys: String, CodingKey {
@@ -63,6 +69,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case transcriptText = "transcript_text"
         case audioArtifactId = "audio_artifact_id"
         case accessibilityArtifactId = "accessibility_artifact_id"
+        case applicationName = "application_name"
+        case bundleIdentifier = "bundle_identifier"
     }
 }
 
@@ -196,29 +204,32 @@ public enum RecallLoadState: Equatable, Sendable {
 }
 
 public struct RecallVisualTuning: Equatable, Sendable {
-    public var thumbnailWidth: Double
-    public var thumbnailSpacing: Double
-    public var selectedScale: Double
-    public var neighborScale: Double
-    public var dimOpacity: Double
-    public var glowStrength: Double
+    public var backdropBlur: Double
+    public var backdropOpacity: Double
+    public var topScrimOpacity: Double
+    public var bottomScrimOpacity: Double
+    public var timelineDensity: Double
+    public var timelineSegmentHeight: Double
+    public var timelineSegmentGap: Double
     public var dragPointsPerMoment: Double
 
     public init(
-        thumbnailWidth: Double = 112,
-        thumbnailSpacing: Double = 10,
-        selectedScale: Double = 1.0,
-        neighborScale: Double = 0.84,
-        dimOpacity: Double = 0.30,
-        glowStrength: Double = 0.62,
+        backdropBlur: Double = 42,
+        backdropOpacity: Double = 0.68,
+        topScrimOpacity: Double = 0.58,
+        bottomScrimOpacity: Double = 0.92,
+        timelineDensity: Double = 0.12,
+        timelineSegmentHeight: Double = 48,
+        timelineSegmentGap: Double = 2,
         dragPointsPerMoment: Double = 54
     ) {
-        self.thumbnailWidth = thumbnailWidth
-        self.thumbnailSpacing = thumbnailSpacing
-        self.selectedScale = selectedScale
-        self.neighborScale = neighborScale
-        self.dimOpacity = dimOpacity
-        self.glowStrength = glowStrength
+        self.backdropBlur = backdropBlur
+        self.backdropOpacity = backdropOpacity
+        self.topScrimOpacity = topScrimOpacity
+        self.bottomScrimOpacity = bottomScrimOpacity
+        self.timelineDensity = timelineDensity
+        self.timelineSegmentHeight = timelineSegmentHeight
+        self.timelineSegmentGap = timelineSegmentGap
         self.dragPointsPerMoment = dragPointsPerMoment
     }
 

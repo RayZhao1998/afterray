@@ -71,12 +71,13 @@ private struct VisualLabView: View {
                 .pickerStyle(.menu)
 
                 VStack(spacing: 18) {
-                    TuneSlider(title: "Thumbnail width", value: $tuning.thumbnailWidth, range: 72...168)
-                    TuneSlider(title: "Thumbnail spacing", value: $tuning.thumbnailSpacing, range: 2...28)
-                    TuneSlider(title: "Selected scale", value: $tuning.selectedScale, range: 0.86...1.08)
-                    TuneSlider(title: "Neighbor scale", value: $tuning.neighborScale, range: 0.64...1)
-                    TuneSlider(title: "Dim opacity", value: $tuning.dimOpacity, range: 0...0.72)
-                    TuneSlider(title: "Red glow", value: $tuning.glowStrength, range: 0...1)
+                    TuneSlider(title: "Backdrop blur", value: $tuning.backdropBlur, range: 0...80)
+                    TuneSlider(title: "Backdrop opacity", value: $tuning.backdropOpacity, range: 0...1)
+                    TuneSlider(title: "Top scrim", value: $tuning.topScrimOpacity, range: 0...1)
+                    TuneSlider(title: "Bottom scrim", value: $tuning.bottomScrimOpacity, range: 0...1)
+                    TuneSlider(title: "Timeline density", value: $tuning.timelineDensity, range: 0.04...0.36)
+                    TuneSlider(title: "Segment height", value: $tuning.timelineSegmentHeight, range: 30...72)
+                    TuneSlider(title: "Segment gap", value: $tuning.timelineSegmentGap, range: 0...8)
                     TuneSlider(title: "Drag sensitivity", value: $tuning.dragPointsPerMoment, range: 20...120)
                 }
 

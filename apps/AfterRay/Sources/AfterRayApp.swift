@@ -41,36 +41,36 @@ private struct AfterRayRootView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ControlBar(
+        RecallView(
+            moments: store.moments,
+            selectedIndex: Binding(
+                get: { store.selectedIndex },
+                set: { store.select(index: $0) }
+            ),
+            loadState: store.loadState,
+            imageLoader: { artifactID, _ in
+                try await images.data(artifactID: artifactID)
+            },
+            artifactLoader: { artifactID in
+                try await images.data(artifactID: artifactID)
+            },
+            onToggleFavorite: {
+                Task { await store.toggleFavorite() }
+            },
+            onToggleAudio: { moment in
+                Task { await audioPlayer.toggle(moment: moment) }
+            },
+            onReload: reload
+        )
+        .background(Color(red: 0.025, green: 0.022, blue: 0.026))
+        .overlay(alignment: .top) {
+            ImmersiveControlBar(
                 model: control,
                 onToggleRecording: toggleRecording,
                 onSearch: { Task { await control.search() } }
             )
-
-            RecallView(
-                moments: store.moments,
-                selectedIndex: Binding(
-                    get: { store.selectedIndex },
-                    set: { store.select(index: $0) }
-                ),
-                loadState: store.loadState,
-                imageLoader: { artifactID, _ in
-                    try await images.data(artifactID: artifactID)
-                },
-                artifactLoader: { artifactID in
-                    try await images.data(artifactID: artifactID)
-                },
-                onToggleFavorite: {
-                    Task { await store.toggleFavorite() }
-                },
-                onToggleAudio: { moment in
-                    Task { await audioPlayer.toggle(moment: moment) }
-                },
-                onReload: reload
-            )
+            .padding(.top, 22)
         }
-        .background(Color(red: 0.025, green: 0.022, blue: 0.026))
         .overlay(alignment: .topTrailing) {
             if !control.searchHits.isEmpty {
                 SearchResultsPanel(
@@ -79,8 +79,8 @@ private struct AfterRayRootView: View {
                     onDismiss: control.dismissSearch
                 )
                 .frame(width: 390)
-                .padding(.top, 56)
-                .padding(.trailing, 18)
+                .padding(.top, 74)
+                .padding(.trailing, 24)
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
         }
@@ -237,47 +237,43 @@ private struct PermissionPanel: View {
     }
 }
 
-private struct ControlBar: View {
+private struct ImmersiveControlBar: View {
     @ObservedObject var model: AfterRayControlModel
     let onToggleRecording: () -> Void
     let onSearch: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 10) {
             HStack(spacing: 7) {
                 Circle()
                     .fill(model.isRecording ? Color.red : Color.secondary.opacity(0.55))
-                    .frame(width: 7, height: 7)
+                    .frame(width: 6, height: 6)
                     .shadow(color: model.isRecording ? .red.opacity(0.8) : .clear, radius: 5)
                 Text(statusLabel)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.72))
             }
 
             Button(action: onToggleRecording) {
-                Label(
-                    model.isRecording ? "Pause" : "Resume",
-                    systemImage: model.isRecording ? "stop.fill" : "record.circle"
-                )
+                Image(systemName: model.isRecording ? "pause.fill" : "record.circle")
+                    .frame(width: 26, height: 26)
             }
-            .buttonStyle(RecordingButtonStyle(isRecording: model.isRecording))
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.82))
             .disabled(!model.canToggleRecording)
+            .help(model.isRecording ? "Pause capture" : "Resume capture")
 
-            Spacer(minLength: 20)
-
-            if let message = model.message {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(maxWidth: 280, alignment: .trailing)
-            }
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(width: 1, height: 18)
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search OCR and transcript", text: $model.searchQuery)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.56))
+                TextField("Search your day", text: $model.searchQuery)
                     .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
                     .onSubmit(onSearch)
                 if model.isSearching {
                     ProgressView().controlSize(.small)
@@ -288,14 +284,14 @@ private struct ControlBar: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 12)
-            .frame(width: 290, height: 32)
-            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .frame(width: 224)
         }
-        .padding(.horizontal, 18)
-        .frame(height: 52)
-        .background(.black.opacity(0.82))
-        .overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.07)).frame(height: 1) }
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .background(.ultraThinMaterial, in: Capsule())
+        .background(.black.opacity(0.28), in: Capsule())
+        .overlay { Capsule().stroke(.white.opacity(0.13), lineWidth: 1) }
+        .shadow(color: .black.opacity(0.34), radius: 18, y: 6)
     }
 
     private var statusLabel: String {

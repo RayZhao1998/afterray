@@ -108,6 +108,8 @@ pub struct Moment {
     pub transcript_text: Option<String>,
     pub audio_artifact_id: Option<String>,
     pub accessibility_artifact_id: Option<String>,
+    pub application_name: Option<String>,
+    pub bundle_identifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
