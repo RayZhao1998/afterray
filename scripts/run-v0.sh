@@ -159,6 +159,7 @@ if [[ -x "$mlx_runtime/bin/python3" ]]; then
   export PATH="$mlx_runtime/bin:$PATH"
 fi
 daemon_log="$run_dir/afterrayd.log"
+app_log="$run_dir/afterray-app.log"
 
 if [[ "$mode" == 'app' ]]; then
   export AFTERRAY_DAEMON="$app_bundle/Contents/Helpers/afterrayd"
@@ -166,10 +167,29 @@ if [[ "$mode" == 'app' ]]; then
   export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"
   export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray_model_worker.py"
   printf '%s\n' \
-    '==> Opening AfterRay.app' \
+    '==> Opening AfterRay.app through LaunchServices' \
     'The app will request Screen Recording, Microphone, and Accessibility access.' \
     'Recording starts automatically once all three permissions are enabled.'
-  "$app_bundle/Contents/MacOS/AfterRay"
+
+  open_args=(-n -W -F --stderr "$app_log")
+  launch_environment=(
+    AFTERRAY_SOCKET
+    AFTERRAY_DATA_DIR
+    AFTERRAY_DAEMON
+    AFTERRAY_CAPTURE_SHIM
+    AFTERRAY_NATIVE_MODEL_WORKER
+    AFTERRAY_MODEL_WORKER
+    AFTERRAY_WHISPER_MODEL
+    AFTERRAY_EMBEDDING_MODEL
+    AFTERRAY_LLM_MODEL
+    PATH
+  )
+  for variable_name in "${launch_environment[@]}"; do
+    if [[ -n "${!variable_name:-}" ]]; then
+      open_args+=(--env "$variable_name=${!variable_name}")
+    fi
+  done
+  open "${open_args[@]}" "$app_bundle"
   exit $?
 fi
 
