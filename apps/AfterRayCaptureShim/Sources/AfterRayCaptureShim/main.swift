@@ -1,9 +1,12 @@
 @preconcurrency import AVFoundation
 import ApplicationServices
 import AppKit
+import CoreGraphics
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
+
+private let afterRayAppBundleIdentifier = "dev.afterray.app"
 
 private struct Options {
     let outputDirectory: URL
@@ -298,7 +301,7 @@ private func captureAccessibilityTree(
     outputDirectory: URL,
     events: EventWriter
 ) throws {
-    guard let application = NSWorkspace.shared.frontmostApplication else {
+    guard let application = capturedForegroundApplication() else {
         events.send(.warning(code: "ax_no_frontmost_app", message: "No foreground application was available"))
         return
     }
@@ -323,6 +326,31 @@ private func captureAccessibilityTree(
         endedAtMs: capturedAtMs,
         requestId: requestId
     ))
+}
+
+private func capturedForegroundApplication() -> NSRunningApplication? {
+    if
+        let frontmost = NSWorkspace.shared.frontmostApplication,
+        frontmost.bundleIdentifier != afterRayAppBundleIdentifier
+    {
+        return frontmost
+    }
+
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+    for window in windows {
+        guard
+            (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+            let processId = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+            let application = NSRunningApplication(processIdentifier: processId),
+            application.bundleIdentifier != afterRayAppBundleIdentifier,
+            application.activationPolicy == .regular
+        else { continue }
+        return application
+    }
+    return nil
 }
 
 private final class EventWriter: @unchecked Sendable {
@@ -494,6 +522,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
     }
 }
 
+@MainActor
 private func captureScreen(
     requestId: String,
     filter: SCContentFilter,
@@ -574,7 +603,14 @@ private enum AfterRayCaptureShim {
             screenshotConfiguration.height = display.height
             screenshotConfiguration.showsCursor = true
 
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let excludedApplications = content.applications.filter {
+                $0.bundleIdentifier == afterRayAppBundleIdentifier
+            }
+            let filter = SCContentFilter(
+                display: display,
+                excludingApplications: excludedApplications,
+                exceptingWindows: []
+            )
             let output = CaptureOutput(options: options, events: events)
             let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)

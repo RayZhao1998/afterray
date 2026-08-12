@@ -1,5 +1,6 @@
 import AfterRayRecall
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
 
 @main
@@ -7,100 +8,157 @@ struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("AfterRay", id: "recall") {
-            AfterRayRootView()
-                .frame(minWidth: 900, minHeight: 620)
-        }
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1_180, height: 760)
+        Settings { EmptyView() }
     }
 }
 
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        RecallOverlayController.shared.start()
+    }
+
     func applicationWillTerminate(_: Notification) {
+        RecallOverlayController.shared.stop()
         DaemonSupervisor.shared.stop()
     }
 }
 
-@MainActor
-private final class AutomaticFullscreenController {
-    static let shared = AutomaticFullscreenController()
+private final class RecallOverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 
-    private weak var window: NSWindow?
-    private var windowWaiters: [CheckedContinuation<NSWindow, Never>] = []
-    private var entryContinuation: CheckedContinuation<Void, Never>?
-    private var entryObserver: NSObjectProtocol?
-    private var didRequestEntry = false
-
-    func register(window: NSWindow) {
-        guard self.window !== window else { return }
-        self.window = window
-        window.collectionBehavior.insert(.fullScreenPrimary)
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = false
-
-        let waiters = windowWaiters
-        windowWaiters.removeAll()
-        waiters.forEach { $0.resume(returning: window) }
-    }
-
-    func enterOnce() async {
-        let window = await resolveWindow()
-        guard !didRequestEntry else { return }
-        didRequestEntry = true
-        guard !window.styleMask.contains(.fullScreen) else { return }
-
-        await withCheckedContinuation { continuation in
-            entryContinuation = continuation
-            entryObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didEnterFullScreenNotification,
-                object: window,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.finishEntry() }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                self?.finishEntry()
-            }
-            window.toggleFullScreen(nil)
-        }
-    }
-
-    private func resolveWindow() async -> NSWindow {
-        if let window { return window }
-        return await withCheckedContinuation { continuation in
-            windowWaiters.append(continuation)
-        }
-    }
-
-    private func finishEntry() {
-        if let entryObserver {
-            NotificationCenter.default.removeObserver(entryObserver)
-            self.entryObserver = nil
-        }
-        entryContinuation?.resume()
-        entryContinuation = nil
+    override func cancelOperation(_: Any?) {
+        RecallOverlayController.shared.hide(returnFocus: true)
     }
 }
 
-private struct AutomaticFullscreenProbe: NSViewRepresentable {
-    func makeNSView(context _: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        registerWindow(from: view)
-        return view
+private let recallHotKeyHandler: EventHandlerUPP = { _, _, _ in
+    DispatchQueue.main.async {
+        RecallOverlayController.shared.toggle()
+    }
+    return noErr
+}
+
+@MainActor
+private final class RecallOverlayController {
+    static let shared = RecallOverlayController()
+
+    private var panel: RecallOverlayPanel?
+    private var previousApplication: NSRunningApplication?
+    private var hotKey: EventHotKeyRef?
+    private var eventHandler: EventHandlerRef?
+
+    func start() {
+        guard panel == nil else { return }
+
+        let panel = RecallOverlayPanel(
+            contentRect: .zero,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = NSHostingView(rootView: AfterRayRootView())
+        panel.backgroundColor = .black
+        panel.isOpaque = true
+        panel.hasShadow = false
+        panel.isMovable = false
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.hidesOnDeactivate = true
+        panel.isReleasedWhenClosed = false
+        panel.animationBehavior = .none
+        panel.level = .statusBar
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .transient,
+            .ignoresCycle,
+        ]
+        self.panel = panel
+        registerHotKey()
+        show()
     }
 
-    func updateNSView(_ nsView: NSView, context _: Context) {
-        registerWindow(from: nsView)
+    func stop() {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let eventHandler { RemoveEventHandler(eventHandler) }
+        hotKey = nil
+        eventHandler = nil
+        panel?.orderOut(nil)
+        panel = nil
     }
 
-    private func registerWindow(from view: NSView) {
-        DispatchQueue.main.async {
-            guard let window = view.window else { return }
-            AutomaticFullscreenController.shared.register(window: window)
+    func toggle() {
+        if panel?.isVisible == true {
+            hide(returnFocus: true)
+        } else {
+            show()
         }
+    }
+
+    func show() {
+        guard let panel else { return }
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
+            previousApplication = NSWorkspace.shared.frontmostApplication
+        }
+        panel.setFrame(targetScreen.frame, display: true)
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKey()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    func hide(returnFocus: Bool) {
+        guard let panel, panel.isVisible else { return }
+        let application = returnFocus ? previousApplication : nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.10
+            panel.animator().alphaValue = 0
+        } completionHandler: {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+            application?.activate(options: [])
+        }
+    }
+
+    private var targetScreen: NSScreen {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens[0]
+    }
+
+    private func registerHotKey() {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let handlerStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            recallHotKeyHandler,
+            1,
+            &eventType,
+            nil,
+            &eventHandler
+        )
+        guard handlerStatus == noErr else { return }
+
+        let identifier = EventHotKeyID(signature: 0x4152_5952, id: 1)
+        RegisterEventHotKey(
+            UInt32(kVK_Space),
+            UInt32(cmdKey | shiftKey),
+            identifier,
+            GetApplicationEventTarget(),
+            0,
+            &hotKey
+        )
     }
 }
 
@@ -109,7 +167,6 @@ private struct AfterRayRootView: View {
     @StateObject private var control: AfterRayControlModel
     @StateObject private var audioPlayer: ArtifactAudioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
-    @Environment(\.scenePhase) private var scenePhase
     private let images: RecallImageRepository
 
     init() {
@@ -144,7 +201,6 @@ private struct AfterRayRootView: View {
             onReload: reload
         )
         .background(Color(red: 0.025, green: 0.022, blue: 0.026))
-        .background(AutomaticFullscreenProbe())
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
@@ -173,7 +229,6 @@ private struct AfterRayRootView: View {
             }
         }
         .task {
-            await AutomaticFullscreenController.shared.enterOnce()
             await bootstrap()
         }
         .task(id: control.status?.recordingState) {
@@ -186,8 +241,7 @@ private struct AfterRayRootView: View {
         }
         .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
-        .onChange(of: scenePhase) { _, phase in
-            guard phase == .active else { return }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
                 permissions.refresh()
                 if permissions.allGranted {
@@ -260,6 +314,10 @@ private struct PermissionPanel: View {
                         permissionRow(permission)
                     }
                 }
+
+                Text("After changing a permission, press ⌘⇧Space to return to AfterRay.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 if coordinator.isRequesting {
                     HStack(spacing: 9) {

@@ -418,7 +418,7 @@ private struct AppUsageTimeline: View {
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
-                Text("Swipe left or right · scroll to travel through time")
+                Text("Swipe or scroll to travel · Esc to close · ⌘⇧Space to return")
             }
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
