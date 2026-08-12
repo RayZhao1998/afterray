@@ -34,6 +34,11 @@ private final class RecallOverlayPanel: NSPanel {
     }
 }
 
+private final class PermissionGuidePanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 private let recallHotKeyHandler: EventHandlerUPP = { _, _, _ in
     DispatchQueue.main.async {
         RecallOverlayController.shared.toggle()
@@ -100,6 +105,7 @@ private final class RecallOverlayController {
 
     func show() {
         guard let panel else { return }
+        PermissionGuideController.shared.hide()
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
@@ -159,6 +165,164 @@ private final class RecallOverlayController {
             0,
             &hotKey
         )
+    }
+}
+
+@MainActor
+private final class PermissionGuideController {
+    static let shared = PermissionGuideController()
+
+    private var panel: PermissionGuidePanel?
+
+    func show(for permission: RequiredPermission) {
+        let size = NSSize(width: 392, height: 214)
+        let panel = panel ?? makePanel(size: size)
+        panel.contentView = NSHostingView(
+            rootView: PermissionDropGuide(permission: permission)
+        )
+
+        let screen = targetScreen
+        let origin = NSPoint(
+            x: screen.visibleFrame.maxX - size.width - 28,
+            y: screen.visibleFrame.maxY - size.height - 28
+        )
+        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.alphaValue = 0
+        NSApp.unhideWithoutActivation()
+        panel.orderFrontRegardless()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    func showAfterOpeningSettings(for permission: RequiredPermission) {
+        hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.show(for: permission)
+        }
+    }
+
+    func hide() {
+        guard let panel, panel.isVisible else { return }
+        panel.orderOut(nil)
+        panel.alphaValue = 1
+    }
+
+    private func makePanel(size: NSSize) -> PermissionGuidePanel {
+        let panel = PermissionGuidePanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.isFloatingPanel = false
+        panel.hidesOnDeactivate = false
+        panel.canHide = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .statusBar
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .transient,
+            .ignoresCycle,
+        ]
+        self.panel = panel
+        return panel
+    }
+
+    private var targetScreen: NSScreen {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens[0]
+    }
+}
+
+private struct PermissionDropGuide: View {
+    let permission: RequiredPermission
+
+    private var applicationURL: URL { Bundle.main.bundleURL }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: permission.icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.red)
+                    .frame(width: 32, height: 32)
+                    .background(.red.opacity(0.12), in: Circle())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Add AfterRay to \(permission.title)")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Drag the application below into the list in System Settings, then turn it on.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: applicationURL.path))
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 42, height: 42)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("AfterRay")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Drag into System Settings")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Image(systemName: "hand.draw")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+            .padding(12)
+            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.red.opacity(0.48), lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .onDrag {
+                NSItemProvider(contentsOf: applicationURL)
+                    ?? NSItemProvider(object: applicationURL as NSURL)
+            } preview: {
+                HStack(spacing: 9) {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: applicationURL.path))
+                        .resizable()
+                        .frame(width: 34, height: 34)
+                    Text("AfterRay")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .padding(10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
+            Text("After granting access, press ⌘⇧Space to return.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.ultraThinMaterial)
+        .background(Color.black.opacity(0.62))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(.white.opacity(0.14), lineWidth: 1)
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -359,7 +523,11 @@ private struct PermissionPanel: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             } else {
-                Button("Open Settings") { coordinator.openSettings(for: permission) }
+                Button("Open Settings") {
+                    RecallOverlayController.shared.hide(returnFocus: false)
+                    PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
+                    coordinator.openSettings(for: permission)
+                }
                     .buttonStyle(.borderless)
                     .font(.caption.weight(.semibold))
             }
