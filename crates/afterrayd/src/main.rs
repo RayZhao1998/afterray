@@ -185,6 +185,36 @@ async fn record_start(state: &Arc<AppState>) -> Response {
         let _ = state.store.end_session_sync(&session.id, now_ms());
         return Response::failure(error.to_string());
     }
+    match tokio::time::timeout(Duration::from_secs(15), state.capture.next_event()).await {
+        Ok(Some(Ok(CaptureEvent::Ready { .. }))) => {}
+        Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
+            let _ = state.capture.stop_capture().await;
+            let _ = state.store.end_session_sync(&session.id, now_ms());
+            return Response::failure(format!("capture startup failed [{code}]: {message}"));
+        }
+        Ok(Some(Ok(event))) => {
+            let _ = state.capture.stop_capture().await;
+            let _ = state.store.end_session_sync(&session.id, now_ms());
+            return Response::failure(format!(
+                "capture helper returned {event:?} before it was ready"
+            ));
+        }
+        Ok(Some(Err(error))) => {
+            let _ = state.capture.stop_capture().await;
+            let _ = state.store.end_session_sync(&session.id, now_ms());
+            return Response::failure(error.to_string());
+        }
+        Ok(None) => {
+            let _ = state.capture.stop_capture().await;
+            let _ = state.store.end_session_sync(&session.id, now_ms());
+            return Response::failure("capture helper exited before it was ready");
+        }
+        Err(_) => {
+            let _ = state.capture.stop_capture().await;
+            let _ = state.store.end_session_sync(&session.id, now_ms());
+            return Response::failure("capture helper did not become ready within 15 seconds");
+        }
+    }
 
     let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
@@ -270,11 +300,32 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
             }
             Ok(CaptureEvent::Failed { code, message }) => {
                 eprintln!("capture failed [{code}]: {message}");
+                finish_failed_recording(&state, &session_id).await;
                 break;
             }
-            Ok(CaptureEvent::Stopped) | Err(_) => break,
+            Ok(CaptureEvent::Stopped) => break,
+            Err(error) => {
+                eprintln!("capture event stream failed: {error}");
+                finish_failed_recording(&state, &session_id).await;
+                break;
+            }
         }
     }
+}
+
+async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
+    let scheduler = {
+        let mut recording = state.recording.lock().await;
+        if recording.active_session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        recording.active_session_id = None;
+        recording.scheduler.take()
+    };
+    if let Some(scheduler) = scheduler {
+        scheduler.abort();
+    }
+    let _ = state.store.end_session_sync(session_id, now_ms());
 }
 
 async fn import_artifact(
