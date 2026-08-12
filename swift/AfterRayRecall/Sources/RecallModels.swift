@@ -74,17 +74,27 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-public struct ArtifactPayload: Codable, Equatable, Sendable {
+public struct ArtifactPayload: Equatable, Sendable {
     public let id: String
     public let contentType: String
-    public let bytesBase64: String
+    public let bytes: Data
 
-    public var bytes: Data? { Data(base64Encoded: bytesBase64) }
+    public init(id: String, contentType: String, bytes: Data) {
+        self.id = id
+        self.contentType = contentType
+        self.bytes = bytes
+    }
+}
+
+public struct ArtifactMeta: Decodable, Equatable, Sendable {
+    public let id: String
+    public let contentType: String
+    public let byteLength: Int
 
     enum CodingKeys: String, CodingKey {
         case id
         case contentType = "content_type"
-        case bytesBase64 = "bytes_base64"
+        case byteLength = "byte_length"
     }
 }
 

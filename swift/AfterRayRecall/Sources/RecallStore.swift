@@ -123,9 +123,7 @@ public actor RecallImageRepository {
         if let existing = inFlight[artifactID] { return try await existing.value }
         let daemon = daemon
         let task = Task<Data, Error> {
-            let payload = try await daemon.artifact(id: artifactID)
-            guard let bytes = payload.bytes else { throw DaemonClientError.invalidResponse }
-            return bytes
+            try await daemon.artifact(id: artifactID).bytes
         }
         inFlight[artifactID] = task
         do {

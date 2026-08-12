@@ -36,7 +36,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
     public let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -84,7 +84,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     }
 
     public func artifact(id: String) async throws -> ArtifactPayload {
-        try await request(WireRequest(type: "read_artifact", artifactID: id), as: ArtifactPayload.self)
+        let encoder = JSONEncoder()
+        var payload = try encoder.encode(WireRequest(type: "read_artifact", artifactID: id))
+        payload.append(0x0A)
+        let path = socketPath
+        return try await Task.detached(priority: .userInitiated) {
+            try UnixLineTransport.exchangeArtifact(path: path, payload: payload)
+        }.value
     }
 
     public func setFavorite(momentID: String, favorite: Bool) async throws {
@@ -161,7 +167,38 @@ private enum UnixLineTransport {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
+        try connect(descriptor: descriptor, path: path)
+        try writeAll(descriptor: descriptor, payload: payload)
+        return try readLine(descriptor: descriptor)
+    }
 
+    static func exchangeArtifact(path: String, payload: Data) throws -> ArtifactPayload {
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw posixError("open socket") }
+        defer { Darwin.close(descriptor) }
+        try connect(descriptor: descriptor, path: path)
+        try writeAll(descriptor: descriptor, payload: payload)
+
+        let framed = try readLineAndLeftover(descriptor: descriptor)
+        let header = try decodeHeader(framed.line)
+        guard header.ok else {
+            throw DaemonClientError.rejected(header.error ?? "Unknown daemon error")
+        }
+        guard let metaObject = header.data else { throw DaemonClientError.missingData }
+        let nested = try JSONSerialization.data(withJSONObject: metaObject)
+        let meta = try JSONDecoder().decode(ArtifactMeta.self, from: nested)
+        guard meta.byteLength >= 0, meta.byteLength <= 64 * 1_024 * 1_024 else {
+            throw DaemonClientError.invalidResponse
+        }
+        let bytes = try readExact(
+            descriptor: descriptor,
+            count: meta.byteLength,
+            prefix: framed.leftover
+        )
+        return ArtifactPayload(id: meta.id, contentType: meta.contentType, bytes: bytes)
+    }
+
+    private static func connect(descriptor: Int32, path: String) throws {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(path.utf8CString)
@@ -181,7 +218,9 @@ private enum UnixLineTransport {
             }
         }
         guard connected == 0 else { throw posixError("connect") }
+    }
 
+    private static func writeAll(descriptor: Int32, payload: Data) throws {
         try payload.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else { return }
             var written = 0
@@ -191,10 +230,16 @@ private enum UnixLineTransport {
                 written += count
             }
         }
+    }
 
+    private static func readLine(descriptor: Int32) throws -> Data {
+        try readLineAndLeftover(descriptor: descriptor).line
+    }
+
+    private static func readLineAndLeftover(descriptor: Int32) throws -> (line: Data, leftover: Data) {
         let maximumResponseBytes = 64 * 1_024 * 1_024
         var response = Data()
-        response.reserveCapacity(256 * 1_024)
+        response.reserveCapacity(256)
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while response.count < maximumResponseBytes {
             let count = Darwin.read(descriptor, &buffer, buffer.count)
@@ -202,12 +247,48 @@ private enum UnixLineTransport {
             let bytes = buffer[..<count]
             if let newline = bytes.firstIndex(of: 0x0A) {
                 response.append(contentsOf: bytes[..<newline])
-                break
+                return (response, Data(bytes[bytes.index(after: newline)...]))
             }
             response.append(contentsOf: bytes)
         }
         guard !response.isEmpty else { throw DaemonClientError.connection("empty response") }
-        return response
+        return (response, Data())
+    }
+
+    private static func readExact(descriptor: Int32, count: Int, prefix: Data) throws -> Data {
+        var data = prefix
+        if data.count > count {
+            throw DaemonClientError.invalidResponse
+        }
+        data.reserveCapacity(count)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while data.count < count {
+            let needed = count - data.count
+            let readCount = Darwin.read(descriptor, &buffer, min(buffer.count, needed))
+            guard readCount > 0 else {
+                throw DaemonClientError.connection("artifact body ended early")
+            }
+            data.append(contentsOf: buffer[..<readCount])
+        }
+        return data
+    }
+
+    private struct Header {
+        let ok: Bool
+        let data: Any?
+        let error: String?
+    }
+
+    private static func decodeHeader(_ responseData: Data) throws -> Header {
+        guard
+            let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+            let version = object["protocol_version"] as? Int,
+            let ok = object["ok"] as? Bool
+        else { throw DaemonClientError.invalidResponse }
+        guard version == UnixSocketDaemonClient.protocolVersion else {
+            throw DaemonClientError.protocolMismatch(version)
+        }
+        return Header(ok: ok, data: object["data"], error: object["error"] as? String)
     }
 
     private static func posixError(_ operation: String) -> DaemonClientError {

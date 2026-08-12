@@ -41,10 +41,12 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.bundleIdentifier, "com.apple.dt.Xcode")
     }
 
-    func testArtifactPayloadDecodesBytes() throws {
-        let json = #"{"id":"a1","content_type":"image/png","bytes_base64":"aGVsbG8="}"#
-        let payload = try JSONDecoder().decode(ArtifactPayload.self, from: Data(json.utf8))
-        XCTAssertEqual(payload.bytes, Data("hello".utf8))
+    func testArtifactMetaDecodesByteLengthWithoutPayload() throws {
+        let json = #"{"id":"a1","content_type":"image/jpeg","byte_length":12}"#
+        let meta = try JSONDecoder().decode(ArtifactMeta.self, from: Data(json.utf8))
+        XCTAssertEqual(meta.id, "a1")
+        XCTAssertEqual(meta.contentType, "image/jpeg")
+        XCTAssertEqual(meta.byteLength, 12)
     }
 
     func testStatusDecodesRustShape() throws {

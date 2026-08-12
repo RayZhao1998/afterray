@@ -92,7 +92,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
     func moments(sessionID: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment] { [] }
     func artifact(id: String) async throws -> ArtifactPayload {
-        ArtifactPayload(id: id, contentType: "application/octet-stream", bytesBase64: "")
+        ArtifactPayload(id: id, contentType: "application/octet-stream", bytes: Data())
     }
     func setFavorite(momentID: String, favorite: Bool) async throws {}
 }

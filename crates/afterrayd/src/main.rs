@@ -3,7 +3,9 @@ use afterray_models::{
     ProcessAdapterConfig, QueueConfig,
 };
 use afterray_platform_macos::{ArtifactKind, CaptureConfig, CaptureEvent, MacOsCaptureBackend};
-use afterray_protocol::{PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit, Status};
+use afterray_protocol::{
+    ArtifactPayload, PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit, Status,
+};
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
 use std::{
@@ -192,13 +194,47 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => dispatch(request, &state).await,
-            Err(error) => Response::failure(format!("invalid request: {error}")),
-        };
-        let mut encoded = serde_json::to_vec(&response)?;
-        encoded.push(b'\n');
-        write.write_all(&encoded).await?;
+        match serde_json::from_str::<Request>(&line) {
+            Ok(Request::ReadArtifact { artifact_id }) => {
+                write_artifact_response(&mut write, state.store.read_artifact(&artifact_id)).await?;
+            }
+            Ok(request) => {
+                write_json_response(&mut write, &dispatch(request, &state).await).await?;
+            }
+            Err(error) => {
+                write_json_response(
+                    &mut write,
+                    &Response::failure(format!("invalid request: {error}")),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn write_json_response(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+) -> anyhow::Result<()> {
+    let mut encoded = serde_json::to_vec(response)?;
+    encoded.push(b'\n');
+    write.write_all(&encoded).await?;
+    Ok(())
+}
+
+async fn write_artifact_response(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    result: Result<ArtifactPayload, StoreError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(payload) => {
+            write.write_all(&payload.header_line()?).await?;
+            write.write_all(&payload.bytes).await?;
+        }
+        Err(error) => {
+            write_json_response(write, &Response::failure(error.to_string())).await?;
+        }
     }
     Ok(())
 }
@@ -238,9 +274,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             }
             Err(error) => Response::failure(error.to_string()),
         },
-        Request::ReadArtifact { artifact_id } => {
-            into_response(state.store.read_artifact(&artifact_id))
-        }
+        Request::ReadArtifact { .. } => Response::failure(
+            "read_artifact is framed as a JSON header plus raw bytes and is handled separately",
+        )
         Request::FavoriteSet {
             moment_id,
             favorite,
@@ -706,6 +742,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn stale_capture_cleanup_only_removes_files() {
@@ -820,4 +857,52 @@ print(json.dumps({
                 .any(|hit| hit.text == "conceptual local context")
         );
     }
+    #[tokio::test]
+    async fn read_artifact_writes_json_header_then_raw_bytes() {
+        let payload = ArtifactPayload {
+            id: "a1".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            bytes: b"raw-jpeg".to_vec(),
+        };
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_ignored, mut write) = server.into_split();
+        write_artifact_response(&mut write, Ok(payload)).await.unwrap();
+        drop(write);
+
+        let (read, _unused) = client.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(response.ok);
+        let meta: afterray_protocol::ArtifactMeta =
+            serde_json::from_value(response.data.unwrap()).unwrap();
+        assert_eq!(meta.id, "a1");
+        assert_eq!(meta.content_type, "image/jpeg");
+        assert_eq!(meta.byte_length, 8);
+        let mut body = vec![0_u8; 8];
+        reader.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, b"raw-jpeg");
+    }
+
+    #[tokio::test]
+    async fn missing_artifact_writes_json_error_without_body() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_ignored, mut write) = server.into_split();
+        write_artifact_response(&mut write, Err(StoreError::ArtifactNotFound("missing".into())))
+            .await
+            .unwrap();
+        drop(write);
+
+        let (read, _unused) = client.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(!response.ok);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
 }

@@ -622,7 +622,7 @@ impl Vault {
         Ok(ArtifactPayload {
             id: id.to_owned(),
             content_type,
-            bytes_base64: BASE64.encode(bytes),
+            bytes,
         })
     }
 
@@ -1089,10 +1089,7 @@ mod tests {
                 .any(|window| window == b"private-screen-text")
         );
         let payload = vault.read_artifact(&moment.image_artifact_id).unwrap();
-        assert_eq!(
-            BASE64.decode(payload.bytes_base64).unwrap(),
-            b"private-screen-text"
-        );
+        assert_eq!(payload.bytes, b"private-screen-text");
         drop(directory);
     }
 

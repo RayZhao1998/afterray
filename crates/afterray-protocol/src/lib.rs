@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -130,11 +130,38 @@ pub enum AudioTrack {
     Microphone,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// JSON header for `read_artifact`. The decrypted bytes follow the newline
+/// as a raw payload of exactly `byte_length` octets. Failures are a JSON
+/// line with no trailing body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactMeta {
+    pub id: String,
+    pub content_type: String,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactPayload {
     pub id: String,
     pub content_type: String,
-    pub bytes_base64: String,
+    pub bytes: Vec<u8>,
+}
+
+impl ArtifactPayload {
+    #[must_use]
+    pub fn meta(&self) -> ArtifactMeta {
+        ArtifactMeta {
+            id: self.id.clone(),
+            content_type: self.content_type.clone(),
+            byte_length: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub fn header_line(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut header = serde_json::to_vec(&Response::success(self.meta()))?;
+        header.push(b'\n');
+        Ok(header)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,5 +184,25 @@ mod tests {
         assert_eq!(json, r#"{"type":"record_start"}"#);
         let decoded: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Request::RecordStart));
+    }
+
+    #[test]
+    fn artifact_header_omits_bytes() {
+        let payload = ArtifactPayload {
+            id: "a1".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            bytes: b"\x00\xffJPEG".to_vec(),
+        };
+        let header = payload.header_line().unwrap();
+        let text = std::str::from_utf8(&header).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.contains("bytes"));
+        assert!(!text.contains("base64"));
+        let parsed: Response = serde_json::from_slice(&header[..header.len() - 1]).unwrap();
+        assert!(parsed.ok);
+        let meta: ArtifactMeta = serde_json::from_value(parsed.data.unwrap()).unwrap();
+        assert_eq!(meta.id, "a1");
+        assert_eq!(meta.content_type, "image/jpeg");
+        assert_eq!(meta.byte_length, 6);
     }
 }

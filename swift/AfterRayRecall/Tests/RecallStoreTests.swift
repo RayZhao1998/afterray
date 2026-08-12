@@ -109,7 +109,7 @@ private actor RefreshingDaemon: RecallDaemonServing {
     }
 
     func artifact(id: String) async throws -> ArtifactPayload {
-        ArtifactPayload(id: id, contentType: "image/jpeg", bytesBase64: "")
+        ArtifactPayload(id: id, contentType: "image/jpeg", bytes: Data())
     }
 
     func setFavorite(momentID _: String, favorite _: Bool) async throws {}
@@ -129,7 +129,7 @@ private actor CountingArtifactDaemon: RecallDaemonServing {
         return ArtifactPayload(
             id: id,
             contentType: "image/jpeg",
-            bytesBase64: Data("frame".utf8).base64EncodedString()
+            bytes: Data("frame".utf8)
         )
     }
 
@@ -177,7 +177,7 @@ private actor FakeDaemon: RecallDaemonServing {
     }
 
     func artifact(id: String) async throws -> ArtifactPayload {
-        ArtifactPayload(id: id, contentType: "image/png", bytesBase64: "")
+        ArtifactPayload(id: id, contentType: "image/png", bytes: Data())
     }
 
     func setFavorite(momentID: String, favorite: Bool) async throws {
