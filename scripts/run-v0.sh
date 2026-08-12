@@ -88,8 +88,13 @@ case "$app_bundle" in
   "$repo_root"/.afterray-dev/AfterRay.app) rm -rf -- "$app_bundle" ;;
   *) printf 'Refusing to replace unexpected app bundle: %s\n' "$app_bundle" >&2; exit 1 ;;
 esac
-mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Helpers"
+mkdir -p \
+  "$app_bundle/Contents/MacOS" \
+  "$app_bundle/Contents/Helpers" \
+  "$app_bundle/Contents/Resources"
 cp "$repo_root/apps/AfterRay/Resources/Info.plist" "$app_bundle/Contents/Info.plist"
+cp "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
+  "$app_bundle/Contents/Resources/AppIcon.icns"
 cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
 cp "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
