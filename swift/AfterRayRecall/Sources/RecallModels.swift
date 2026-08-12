@@ -265,4 +265,10 @@ public enum RecallGeometry {
         let delta = Int((-translation / pointsPerMoment).rounded())
         return min(max(originPosition + delta, 0), momentCount)
     }
+
+    /// A rightward/upward scroll begins history immediately from the virtual
+    /// live slot instead of waiting for the normal accumulated threshold.
+    public static func liveScrollStep(delta: CGFloat) -> Int? {
+        delta > 0 ? -1 : nil
+    }
 }

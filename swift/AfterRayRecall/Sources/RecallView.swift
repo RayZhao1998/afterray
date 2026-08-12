@@ -108,8 +108,6 @@ public struct RecallView: View {
                     backdropOpacity: tuning.backdropOpacity,
                     loader: imageLoader
                 )
-                .id(moment.imageArtifactId)
-                .transition(.opacity)
             }
 
             if !isLive {
@@ -155,9 +153,11 @@ public struct RecallView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
-        .animation(.easeOut(duration: 0.18), value: selectedIndex)
         .animation(.easeOut(duration: 0.18), value: isLive)
         .animation(.easeOut(duration: 0.18), value: showsDetails)
+        .task(id: selectedIndex) {
+            await prefetchAroundSelection()
+        }
     }
 
     private var chromeGradients: some View {
@@ -316,13 +316,18 @@ public struct RecallView: View {
             return
         }
         guard delta != 0 else { return }
+        if isLive, let step = RecallGeometry.liveScrollStep(delta: delta) {
+            moveSelection(by: step)
+            scrollAccumulator = 0
+            return
+        }
         if !isPrecise {
             moveSelection(by: delta > 0 ? -1 : 1)
             return
         }
 
         scrollAccumulator += delta
-        let threshold: CGFloat = 24
+        let threshold: CGFloat = 10
         let steps = Int(abs(scrollAccumulator) / threshold)
         guard steps > 0 else { return }
         moveSelection(by: scrollAccumulator > 0 ? -steps : steps)
@@ -352,6 +357,21 @@ public struct RecallView: View {
         } else {
             selectedIndex = position
             isLive = false
+        }
+    }
+
+    private func prefetchAroundSelection() async {
+        guard !moments.isEmpty else { return }
+        let center = min(max(selectedIndex, 0), moments.count - 1)
+        let offsets = [0, -1, 1, -2, 2, -3, 3]
+        for offset in offsets {
+            guard !Task.isCancelled else { return }
+            let index = center + offset
+            guard moments.indices.contains(index) else { continue }
+            _ = await RecallDecodedImageCache.shared.image(
+                artifactID: moments[index].imageArtifactId,
+                loader: imageLoader
+            )
         }
     }
 }
@@ -390,9 +410,58 @@ private struct ImmersiveArtifactImage: View {
             .clipped()
         }
         .task(id: artifactID) {
-            guard let data = try? await loader(artifactID, .full), let loaded = NSImage(data: data) else { return }
+            if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
+                image = cached
+                return
+            }
+            guard let loaded = await RecallDecodedImageCache.shared.image(
+                artifactID: artifactID,
+                loader: loader
+            ), !Task.isCancelled else { return }
             image = loaded
         }
+    }
+}
+
+@MainActor
+private final class RecallDecodedImageCache {
+    static let shared = RecallDecodedImageCache()
+
+    private let images = NSCache<NSString, NSImage>()
+    private var inFlight: [String: Task<NSImage?, Never>] = [:]
+
+    private init() {
+        images.countLimit = 18
+        images.totalCostLimit = 512 * 1_024 * 1_024
+    }
+
+    func cached(artifactID: String) -> NSImage? {
+        images.object(forKey: artifactID as NSString)
+    }
+
+    func image(artifactID: String, loader: @escaping RecallImageLoader) async -> NSImage? {
+        if let cached = cached(artifactID: artifactID) { return cached }
+        if let existing = inFlight[artifactID] { return await existing.value }
+
+        let task = Task { @MainActor () -> NSImage? in
+            guard
+                let data = try? await loader(artifactID, .full),
+                let decoded = NSImage(data: data)
+            else { return nil }
+            return decoded
+        }
+        inFlight[artifactID] = task
+        let decoded = await task.value
+        inFlight[artifactID] = nil
+        if let decoded {
+            images.setObject(decoded, forKey: artifactID as NSString, cost: estimatedCost(decoded))
+        }
+        return decoded
+    }
+
+    private func estimatedCost(_ image: NSImage) -> Int {
+        guard let representation = image.representations.first else { return 1 }
+        return max(representation.pixelsWide * representation.pixelsHigh * 4, 1)
     }
 }
 

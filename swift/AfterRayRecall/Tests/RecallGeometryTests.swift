@@ -49,4 +49,9 @@ final class RecallGeometryTests: XCTestCase {
             4
         )
     }
+
+    func testRightwardScrollImmediatelyEntersHistoryFromLive() {
+        XCTAssertEqual(RecallGeometry.liveScrollStep(delta: 0.1), -1)
+        XCTAssertNil(RecallGeometry.liveScrollStep(delta: -0.1))
+    }
 }
