@@ -423,7 +423,7 @@ private struct AfterRayRootView: View {
             await control.refreshStatus()
             return
         }
-        await permissions.requestRequiredPermissions()
+        await permissions.requestInitialPermissionsOnce()
         if permissions.allGranted {
             _ = await control.ensureRecording()
         } else {
@@ -491,9 +491,7 @@ private struct PermissionPanel: View {
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Button("Request permissions again") {
-                        Task { await coordinator.requestRequiredPermissions() }
-                    }
+                    Button("Check permissions") { coordinator.refresh() }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
                 }

@@ -6,39 +6,55 @@ import Foundation
 
 @MainActor
 final class SystemPermissionCoordinator: ObservableObject {
+    private static let automaticRequestLedgerKey =
+        "dev.afterray.permissions.automatic-requested.v1"
+
     @Published private(set) var screenRecording = false
     @Published private(set) var microphone = false
     @Published private(set) var accessibility = false
     @Published private(set) var isRequesting = false
 
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
     var allGranted: Bool { screenRecording && microphone && accessibility }
 
-    func requestRequiredPermissions() async {
+    func requestInitialPermissionsOnce() async {
         guard !isRequesting else { return }
+        refresh()
+        guard !allGranted else { return }
+
         isRequesting = true
         defer { isRequesting = false }
 
-        screenRecording = CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess()
+        if !screenRecording, reserveAutomaticRequest(for: .screenRecording) {
+            screenRecording = CGRequestScreenCaptureAccess()
+        }
 
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             microphone = true
-        case .notDetermined:
+        case .notDetermined where reserveAutomaticRequest(for: .microphone):
             microphone = await AVCaptureDevice.requestAccess(for: .audio)
-        case .denied, .restricted:
+        case .notDetermined, .denied, .restricted:
             microphone = false
         @unknown default:
             microphone = false
         }
 
-        accessibility = checkAccessibility(prompt: true)
+        if !accessibility, reserveAutomaticRequest(for: .accessibility) {
+            requestAccessibilityAccess()
+        }
         refresh()
     }
 
     func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess()
         microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        accessibility = checkAccessibility(prompt: false)
+        accessibility = AXIsProcessTrusted()
     }
 
     func openSettings(for permission: RequiredPermission) {
@@ -53,9 +69,18 @@ final class SystemPermissionCoordinator: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    private func checkAccessibility(prompt: Bool) -> Bool {
+    private func requestAccessibilityAccess() {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        return AXIsProcessTrustedWithOptions([key: prompt] as CFDictionary)
+        AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
+    private func reserveAutomaticRequest(for permission: RequiredPermission) -> Bool {
+        var requested = Set(
+            defaults.stringArray(forKey: Self.automaticRequestLedgerKey) ?? []
+        )
+        guard requested.insert(permission.rawValue).inserted else { return false }
+        defaults.set(requested.sorted(), forKey: Self.automaticRequestLedgerKey)
+        return true
     }
 }
 

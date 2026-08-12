@@ -101,7 +101,15 @@ codesign --force --sign - "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
 codesign --force --sign - "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign - "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign - "$app_bundle/Contents/Helpers/afterray_model_worker.py" >/dev/null
-codesign --force --sign - "$app_bundle" >/dev/null
+# Keep the development app's designated requirement stable across rebuilds. The
+# default ad-hoc requirement is its cdhash, which changes every build and makes
+# macOS TCC treat the same bundle as a new permission subject.
+codesign \
+  --force \
+  --sign - \
+  --identifier dev.afterray.app \
+  --requirements '=designated => identifier "dev.afterray.app"' \
+  "$app_bundle" >/dev/null
 
 if [[ "$mode" == 'build' ]]; then
   printf '%s\n' 'AfterRay V0 build completed.'
