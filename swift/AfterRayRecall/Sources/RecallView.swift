@@ -153,7 +153,6 @@ public struct RecallView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
-        .animation(.easeOut(duration: 0.18), value: isLive)
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .task(id: selectedIndex) {
             await prefetchAroundSelection()
