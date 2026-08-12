@@ -242,6 +242,12 @@ daemon_log="$run_dir/afterrayd.log"
 app_log="$run_dir/afterray-app.log"
 
 if [[ "$mode" == 'app' ]]; then
+  if [[ "$ephemeral" != 'true' ]]; then
+    # The app derives stable development socket/data paths from its bundle
+    # location. Do not inject run-directory paths that disappear when macOS
+    # performs Quit & Reopen after a privacy permission change.
+    unset AFTERRAY_SOCKET AFTERRAY_DATA_DIR
+  fi
   export AFTERRAY_DAEMON="$app_bundle/Contents/Helpers/afterrayd"
   export AFTERRAY_CAPTURE_SHIM="$app_bundle/Contents/Helpers/AfterRayCaptureShim"
   export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"

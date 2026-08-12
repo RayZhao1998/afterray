@@ -527,6 +527,7 @@ private struct AfterRayRootView: View {
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
+                try? await DaemonSupervisor.shared.startIfNeeded()
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
@@ -564,6 +565,13 @@ private struct AfterRayRootView: View {
 
     private func reload() {
         Task {
+            do {
+                try await DaemonSupervisor.shared.startIfNeeded()
+            } catch {
+                await control.refreshStatus()
+                await store.loadLatestSession()
+                return
+            }
             async let status: Void = control.refreshStatus()
             async let timeline: Void = store.loadLatestSession()
             _ = await (status, timeline)
