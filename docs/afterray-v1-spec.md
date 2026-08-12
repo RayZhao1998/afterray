@@ -22,7 +22,7 @@
 
 ### 1.1 v1 的产品定义
 
-AfterRay v1 是一款面向 macOS 26、M3 及以上 Apple Silicon Mac 的本地记忆工具。它持续捕获用户看见的内容；当它判断用户可能进入会议时，先提示用户，只在得到本次会议的明确同意后才捕获麦克风与系统音频。屏幕、OCR、Accessibility 语义和 Transcript 被组织成可回放的时间线，并允许用户或经授权的本地 Agent 检索这些证据。
+AfterRay v1 是一款面向 macOS 26、M3 及以上 Apple Silicon Mac 的本地记忆工具。它持续捕获用户看见的内容；用户在 onboarding 明确开启“自动记录检测到的会议”后，系统只在稳定确认会议时自动捕获麦克风与系统音频，并立即通过菜单栏和通知提示、允许一键停止或本次不录。屏幕、OCR、Accessibility 语义和 Transcript 被组织成可回放的时间线，并允许用户或经授权的本地 Agent 检索这些证据。
 
 v1 的主入口不是搜索框，而是一个具有“视觉奇观”感的可缩放 Timeline：用户可以从某一秒连续缩放到一天、一周和一个月，并快速进入任意时刻的屏幕、对话与上下文。
 
@@ -219,7 +219,7 @@ Timeline 至少有四个 Level of Detail，但用户感知应是连续缩放：
 | Day：一天 | 注意力河流、会议、空白、目标与总结 | 看懂一天花在哪里 |
 | Month：一月 | 每日密度、主要主题、代表帧星图 | 找模式并快速下钻 |
 
-数据层需要预先构建多分辨率摘要金字塔：`Moment → Episode → Day → Month`。缩放时不允许临时让大模型生成整个视图。
+数据层需要预先构建多分辨率摘要金字塔：`Moment → Session → Day → Month`。`Episode` 是会议或其他语义区间，可跨越 Session，不是 Timeline LOD 的父子层。缩放时不允许临时让大模型生成整个视图。
 
 ### 5.3 回放语义层
 
@@ -231,7 +231,7 @@ Timeline 至少有四个 Level of Detail，但用户感知应是连续缩放：
 4. **Accessibility**：role、label、value、bounds、可用性与捕获偏移。
 5. **Transcript**：按系统音频和麦克风两条轨道显示。
 
-Accessibility Tree 是当时的近似快照，不是截图的绝对真相。若 AX 查询晚于屏幕 83ms、超时或只取到部分节点，UI 必须明确展示，而不能画出看似确定的框。
+Accessibility Tree 是当时的近似快照，不是截图的绝对真相。Snapshot 必须标记 `complete`、`partial` 或 `unavailable`；与截图偏差超过 2 秒时不绑定覆盖层，超时或只取得部分节点时 UI 必须明确展示，而不能画出看似确定的框。
 
 ### 5.4 Timeline 初始验收门槛
 
@@ -257,7 +257,7 @@ Accessibility Tree 是当时的近似快照，不是截图的绝对真相。若 
 ```text
 AfterRayDesignSystem     colors, type, spacing, materials, icons
 AfterRayTimelineKit      Timeline components, layout, transitions, shaders
-AfterRayMockData         deterministic synthetic Moment/Episode/Day/Month data
+AfterRayMockData         deterministic synthetic Moment/Session/Day/Month data；MeetingEpisode 作为可跨层的语义区间
 AfterRayVisualLab.app    scene catalog, controls, capture and stress modes
 AfterRay.app             production shell, permissions, real services
 ```
@@ -1191,7 +1191,7 @@ v1 不承诺防护：
 ### Week 3：OCR、AX 与 Search
 
 - 快速 OCR、Deep OCR 与系统基线在真实屏幕语料上对比。
-- AX snapshot 时序、超时和覆盖层。
+- AX snapshot 的 complete/partial/unavailable 状态、1 秒截止、2 秒对齐规则和覆盖层正确性；不再安排 AX 耗时基准。
 - SQLite FTS/trigram + Embedding 原型；建立 100–300 条真实查询集。
 
 ### Week 4：Audio/ASR
