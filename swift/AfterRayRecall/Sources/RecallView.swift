@@ -128,10 +128,7 @@ public struct RecallView: View {
                     selectedIndex: selectedIndex,
                     isLive: isLive,
                     tuning: tuning,
-                    onSelect: {
-                        isLive = false
-                        selectedIndex = $0
-                    }
+                    onSelect: { selectTimeline(position: $0) }
                 )
                 .padding(.horizontal, 26)
                 .padding(.bottom, 18)
@@ -350,12 +347,16 @@ public struct RecallView: View {
 
     private func selectTimeline(position: Int) {
         guard !moments.isEmpty else { return }
-        if position == moments.count {
-            selectedIndex = moments.count - 1
-            isLive = true
-        } else {
-            selectedIndex = position
-            isLive = false
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            if position == moments.count {
+                selectedIndex = moments.count - 1
+                isLive = true
+            } else {
+                selectedIndex = position
+                isLive = false
+            }
         }
     }
 

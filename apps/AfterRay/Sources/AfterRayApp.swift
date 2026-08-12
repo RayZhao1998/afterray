@@ -136,28 +136,18 @@ private final class RecallOverlayController {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
         panel.setFrame(targetScreen.frame, display: true)
-        panel.alphaValue = 0
+        panel.alphaValue = 1
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.14
-            panel.animator().alphaValue = 1
-        }
     }
 
     func hide(returnFocus: Bool) {
         guard let panel, panel.isVisible else { return }
         let application = returnFocus ? previousApplication : nil
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.10
-            panel.animator().alphaValue = 0
-        } completionHandler: {
-            panel.orderOut(nil)
-            panel.alphaValue = 1
-            application?.activate(options: [])
-        }
+        panel.orderOut(nil)
+        panel.alphaValue = 1
+        application?.activate(options: [])
     }
 
     private var targetScreen: NSScreen {
@@ -604,7 +594,11 @@ private struct AfterRayRootView: View {
 
     private func openSearchHit(_ hit: RecallSearchHit) {
         control.dismissSearch()
-        isLive = false
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isLive = false
+        }
         Task { await store.openSearchHit(hit) }
     }
 }
