@@ -18,8 +18,8 @@ make v0
 ```
 
 The first recording asks macOS for Screen Recording and Microphone access. V0
-never starts recording automatically. To keep the temporary vault after the app
-closes, run `./scripts/run-v0.sh --keep-data`.
+never starts recording automatically. The vault persists at `.afterray/v0-data`;
+use `./scripts/run-v0.sh --ephemeral` only for a disposable test run.
 
 Useful development commands:
 

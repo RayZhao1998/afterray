@@ -444,7 +444,13 @@ async fn search_hits(
     limit: usize,
 ) -> Result<Vec<SearchHit>, StoreError> {
     let candidate_limit = limit.saturating_mul(4).clamp(limit, 400);
-    let full_text = store.search(query, candidate_limit)?;
+    let full_text = match store.search(query, candidate_limit) {
+        Ok(hits) => hits,
+        Err(error) => {
+            eprintln!("full-text search unavailable; continuing with semantic search: {error}");
+            Vec::new()
+        }
+    };
     let job_id = match models
         .submit(ModelInput::Embedding {
             text: query.to_owned(),

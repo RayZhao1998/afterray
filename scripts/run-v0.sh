@@ -4,18 +4,18 @@ set -Eeuo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/run-v0.sh [--build-only | --daemon-only] [--keep-data]' \
+    'Usage: scripts/run-v0.sh [--build-only | --daemon-only] [--ephemeral]' \
     '' \
     '  no option       Build everything, start afterrayd, then run the Swift app.' \
     '  --build-only    Compile the capture shim, Rust workspace, and Swift app.' \
     '  --daemon-only   Build and run afterrayd without opening the Swift app.' \
-    '  --keep-data     Keep the temporary run directory after exit.' \
+    '  --ephemeral     Use a throwaway vault instead of .afterray/v0-data.' \
     '' \
     'This script never downloads models or starts recording automatically.'
 }
 
 mode='app'
-keep_data='false'
+ephemeral='false'
 while (($# > 0)); do
   case "$1" in
     --build-only)
@@ -32,8 +32,8 @@ while (($# > 0)); do
       fi
       mode='daemon'
       ;;
-    --keep-data)
-      keep_data='true'
+    --ephemeral)
+      ephemeral='true'
       ;;
     -h | --help)
       usage
@@ -92,18 +92,14 @@ cleanup() {
     kill "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
   fi
-  if [[ "$keep_data" == 'true' ]]; then
-    printf 'AfterRay run data kept at %s\n' "$run_dir"
-  else
-    case "$run_dir" in
-      /tmp/afterray-v0.*)
-        rm -rf -- "$run_dir"
-        ;;
-      *)
-        printf 'Refusing to clean unexpected run directory: %s\n' "$run_dir" >&2
-        ;;
-    esac
-  fi
+  case "$run_dir" in
+    /tmp/afterray-v0.*)
+      rm -rf -- "$run_dir"
+      ;;
+    *)
+      printf 'Refusing to clean unexpected run directory: %s\n' "$run_dir" >&2
+      ;;
+  esac
   exit "$status"
 }
 trap cleanup EXIT
@@ -112,8 +108,17 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 export AFTERRAY_SOCKET="$run_dir/afterray.sock"
-export AFTERRAY_DATA_DIR="$run_dir/data"
+if [[ "$ephemeral" == 'true' ]]; then
+  export AFTERRAY_DATA_DIR="$run_dir/data"
+else
+  export AFTERRAY_DATA_DIR="${AFTERRAY_DATA_DIR:-$repo_root/.afterray/v0-data}"
+fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
+mkdir -p "$AFTERRAY_DATA_DIR"
+default_whisper_model="$repo_root/.afterray/models/ggml-large-v3-turbo-q5_0.bin"
+if [[ -z "${AFTERRAY_WHISPER_MODEL:-}" && -f "$default_whisper_model" ]]; then
+  export AFTERRAY_WHISPER_MODEL="$default_whisper_model"
+fi
 daemon_log="$run_dir/afterrayd.log"
 
 printf '==> Starting afterrayd\n    socket: %s\n    data:   %s\n' \

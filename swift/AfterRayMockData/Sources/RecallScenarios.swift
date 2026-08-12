@@ -77,7 +77,6 @@ public enum MockArtifactFactory {
         let size = quality == .thumbnail ? NSSize(width: 320, height: 200) : NSSize(width: 1_280, height: 800)
         let image = NSImage(size: size)
         image.lockFocus()
-        defer { image.unlockFocus() }
 
         let palettes: [(NSColor, NSColor)] = [
             (.init(red: 0.18, green: 0.05, blue: 0.08, alpha: 1), .init(red: 0.94, green: 0.16, blue: 0.12, alpha: 1)),
@@ -106,6 +105,7 @@ public enum MockArtifactFactory {
         for row in 0..<3 {
             NSBezierPath(roundedRect: NSRect(x: inset * 1.7, y: size.height * (0.37 - Double(row) * 0.075), width: size.width * (0.52 - Double(row) * 0.08), height: max(4, size.height * 0.013)), xRadius: 3, yRadius: 3).fill()
         }
+        image.unlockFocus()
 
         guard let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff),

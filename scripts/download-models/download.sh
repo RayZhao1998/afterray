@@ -18,6 +18,14 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "error: curl is required to download the whisper.cpp model" >&2
   exit 1
 fi
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "error: ffmpeg is required by the ASR worker; install it with: brew install ffmpeg" >&2
+  exit 1
+fi
+if ! command -v whisper-cli >/dev/null 2>&1; then
+  echo "error: whisper-cli is required by the ASR worker; install it with: brew install whisper-cpp" >&2
+  exit 1
+fi
 
 mkdir -p "$model_dir"
 
