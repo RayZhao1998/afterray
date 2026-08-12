@@ -12,6 +12,7 @@ public typealias RecallArtifactLoader = (String) async throws -> Data
 public struct RecallView: View {
     public let moments: [RecallMoment]
     @Binding public var selectedIndex: Int
+    @Binding public var isLive: Bool
     public let loadState: RecallLoadState
     public var tuning: RecallVisualTuning
     public let imageLoader: RecallImageLoader
@@ -20,13 +21,14 @@ public struct RecallView: View {
     public var onToggleAudio: ((RecallMoment) -> Void)?
     public var onReload: (() -> Void)?
 
-    @State private var dragOriginIndex: Int?
+    @State private var dragOriginPosition: Int?
     @State private var scrollAccumulator: CGFloat = 0
     @State private var showsDetails = false
 
     public init(
         moments: [RecallMoment],
         selectedIndex: Binding<Int>,
+        isLive: Binding<Bool> = .constant(false),
         loadState: RecallLoadState = .ready,
         tuning: RecallVisualTuning = .standard,
         imageLoader: @escaping RecallImageLoader,
@@ -37,6 +39,7 @@ public struct RecallView: View {
     ) {
         self.moments = moments
         self._selectedIndex = selectedIndex
+        self._isLive = isLive
         self.loadState = loadState
         self.tuning = tuning
         self.imageLoader = imageLoader
@@ -53,7 +56,9 @@ public struct RecallView: View {
 
     public var body: some View {
         ZStack {
-            RecallPalette.background.ignoresSafeArea()
+            if !isLive {
+                RecallPalette.background.ignoresSafeArea()
+            }
 
             switch loadState {
             case .loading:
@@ -63,6 +68,7 @@ public struct RecallView: View {
             case .ready, .processing:
                 if moments.isEmpty {
                     EmptyRecallView(isProcessing: isProcessing)
+                        .padding(40)
                 } else {
                     recallContent
                 }
@@ -83,11 +89,19 @@ public struct RecallView: View {
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.secondary)
         }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 24)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(.white.opacity(0.13), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.42), radius: 28, y: 12)
     }
 
     private var recallContent: some View {
         ZStack {
-            if let moment = selectedMoment {
+            if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
                     artifactID: moment.imageArtifactId,
                     blur: tuning.backdropBlur,
@@ -98,26 +112,34 @@ public struct RecallView: View {
                 .transition(.opacity)
             }
 
-            chromeGradients
+            if !isLive {
+                chromeGradients
+            }
 
             VStack(spacing: 0) {
-                momentHeader
-                    .padding(.horizontal, 26)
-                    .padding(.top, 22)
+                if !isLive {
+                    momentHeader
+                        .padding(.horizontal, 26)
+                        .padding(.top, 22)
+                }
 
                 Spacer(minLength: 100)
 
                 AppUsageTimeline(
                     moments: moments,
                     selectedIndex: selectedIndex,
+                    isLive: isLive,
                     tuning: tuning,
-                    onSelect: { selectedIndex = $0 }
+                    onSelect: {
+                        isLive = false
+                        selectedIndex = $0
+                    }
                 )
                 .padding(.horizontal, 26)
                 .padding(.bottom, 18)
             }
 
-            if showsDetails {
+            if showsDetails, !isLive {
                 detailsPanel
                     .frame(width: 340)
                     .padding(.top, 76)
@@ -134,6 +156,7 @@ public struct RecallView: View {
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
         .animation(.easeOut(duration: 0.18), value: selectedIndex)
+        .animation(.easeOut(duration: 0.18), value: isLive)
         .animation(.easeOut(duration: 0.18), value: showsDetails)
     }
 
@@ -272,18 +295,19 @@ public struct RecallView: View {
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
-                if dragOriginIndex == nil { dragOriginIndex = selectedIndex }
-                guard let origin = dragOriginIndex else { return }
-                if let index = RecallGeometry.index(
-                    fromDragTranslation: value.translation.width,
-                    originIndex: origin,
-                    count: moments.count,
-                    pointsPerMoment: tuning.dragPointsPerMoment
-                ) {
-                    selectedIndex = index
+                if dragOriginPosition == nil {
+                    dragOriginPosition = isLive ? moments.count : selectedIndex
                 }
+                guard let origin = dragOriginPosition else { return }
+                let position = RecallGeometry.timelinePosition(
+                    fromDragTranslation: value.translation.width,
+                    originPosition: origin,
+                    momentCount: moments.count,
+                    pointsPerMoment: tuning.dragPointsPerMoment
+                )
+                selectTimeline(position: position)
             }
-            .onEnded { _ in dragOriginIndex = nil }
+            .onEnded { _ in dragOriginPosition = nil }
     }
 
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
@@ -314,8 +338,21 @@ public struct RecallView: View {
     }
 
     private func moveSelection(by delta: Int) {
-        guard let next = RecallGeometry.clampedIndex(selectedIndex + delta, count: moments.count) else { return }
-        selectedIndex = next
+        guard !moments.isEmpty else { return }
+        let currentPosition = isLive ? moments.count : selectedIndex
+        let nextPosition = min(max(currentPosition + delta, 0), moments.count)
+        selectTimeline(position: nextPosition)
+    }
+
+    private func selectTimeline(position: Int) {
+        guard !moments.isEmpty else { return }
+        if position == moments.count {
+            selectedIndex = moments.count - 1
+            isLive = true
+        } else {
+            selectedIndex = position
+            isLive = false
+        }
     }
 }
 
@@ -387,6 +424,7 @@ private struct AppIdentity: View {
 private struct AppUsageTimeline: View {
     let moments: [RecallMoment]
     let selectedIndex: Int
+    let isLive: Bool
     let tuning: RecallVisualTuning
     let onSelect: (Int) -> Void
 
@@ -427,10 +465,14 @@ private struct AppUsageTimeline: View {
 
     private var timestamp: some View {
         VStack(spacing: 2) {
-            Text(selectedDate.formatted(date: .omitted, time: .standard))
+            Text(isLive ? "NOW" : selectedDate.formatted(date: .omitted, time: .standard))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .monospacedDigit()
-            Text(selectedDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
+            Text(
+                isLive
+                    ? "Swipe right to enter history"
+                    : selectedDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+            )
                 .font(.system(size: 10, weight: .medium, design: .rounded))
                 .foregroundStyle(.white.opacity(0.58))
         }
@@ -779,26 +821,24 @@ private struct EmptyRecallView: View {
     let isProcessing: Bool
 
     var body: some View {
-        ZStack {
-            RadialGradient(
-                colors: [RecallPalette.ray.opacity(0.18), .clear],
-                center: .center,
-                startRadius: 20,
-                endRadius: 420
-            )
-            VStack(spacing: 14) {
-                Image(systemName: isProcessing ? "sparkles.rectangle.stack" : "rectangle.stack")
-                    .font(.system(size: 36, weight: .light))
-                    .foregroundStyle(RecallPalette.ray)
-                Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
-                    .font(.title2.weight(.medium))
-                Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .multilineTextAlignment(.center)
-            .padding(40)
+        VStack(spacing: 14) {
+            Image(systemName: isProcessing ? "sparkles.rectangle.stack" : "rectangle.stack")
+                .font(.system(size: 36, weight: .light))
+                .foregroundStyle(RecallPalette.ray)
+            Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
+                .font(.title2.weight(.medium))
+            Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
+        .multilineTextAlignment(.center)
+        .padding(40)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(.white.opacity(0.13), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.42), radius: 30, y: 14)
     }
 }
 
@@ -819,6 +859,12 @@ private struct FailureView: View {
             }
         }
         .padding(40)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(.white.opacity(0.13), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.42), radius: 28, y: 12)
     }
 }
 

@@ -28,4 +28,25 @@ final class RecallGeometryTests: XCTestCase {
         XCTAssertNil(RecallGeometry.clampedIndex(0, count: 0))
         XCTAssertNil(RecallGeometry.index(fromDragTranslation: 10, originIndex: 0, count: 0, pointsPerMoment: 50))
     }
+
+    func testLiveTimelinePositionMovesIntoAndBackOutOfHistory() {
+        XCTAssertEqual(
+            RecallGeometry.timelinePosition(
+                fromDragTranslation: 54,
+                originPosition: 4,
+                momentCount: 4,
+                pointsPerMoment: 54
+            ),
+            3
+        )
+        XCTAssertEqual(
+            RecallGeometry.timelinePosition(
+                fromDragTranslation: -54,
+                originPosition: 3,
+                momentCount: 4,
+                pointsPerMoment: 54
+            ),
+            4
+        )
+    }
 }

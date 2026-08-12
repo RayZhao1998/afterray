@@ -252,4 +252,17 @@ public enum RecallGeometry {
         let delta = Int((-translation / pointsPerMoment).rounded())
         return clampedIndex(originIndex + delta, count: count)
     }
+
+    /// Positions include one virtual slot after the latest captured moment.
+    /// That final slot represents the transparent, live "now" view.
+    public static func timelinePosition(
+        fromDragTranslation translation: Double,
+        originPosition: Int,
+        momentCount: Int,
+        pointsPerMoment: Double
+    ) -> Int {
+        guard momentCount > 0, pointsPerMoment > 0 else { return 0 }
+        let delta = Int((-translation / pointsPerMoment).rounded())
+        return min(max(originPosition + delta, 0), momentCount)
+    }
 }

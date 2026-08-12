@@ -3,6 +3,10 @@ import AppKit
 import Carbon.HIToolbox
 import SwiftUI
 
+private extension Notification.Name {
+    static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
+}
+
 @main
 struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
@@ -66,8 +70,8 @@ private final class RecallOverlayController {
             defer: false
         )
         panel.contentView = NSHostingView(rootView: AfterRayRootView())
-        panel.backgroundColor = .black
-        panel.isOpaque = true
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
         panel.hasShadow = false
         panel.isMovable = false
         panel.isFloatingPanel = true
@@ -110,6 +114,11 @@ private final class RecallOverlayController {
     }
 
     func toggle() {
+        if PermissionGuideController.shared.isVisible {
+            PermissionGuideController.shared.hide()
+            show()
+            return
+        }
         if panel?.isVisible == true {
             hide(returnFocus: true)
         } else {
@@ -120,6 +129,7 @@ private final class RecallOverlayController {
     func show() {
         guard let panel else { return }
         PermissionGuideController.shared.hide()
+        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: nil)
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
@@ -188,6 +198,8 @@ private final class PermissionGuideController {
 
     private let panelSize = NSSize(width: 392, height: 214)
     private var panel: PermissionGuidePanel?
+
+    var isVisible: Bool { panel?.isVisible == true }
 
     func show(for permission: RequiredPermission) {
         let panel = panel ?? makePanel()
@@ -353,6 +365,7 @@ private struct AfterRayRootView: View {
     @StateObject private var control: AfterRayControlModel
     @StateObject private var audioPlayer: ArtifactAudioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
+    @State private var isLive = true
     private let images: RecallImageRepository
 
     init() {
@@ -371,6 +384,7 @@ private struct AfterRayRootView: View {
                 get: { store.selectedIndex },
                 set: { store.select(index: $0) }
             ),
+            isLive: $isLive,
             loadState: store.loadState,
             imageLoader: { artifactID, _ in
                 try await images.data(artifactID: artifactID)
@@ -386,7 +400,7 @@ private struct AfterRayRootView: View {
             },
             onReload: reload
         )
-        .background(Color(red: 0.025, green: 0.022, blue: 0.026))
+        .background(isLive ? Color.clear : Color(red: 0.025, green: 0.022, blue: 0.026))
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
@@ -436,6 +450,9 @@ private struct AfterRayRootView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
+            isLive = true
+        }
     }
 
     private func bootstrap() async {
@@ -471,6 +488,7 @@ private struct AfterRayRootView: View {
 
     private func openSearchHit(_ hit: RecallSearchHit) {
         control.dismissSearch()
+        isLive = false
         Task { await store.openSearchHit(hit) }
     }
 }
@@ -480,7 +498,6 @@ private struct PermissionPanel: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.62).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("LET AFTERRAY REMEMBER")
