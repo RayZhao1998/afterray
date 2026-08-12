@@ -30,6 +30,10 @@ public final class RecallStore: ObservableObject {
             }
             try await loadSession(id: latest.id)
         } catch {
+            if Self.isDaemonConnectionError(error) {
+                loadState = .loading
+                return
+            }
             moments = []
             selectedIndex = 0
             loadState = .failed(message: error.localizedDescription)
@@ -52,7 +56,9 @@ public final class RecallStore: ObservableObject {
         do {
             try await loadSession(id: hit.sessionId, selecting: hit.momentId)
         } catch {
-            loadState = .failed(message: error.localizedDescription)
+            loadState = Self.isDaemonConnectionError(error)
+                ? .loading
+                : .failed(message: error.localizedDescription)
         }
     }
 
@@ -69,8 +75,16 @@ public final class RecallStore: ObservableObject {
             try await daemon.setFavorite(momentID: moments[selectedIndex].id, favorite: !previous)
         } catch {
             moments[selectedIndex].isFavorite = previous
-            loadState = .failed(message: error.localizedDescription)
+            loadState = Self.isDaemonConnectionError(error)
+                ? .loading
+                : .failed(message: error.localizedDescription)
         }
+    }
+
+    private static func isDaemonConnectionError(_ error: Error) -> Bool {
+        guard let daemonError = error as? DaemonClientError else { return false }
+        if case .connection = daemonError { return true }
+        return false
     }
 }
 

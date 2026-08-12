@@ -15,6 +15,27 @@ final class RecallStoreTests: XCTestCase {
         let calls = await daemon.favoriteCalls
         XCTAssertEqual(calls, [.init(momentID: "m2", favorite: true)])
     }
+
+    func testConnectionFailureStaysInRecoveringState() async {
+        let store = RecallStore(daemon: ConnectionFailingDaemon())
+
+        await store.loadLatestSession()
+
+        XCTAssertEqual(store.loadState, .loading)
+    }
+}
+
+private actor ConnectionFailingDaemon: RecallDaemonServing {
+    func sessions() async throws -> [RecallSession] {
+        throw DaemonClientError.connection("Connection refused")
+    }
+
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+    func artifact(id _: String) async throws -> ArtifactPayload {
+        throw DaemonClientError.connection("Connection refused")
+    }
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
 private actor FakeDaemon: RecallDaemonServing {

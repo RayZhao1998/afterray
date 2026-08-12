@@ -515,6 +515,9 @@ private struct AfterRayRootView: View {
         .task {
             await bootstrap()
         }
+        .task {
+            await keepDaemonAlive()
+        }
         .task(id: control.status?.recordingState) {
             while !Task.isCancelled, control.isRecording {
                 try? await Task.sleep(for: .seconds(5))
@@ -527,7 +530,7 @@ private struct AfterRayRootView: View {
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
-                try? await DaemonSupervisor.shared.startIfNeeded()
+                _ = try? await DaemonSupervisor.shared.startIfNeeded()
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
@@ -575,6 +578,27 @@ private struct AfterRayRootView: View {
             async let status: Void = control.refreshStatus()
             async let timeline: Void = store.loadLatestSession()
             _ = await (status, timeline)
+        }
+    }
+
+    private func keepDaemonAlive() async {
+        while !Task.isCancelled {
+            do {
+                let restarted = try await DaemonSupervisor.shared.startIfNeeded()
+                if restarted {
+                    permissions.refresh()
+                    if permissions.allGranted {
+                        _ = await control.ensureRecording()
+                    } else {
+                        await control.refreshStatus()
+                    }
+                    await store.loadLatestSession()
+                }
+            } catch {
+                // The next health tick retries. Daemon connectivity is an
+                // implementation detail and never becomes a user-facing error.
+            }
+            try? await Task.sleep(for: .seconds(1))
         }
     }
 

@@ -9,6 +9,7 @@ final class DaemonSupervisor {
     private let defaultDataDirectory: URL
     private let defaultModelDirectory: URL
     private var process: Process?
+    private var recoveryTask: Task<Bool, Error>?
 
     private init() {
         let environment = ProcessInfo.processInfo.environment
@@ -30,8 +31,21 @@ final class DaemonSupervisor {
         }
     }
 
-    func startIfNeeded() async throws {
-        if await daemonIsReachable() { return }
+    @discardableResult
+    func startIfNeeded() async throws -> Bool {
+        if let recoveryTask {
+            return try await recoveryTask.value
+        }
+        let task = Task { @MainActor in
+            try await recoverIfNeeded()
+        }
+        recoveryTask = task
+        defer { recoveryTask = nil }
+        return try await task.value
+    }
+
+    private func recoverIfNeeded() async throws -> Bool {
+        if await daemonIsReachable() { return false }
 
         if let process, process.isRunning {
             process.terminate()
@@ -81,7 +95,7 @@ final class DaemonSupervisor {
         process = child
 
         for _ in 0..<100 {
-            if await daemonIsReachable() { return }
+            if await daemonIsReachable() { return true }
             if !child.isRunning {
                 process = nil
                 throw RuntimeError.daemonExited(child.terminationStatus)
@@ -94,6 +108,8 @@ final class DaemonSupervisor {
     }
 
     func stop() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
         if let process, process.isRunning {
             process.terminate()
         }
