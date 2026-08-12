@@ -54,6 +54,7 @@ private final class RecallOverlayController {
     private var previousApplication: NSRunningApplication?
     private var hotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
+    private var resignKeyObserver: NSObjectProtocol?
 
     func start() {
         guard panel == nil else { return }
@@ -71,7 +72,7 @@ private final class RecallOverlayController {
         panel.isMovable = false
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = false
-        panel.hidesOnDeactivate = true
+        panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.animationBehavior = .none
         panel.level = .statusBar
@@ -82,6 +83,15 @@ private final class RecallOverlayController {
             .ignoresCycle,
         ]
         self.panel = panel
+        resignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: panel,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                RecallOverlayController.shared.hide(returnFocus: false)
+            }
+        }
         registerHotKey()
         show()
     }
@@ -91,6 +101,10 @@ private final class RecallOverlayController {
         if let eventHandler { RemoveEventHandler(eventHandler) }
         hotKey = nil
         eventHandler = nil
+        if let resignKeyObserver {
+            NotificationCenter.default.removeObserver(resignKeyObserver)
+        }
+        resignKeyObserver = nil
         panel?.orderOut(nil)
         panel = nil
     }
@@ -111,9 +125,9 @@ private final class RecallOverlayController {
         }
         panel.setFrame(targetScreen.frame, display: true)
         panel.alphaValue = 0
-        panel.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
-        panel.makeKey()
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.14
