@@ -8,6 +8,7 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var loadState: RecallLoadState = .loading
 
     private let daemon: any RecallDaemonServing
+    private var sensitiveGeneration: UInt64 = 0
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -19,14 +20,18 @@ public final class RecallStore: ObservableObject {
     }
 
     public func loadTimeline(preservingSelection: Bool = false) async {
+        let requestGeneration = sensitiveGeneration
         if moments.isEmpty {
             loadState = .loading
         }
         do {
-            sessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
+            let loadedSessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            guard sensitiveGeneration == requestGeneration else { return }
+            sessions = loadedSessions
             apply(loaded, preservingSelection: preservingSelection)
         } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
                 loadState = .loading
                 return
@@ -37,12 +42,45 @@ public final class RecallStore: ObservableObject {
         }
     }
 
+    /// Refreshes a small overlap window so recently completed OCR/AX work can
+    /// replace existing moments without rescanning the entire encrypted vault.
+    public func refreshTimeline(preservingSelection: Bool = true) async {
+        guard !moments.isEmpty else {
+            await loadTimeline(preservingSelection: preservingSelection)
+            return
+        }
+
+        let overlapStart = max(moments.count - 20, 0)
+        let sinceMs = moments[overlapStart].capturedAtMs
+        let requestGeneration = sensitiveGeneration
+        do {
+            let updated = try await daemon.timeline(sinceMs: sinceMs)
+                .sorted { left, right in
+                    if left.capturedAtMs == right.capturedAtMs { return left.id < right.id }
+                    return left.capturedAtMs < right.capturedAtMs
+                }
+            guard sensitiveGeneration == requestGeneration else { return }
+            guard !updated.isEmpty else { return }
+            let prefix = moments.prefix { $0.capturedAtMs < sinceMs }
+            let existingOverlap = Array(moments.dropFirst(prefix.count))
+            guard existingOverlap != updated else { return }
+            apply(Array(prefix) + updated, preservingSelection: preservingSelection)
+        } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
+            if !Self.isDaemonConnectionError(error) {
+                loadState = .failed(message: error.localizedDescription)
+            }
+        }
+    }
+
     public func loadSession(
         id: String,
         selecting momentID: String? = nil,
         preservingSelection: Bool = false
     ) async throws {
+        let requestGeneration = sensitiveGeneration
         let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
+        guard sensitiveGeneration == requestGeneration else { return }
         apply(loaded, selecting: momentID, preservingSelection: preservingSelection)
     }
 
@@ -70,11 +108,14 @@ public final class RecallStore: ObservableObject {
     }
 
     public func openSearchHit(_ hit: RecallSearchHit) async {
+        let requestGeneration = sensitiveGeneration
         loadState = .loading
         do {
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            guard sensitiveGeneration == requestGeneration else { return }
             apply(loaded, selecting: hit.momentId)
         } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
             loadState = Self.isDaemonConnectionError(error)
                 ? .loading
                 : .failed(message: error.localizedDescription)
@@ -88,16 +129,26 @@ public final class RecallStore: ObservableObject {
 
     public func toggleFavorite() async {
         guard moments.indices.contains(selectedIndex) else { return }
+        let momentID = moments[selectedIndex].id
         let previous = moments[selectedIndex].isFavorite
         moments[selectedIndex].isFavorite.toggle()
         do {
-            try await daemon.setFavorite(momentID: moments[selectedIndex].id, favorite: !previous)
+            try await daemon.setFavorite(momentID: momentID, favorite: !previous)
         } catch {
-            moments[selectedIndex].isFavorite = previous
+            guard let index = moments.firstIndex(where: { $0.id == momentID }) else { return }
+            moments[index].isFavorite = previous
             loadState = Self.isDaemonConnectionError(error)
                 ? .loading
                 : .failed(message: error.localizedDescription)
         }
+    }
+
+    public func clearSensitiveState() {
+        sensitiveGeneration &+= 1
+        sessions = []
+        moments = []
+        selectedIndex = 0
+        loadState = .loading
     }
 
     private static func isDaemonConnectionError(_ error: Error) -> Bool {
@@ -111,6 +162,8 @@ public actor RecallImageRepository {
     private let daemon: any RecallDaemonServing
     private let cache = NSCache<NSString, NSData>()
     private var inFlight: [String: Task<Data, Error>] = [:]
+    private var cachedArtifactIDs: Set<String> = []
+    private var generation: UInt64 = 0
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -122,6 +175,7 @@ public actor RecallImageRepository {
         if let cached = cache.object(forKey: artifactID as NSString) { return cached as Data }
         if let existing = inFlight[artifactID] { return try await existing.value }
         let daemon = daemon
+        let requestGeneration = generation
         let task = Task<Data, Error> {
             try await daemon.artifact(id: artifactID).bytes
         }
@@ -129,7 +183,13 @@ public actor RecallImageRepository {
         do {
             let bytes = try await task.value
             inFlight[artifactID] = nil
-            cache.setObject(bytes as NSData, forKey: artifactID as NSString, cost: bytes.count)
+            guard generation == requestGeneration else { return bytes }
+            cache.setObject(
+                NSMutableData(data: bytes),
+                forKey: artifactID as NSString,
+                cost: bytes.count
+            )
+            cachedArtifactIDs.insert(artifactID)
             return bytes
         } catch {
             inFlight[artifactID] = nil
@@ -141,6 +201,20 @@ public actor RecallImageRepository {
         for id in artifactIDs where cache.object(forKey: id as NSString) == nil {
             _ = try? await data(artifactID: id)
         }
+    }
+
+    public func clearSensitiveData() {
+        generation &+= 1
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll()
+        for artifactID in cachedArtifactIDs {
+            guard let data = cache.object(forKey: artifactID as NSString) as? NSMutableData else {
+                continue
+            }
+            data.resetBytes(in: NSRange(location: 0, length: data.length))
+        }
+        cachedArtifactIDs.removeAll()
+        cache.removeAllObjects()
     }
 }
 

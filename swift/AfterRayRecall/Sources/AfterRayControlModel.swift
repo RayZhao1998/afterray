@@ -10,6 +10,7 @@ public final class AfterRayControlModel: ObservableObject {
     @Published public private(set) var message: String?
 
     private let daemon: any AfterRayDaemonServing
+    private var sensitiveGeneration: UInt64 = 0
 
     public init(daemon: any AfterRayDaemonServing) {
         self.daemon = daemon
@@ -69,6 +70,7 @@ public final class AfterRayControlModel: ObservableObject {
     }
 
     public func search() async {
+        let requestGeneration = sensitiveGeneration
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
             searchHits = []
@@ -78,9 +80,12 @@ public final class AfterRayControlModel: ObservableObject {
         isSearching = true
         defer { isSearching = false }
         do {
-            searchHits = try await daemon.search(query: query, limit: 30)
+            let hits = try await daemon.search(query: query, limit: 30)
+            guard sensitiveGeneration == requestGeneration else { return }
+            searchHits = hits
             message = searchHits.isEmpty ? "No moments matched “\(query)”." : nil
         } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
             searchHits = []
             message = error.localizedDescription
         }
@@ -89,6 +94,15 @@ public final class AfterRayControlModel: ObservableObject {
     public func dismissSearch() {
         searchQuery = ""
         searchHits = []
+        message = nil
+    }
+
+    public func clearSensitiveState() {
+        sensitiveGeneration &+= 1
+        status = nil
+        searchQuery = ""
+        searchHits = []
+        isSearching = false
         message = nil
     }
 }

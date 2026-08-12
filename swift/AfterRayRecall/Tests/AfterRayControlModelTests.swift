@@ -44,6 +44,21 @@ final class AfterRayControlModelTests: XCTestCase {
         let commands = await daemon.recordCommands
         XCTAssertEqual(commands, ["start"])
     }
+
+    func testSystemLockClearsSearchAndStatus() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+        model.searchQuery = "private query"
+        await model.search()
+
+        model.clearSensitiveState()
+
+        XCTAssertNil(model.status)
+        XCTAssertEqual(model.searchQuery, "")
+        XCTAssertTrue(model.searchHits.isEmpty)
+        XCTAssertNil(model.message)
+    }
 }
 
 private actor ControlDaemon: AfterRayDaemonServing {
@@ -89,6 +104,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
 
     func sessions() async throws -> [RecallSession] { [] }
     func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
     func moments(sessionID: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment] { [] }
     func artifact(id: String) async throws -> ArtifactPayload {

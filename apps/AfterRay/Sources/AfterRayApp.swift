@@ -5,6 +5,12 @@ import SwiftUI
 
 private extension Notification.Name {
     static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
+    static let afterRaySystemSessionWillSuspend = Notification.Name(
+        "dev.afterray.system-session-will-suspend"
+    )
+    static let afterRaySystemSessionDidResume = Notification.Name(
+        "dev.afterray.system-session-did-resume"
+    )
 }
 
 @MainActor
@@ -29,14 +35,56 @@ struct AfterRayApp: App {
 
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
+    private var workspaceObservers: [NSObjectProtocol] = []
+
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
     }
 
     func applicationWillTerminate(_: Notification) {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.forEach(center.removeObserver)
+        workspaceObservers.removeAll()
         RecallOverlayController.shared.stop()
         DaemonSupervisor.shared.stop()
+    }
+
+    private func observeSystemSessionSecurityEvents() {
+        let center = NSWorkspace.shared.notificationCenter
+        let suspendNotifications: [Notification.Name] = [
+            NSWorkspace.sessionDidResignActiveNotification,
+            NSWorkspace.screensDidSleepNotification,
+            NSWorkspace.willSleepNotification,
+        ]
+        let resumeNotifications: [Notification.Name] = [
+            NSWorkspace.sessionDidBecomeActiveNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.didWakeNotification,
+        ]
+        workspaceObservers += suspendNotifications.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                Task { @MainActor in
+                    NotificationCenter.default.post(
+                        name: .afterRaySystemSessionWillSuspend,
+                        object: nil
+                    )
+                    DaemonSupervisor.shared.suspendForSystemLock()
+                }
+            }
+        }
+        workspaceObservers += resumeNotifications.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                Task { @MainActor in
+                    DaemonSupervisor.shared.resumeAfterSystemUnlock()
+                    NotificationCenter.default.post(
+                        name: .afterRaySystemSessionDidResume,
+                        object: nil
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -526,7 +574,7 @@ private struct AfterRayRootView: View {
             while !Task.isCancelled, control.isRecording {
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled else { return }
-                await store.loadTimeline(preservingSelection: !isLive)
+                await store.refreshTimeline(preservingSelection: !isLive)
                 await control.refreshStatus()
             }
         }
@@ -538,12 +586,29 @@ private struct AfterRayRootView: View {
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
-                    await store.loadTimeline(preservingSelection: !isLive)
+                    await store.refreshTimeline(preservingSelection: !isLive)
                 }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
             isLive = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
+            Task {
+                _ = try? await DaemonSupervisor.shared.startIfNeeded()
+                permissions.refresh()
+                if permissions.allGranted {
+                    _ = await control.ensureRecording()
+                }
+                await store.refreshTimeline(preservingSelection: !isLive)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionWillSuspend)) { _ in
+            audioPlayer.stop()
+            store.clearSensitiveState()
+            control.clearSensitiveState()
+            clearRecallDecodedImageCache()
+            Task { await images.clearSensitiveData() }
         }
     }
 
@@ -570,7 +635,7 @@ private struct AfterRayRootView: View {
     private func toggleRecording() {
         Task {
             let changed = await control.toggleRecording()
-            if changed { await store.loadTimeline(preservingSelection: !isLive) }
+            if changed { await store.refreshTimeline(preservingSelection: !isLive) }
         }
     }
 
@@ -580,11 +645,11 @@ private struct AfterRayRootView: View {
                 try await DaemonSupervisor.shared.startIfNeeded()
             } catch {
                 await control.refreshStatus()
-                await store.loadTimeline(preservingSelection: !isLive)
+                await store.refreshTimeline(preservingSelection: !isLive)
                 return
             }
             async let status: Void = control.refreshStatus()
-            async let timeline: Void = store.loadTimeline(preservingSelection: !isLive)
+            async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
             _ = await (status, timeline)
         }
     }
@@ -600,7 +665,7 @@ private struct AfterRayRootView: View {
                     } else {
                         await control.refreshStatus()
                     }
-                    await store.loadTimeline(preservingSelection: !isLive)
+                    await store.refreshTimeline(preservingSelection: !isLive)
                 }
             } catch {
                 // The next health tick retries. Daemon connectivity is an

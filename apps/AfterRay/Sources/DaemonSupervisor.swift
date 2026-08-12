@@ -10,6 +10,7 @@ final class DaemonSupervisor {
     private let defaultModelDirectory: URL
     private var process: Process?
     private var recoveryTask: Task<Bool, Error>?
+    private var isSuspendedForSystemLock = false
 
     private init() {
         let environment = ProcessInfo.processInfo.environment
@@ -33,6 +34,7 @@ final class DaemonSupervisor {
 
     @discardableResult
     func startIfNeeded() async throws -> Bool {
+        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
         if let recoveryTask {
             return try await recoveryTask.value
         }
@@ -45,7 +47,9 @@ final class DaemonSupervisor {
     }
 
     private func recoverIfNeeded() async throws -> Bool {
+        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
         if await daemonIsReachable() { return false }
+        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
 
         if let process, process.isRunning {
             process.terminate()
@@ -64,7 +68,7 @@ final class DaemonSupervisor {
         let daemon = try resolveExecutable(
             environmentKey: "AFTERRAY_DAEMON",
             bundledName: "afterrayd",
-            developmentPath: "target/debug/afterrayd"
+            developmentPath: "target/release/afterrayd"
         )
         let child = Process()
         child.executableURL = daemon
@@ -75,12 +79,12 @@ final class DaemonSupervisor {
         environment["AFTERRAY_CAPTURE_SHIM"] = try resolveExecutable(
             environmentKey: "AFTERRAY_CAPTURE_SHIM",
             bundledName: "AfterRayCaptureShim",
-            developmentPath: "apps/AfterRayCaptureShim/.build/debug/AfterRayCaptureShim"
+            developmentPath: "apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim"
         ).path
         environment["AFTERRAY_NATIVE_MODEL_WORKER"] = try resolveExecutable(
             environmentKey: "AFTERRAY_NATIVE_MODEL_WORKER",
             bundledName: "afterray-native-model-worker",
-            developmentPath: ".build/debug/afterray-native-model-worker"
+            developmentPath: ".build/release/afterray-native-model-worker"
         ).path
         environment["AFTERRAY_MODEL_WORKER"] = try resolveExecutable(
             environmentKey: "AFTERRAY_MODEL_WORKER",
@@ -95,6 +99,11 @@ final class DaemonSupervisor {
         process = child
 
         for _ in 0..<100 {
+            guard !isSuspendedForSystemLock else {
+                child.terminate()
+                process = nil
+                throw RuntimeError.daemonSuspended
+            }
             if await daemonIsReachable() { return true }
             if !child.isRunning {
                 process = nil
@@ -117,6 +126,16 @@ final class DaemonSupervisor {
         // The daemon owns the socket and removes it only after its active
         // recording session has been closed. A following launch can reuse the
         // still-shutting-down daemon or remove a genuinely stale socket.
+    }
+
+    func suspendForSystemLock() {
+        guard !isSuspendedForSystemLock else { return }
+        isSuspendedForSystemLock = true
+        stop()
+    }
+
+    func resumeAfterSystemUnlock() {
+        isSuspendedForSystemLock = false
     }
 
     private func daemonIsReachable() async -> Bool {
@@ -182,12 +201,14 @@ private enum RuntimeError: LocalizedError {
     case missingExecutable(String)
     case daemonExited(Int32)
     case daemonTimeout
+    case daemonSuspended
 
     var errorDescription: String? {
         switch self {
         case .missingExecutable(let name): "AfterRay helper is missing: \(name)"
         case .daemonExited(let status): "afterrayd exited during startup (status \(status))"
         case .daemonTimeout: "afterrayd did not become ready"
+        case .daemonSuspended: "afterrayd is suspended while the Mac is locked or asleep"
         }
     }
 }

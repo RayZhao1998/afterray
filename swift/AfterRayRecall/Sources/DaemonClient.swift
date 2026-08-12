@@ -22,6 +22,7 @@ public enum DaemonClientError: LocalizedError, Equatable {
 public protocol RecallDaemonServing: Sendable {
     func sessions() async throws -> [RecallSession]
     func timeline() async throws -> [RecallMoment]
+    func timeline(sinceMs: Int64) async throws -> [RecallMoment]
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func artifact(id: String) async throws -> ArtifactPayload
@@ -51,6 +52,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func timeline() async throws -> [RecallMoment] {
         try await request(WireRequest(type: "timeline_list"), as: [RecallMoment].self)
+    }
+
+    public func timeline(sinceMs: Int64) async throws -> [RecallMoment] {
+        try await request(
+            WireRequest(type: "timeline_since", sinceMs: sinceMs),
+            as: [RecallMoment].self
+        )
     }
 
     public func status() async throws -> DaemonStatus {
@@ -145,6 +153,7 @@ struct WireRequest: Encodable, Equatable {
     var momentID: String?
     var favorite: Bool?
     var query: String?
+    var sinceMs: Int64?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -155,6 +164,7 @@ struct WireRequest: Encodable, Equatable {
         case momentID = "moment_id"
         case favorite
         case query
+        case sinceMs = "since_ms"
     }
 }
 

@@ -34,7 +34,10 @@ enum Command {
     Moments {
         session_id: String,
     },
-    Timeline,
+    Timeline {
+        #[arg(long)]
+        since_ms: Option<i64>,
+    },
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
@@ -112,7 +115,10 @@ async fn main() -> anyhow::Result<()> {
             command: SessionsCommand::List,
         } => Request::SessionsList,
         Command::Moments { session_id } => Request::MomentsList { session_id },
-        Command::Timeline => Request::TimelineList,
+        Command::Timeline { since_ms: None } => Request::TimelineList,
+        Command::Timeline {
+            since_ms: Some(since_ms),
+        } => Request::TimelineSince { since_ms },
         Command::Search { query, limit } => Request::Search { query, limit },
         Command::Favorite {
             command: FavoriteCommand::Add { moment_id },

@@ -21,6 +21,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
 
 [dev-dependencies]
 tempfile = "3.27"

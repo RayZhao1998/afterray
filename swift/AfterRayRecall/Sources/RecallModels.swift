@@ -214,8 +214,6 @@ public enum RecallLoadState: Equatable, Sendable {
 }
 
 public struct RecallVisualTuning: Equatable, Sendable {
-    public var backdropBlur: Double
-    public var backdropOpacity: Double
     public var topScrimOpacity: Double
     public var bottomScrimOpacity: Double
     public var timelineDensity: Double
@@ -224,8 +222,6 @@ public struct RecallVisualTuning: Equatable, Sendable {
     public var dragPointsPerMoment: Double
 
     public init(
-        backdropBlur: Double = 42,
-        backdropOpacity: Double = 0.68,
         topScrimOpacity: Double = 0.58,
         bottomScrimOpacity: Double = 0.92,
         timelineDensity: Double = 0.12,
@@ -233,8 +229,6 @@ public struct RecallVisualTuning: Equatable, Sendable {
         timelineSegmentGap: Double = 2,
         dragPointsPerMoment: Double = 54
     ) {
-        self.backdropBlur = backdropBlur
-        self.backdropOpacity = backdropOpacity
         self.topScrimOpacity = topScrimOpacity
         self.bottomScrimOpacity = bottomScrimOpacity
         self.timelineDensity = timelineDensity

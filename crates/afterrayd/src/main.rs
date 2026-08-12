@@ -29,7 +29,12 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     std::fs::create_dir_all(staging_dir)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(staging_dir, std::fs::Permissions::from_mode(0o700))?;
     let mut removed = 0;
     for entry in std::fs::read_dir(staging_dir)? {
         let entry = entry?;
@@ -58,28 +63,27 @@ async fn main() -> anyhow::Result<()> {
         vault_config.max_unstarred_moments = value.parse().context("invalid retention limit")?;
     }
     let staging_dir = vault_config.data_dir.join("capture-staging");
+    let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
+    if removed_staging_files > 0 {
+        eprintln!("removed {removed_staging_files} stale capture staging file(s)");
+    }
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
     let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
     if repaired_sessions > 0 {
         eprintln!("closed {repaired_sessions} session(s) left open by an earlier daemon");
     }
-    let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
-    if removed_staging_files > 0 {
-        eprintln!("removed {removed_staging_files} stale capture staging file(s)");
-    }
-
     let shim_path = std::env::var_os("AFTERRAY_CAPTURE_SHIM").map_or_else(
-        || PathBuf::from("apps/AfterRayCaptureShim/.build/debug/AfterRayCaptureShim"),
+        || PathBuf::from("apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim"),
         PathBuf::from,
     );
-    let capture = MacOsCaptureBackend::new(CaptureConfig::new(shim_path, staging_dir));
+    let capture = MacOsCaptureBackend::new(CaptureConfig::new(shim_path, staging_dir.clone()));
 
     let worker_path = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
         || PathBuf::from("scripts/download-models/afterray_model_worker.py"),
         PathBuf::from,
     );
     let native_worker_path = std::env::var_os("AFTERRAY_NATIVE_MODEL_WORKER").map_or_else(
-        || PathBuf::from(".build/debug/afterray-native-model-worker"),
+        || PathBuf::from(".build/release/afterray-native-model-worker"),
         PathBuf::from,
     );
     let models = ModelQueue::new(
@@ -124,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
             "could not finish the active session during shutdown: {}",
             response.error.as_deref().unwrap_or("unknown error")
         );
+    }
+    if let Err(error) = clear_stale_capture_files(&staging_dir) {
+        eprintln!("could not clear capture staging during shutdown: {error}");
     }
     drop(listener);
     let _ = std::fs::remove_file(&socket);
@@ -196,7 +203,8 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
             Ok(Request::ReadArtifact { artifact_id }) => {
-                write_artifact_response(&mut write, state.store.read_artifact(&artifact_id)).await?;
+                write_artifact_response(&mut write, state.store.read_artifact(&artifact_id))
+                    .await?;
             }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
@@ -260,6 +268,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::RecordStop => record_stop(state).await,
         Request::SessionsList => into_response(state.store.sessions_sync()),
         Request::TimelineList => into_response(state.store.timeline_sync()),
+        Request::TimelineSince { since_ms } => {
+            into_response(state.store.timeline_since_sync(since_ms))
+        }
         Request::MomentsList { session_id } => into_response(state.store.moments_sync(&session_id)),
         Request::RecallWindow {
             session_id,
@@ -276,7 +287,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         },
         Request::ReadArtifact { .. } => Response::failure(
             "read_artifact is framed as a JSON header plus raw bytes and is handled separately",
-        )
+        ),
         Request::FavoriteSet {
             moment_id,
             favorite,
@@ -714,7 +725,7 @@ fn model_status() -> serde_json::Value {
     serde_json::json!({
         "runtime": "afterray-managed",
         "ocr_worker": std::env::var("AFTERRAY_NATIVE_MODEL_WORKER")
-            .unwrap_or_else(|_| ".build/debug/afterray-native-model-worker".to_owned()),
+            .unwrap_or_else(|_| ".build/release/afterray-native-model-worker".to_owned()),
         "model_worker": std::env::var("AFTERRAY_MODEL_WORKER")
             .unwrap_or_else(|_| "scripts/download-models/afterray_model_worker.py".to_owned()),
         "capabilities": ["ocr", "asr", "embedding", "llm"]
@@ -857,6 +868,7 @@ print(json.dumps({
                 .any(|hit| hit.text == "conceptual local context")
         );
     }
+
     #[tokio::test]
     async fn read_artifact_writes_json_header_then_raw_bytes() {
         let payload = ArtifactPayload {
@@ -866,7 +878,9 @@ print(json.dumps({
         };
         let (server, client) = UnixStream::pair().unwrap();
         let (_ignored, mut write) = server.into_split();
-        write_artifact_response(&mut write, Ok(payload)).await.unwrap();
+        write_artifact_response(&mut write, Ok(payload))
+            .await
+            .unwrap();
         drop(write);
 
         let (read, _unused) = client.into_split();
@@ -889,9 +903,12 @@ print(json.dumps({
     async fn missing_artifact_writes_json_error_without_body() {
         let (server, client) = UnixStream::pair().unwrap();
         let (_ignored, mut write) = server.into_split();
-        write_artifact_response(&mut write, Err(StoreError::ArtifactNotFound("missing".into())))
-            .await
-            .unwrap();
+        write_artifact_response(
+            &mut write,
+            Err(StoreError::ArtifactNotFound("missing".into())),
+        )
+        .await
+        .unwrap();
         drop(write);
 
         let (read, _unused) = client.into_split();
@@ -904,5 +921,4 @@ print(json.dumps({
         reader.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty());
     }
-
 }

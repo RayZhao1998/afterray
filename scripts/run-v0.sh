@@ -51,11 +51,11 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
 capture_package="$repo_root/apps/AfterRayCaptureShim"
-capture_shim="$capture_package/.build/debug/AfterRayCaptureShim"
-daemon_bin="$repo_root/target/debug/afterrayd"
-cli_bin="$repo_root/target/debug/afterray"
+capture_shim="$capture_package/.build/release/AfterRayCaptureShim"
+daemon_bin="$repo_root/target/release/afterrayd"
+cli_bin="$repo_root/target/release/afterray"
 app_bin="$repo_root/.build/debug/afterray-app"
-native_model_worker="$repo_root/.build/debug/afterray-native-model-worker"
+native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
@@ -118,11 +118,11 @@ export SWIFTPM_CUSTOM_CACHE_PATH="$swift_cache/swiftpm"
 printf '%s\n' '==> Building native ScreenCaptureKit shim'
 swift build \
   --package-path "$capture_package" \
-  --configuration debug \
+  --configuration release \
   --product AfterRayCaptureShim
 
 printf '%s\n' '==> Building Rust daemon and CLI'
-cargo build --manifest-path "$repo_root/Cargo.toml" --workspace
+cargo build --manifest-path "$repo_root/Cargo.toml" --workspace --release
 
 printf '%s\n' '==> Building Swift recall app'
 swift build \
@@ -131,7 +131,7 @@ swift build \
   --product afterray-app
 swift build \
   --package-path "$repo_root" \
-  --configuration debug \
+  --configuration release \
   --product afterray-native-model-worker
 
 printf '%s\n' '==> Assembling AfterRay.app'

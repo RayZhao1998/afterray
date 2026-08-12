@@ -102,8 +102,6 @@ public struct RecallView: View {
             if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
                     artifactID: moment.imageArtifactId,
-                    blur: tuning.backdropBlur,
-                    backdropOpacity: tuning.backdropOpacity,
                     loader: imageLoader
                 )
             }
@@ -383,8 +381,6 @@ public struct RecallView: View {
 
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
-    let blur: Double
-    let backdropOpacity: Double
     let loader: RecallImageLoader
     @State private var image: NSImage?
 
@@ -393,14 +389,6 @@ private struct ImmersiveArtifactImage: View {
         GeometryReader { geometry in
             ZStack {
                 if let image = cachedImage ?? image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                        .blur(radius: blur)
-                        .saturation(0.8)
-                        .opacity(backdropOpacity)
-
                     Image(nsImage: image)
                         .resizable()
                         .interpolation(.high)
@@ -438,6 +426,7 @@ private final class RecallDecodedImageCache {
     private var pendingPrefetches: [PrefetchRequest] = []
     private var activePrefetches = 0
     private let maximumConcurrentPrefetches = 6
+    private var generation: UInt64 = 0
 
     private init() {
         images.countLimit = 48
@@ -455,6 +444,7 @@ private final class RecallDecodedImageCache {
         if let cached = cached(artifactID: artifactID) { return cached }
         if let existing = inFlight[artifactID] { return await existing.value }
 
+        let requestGeneration = generation
         let task = Task { @MainActor () -> NSImage? in
             guard let data = try? await loader(artifactID) else { return nil }
             let decoded = await Task.detached(priority: .userInitiated) {
@@ -466,10 +456,20 @@ private final class RecallDecodedImageCache {
         inFlight[artifactID] = task
         let decoded = await task.value
         inFlight[artifactID] = nil
+        guard generation == requestGeneration else { return decoded }
         if let decoded {
             images.setObject(decoded, forKey: artifactID as NSString, cost: estimatedCost(decoded))
         }
         return decoded
+    }
+
+
+    func clearSensitiveData() {
+        generation &+= 1
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll()
+        pendingPrefetches.removeAll()
+        images.removeAllObjects()
     }
 
     func prefetch(
@@ -521,6 +521,11 @@ private final class RecallDecodedImageCache {
         let artifactID: String
         let loader: RecallImageLoader
     }
+}
+
+@MainActor
+public func clearRecallDecodedImageCache() {
+    RecallDecodedImageCache.shared.clearSensitiveData()
 }
 
 private struct AppIdentity: View {

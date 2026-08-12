@@ -71,8 +71,6 @@ private struct VisualLabView: View {
                 .pickerStyle(.menu)
 
                 VStack(spacing: 18) {
-                    TuneSlider(title: "Backdrop blur", value: $tuning.backdropBlur, range: 0...80)
-                    TuneSlider(title: "Backdrop opacity", value: $tuning.backdropOpacity, range: 0...1)
                     TuneSlider(title: "Top scrim", value: $tuning.topScrimOpacity, range: 0...1)
                     TuneSlider(title: "Bottom scrim", value: $tuning.bottomScrimOpacity, range: 0...1)
                     TuneSlider(title: "Timeline density", value: $tuning.timelineDensity, range: 0.04...0.36)

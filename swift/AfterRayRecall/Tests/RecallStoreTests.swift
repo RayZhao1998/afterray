@@ -40,6 +40,24 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    func testSystemLockClearsTimelineAndArtifactCache() async throws {
+        let timelineDaemon = FakeDaemon()
+        let store = RecallStore(daemon: timelineDaemon)
+        await store.loadTimeline()
+        store.clearSensitiveState()
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertTrue(store.moments.isEmpty)
+        XCTAssertEqual(store.loadState, .loading)
+
+        let artifactDaemon = CountingArtifactDaemon()
+        let repository = RecallImageRepository(daemon: artifactDaemon)
+        _ = try await repository.data(artifactID: "frame-1")
+        await repository.clearSensitiveData()
+        _ = try await repository.data(artifactID: "frame-1")
+        let requestCount = await artifactDaemon.requestCount
+        XCTAssertEqual(requestCount, 2)
+    }
+
     func testBackgroundRefreshPreservesLatestUserSelection() async {
         let daemon = RefreshingDaemon()
         let store = RecallStore(daemon: daemon)
@@ -51,7 +69,7 @@ final class RecallStoreTests: XCTestCase {
         await daemon.delayNextMomentsRequest()
 
         let refresh = Task { @MainActor in
-            await store.loadTimeline(preservingSelection: true)
+            await store.refreshTimeline(preservingSelection: true)
         }
         try? await Task.sleep(for: .milliseconds(10))
         store.select(index: 1)
@@ -89,11 +107,15 @@ private actor RefreshingDaemon: RecallDaemonServing {
     }
 
     func timeline() async throws -> [RecallMoment] {
+        storedMoments
+    }
+
+    func timeline(sinceMs: Int64) async throws -> [RecallMoment] {
         if shouldDelayNextMomentsRequest {
             shouldDelayNextMomentsRequest = false
             try await Task.sleep(for: .milliseconds(40))
         }
-        return storedMoments
+        return storedMoments.filter { $0.capturedAtMs >= sinceMs }
     }
 
     func moments(sessionID _: String) async throws -> [RecallMoment] {
@@ -120,6 +142,7 @@ private actor CountingArtifactDaemon: RecallDaemonServing {
 
     func sessions() async throws -> [RecallSession] { [] }
     func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
     func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
 
@@ -142,6 +165,7 @@ private actor ConnectionFailingDaemon: RecallDaemonServing {
     }
 
     func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
     func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
     func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
     func artifact(id _: String) async throws -> ArtifactPayload {
@@ -166,6 +190,10 @@ private actor FakeDaemon: RecallDaemonServing {
             RecallMoment(id: "m1", sessionId: "s1", capturedAtMs: 100, imageArtifactId: "a1"),
             RecallMoment(id: "m2", sessionId: "s2", capturedAtMs: 200, imageArtifactId: "a2"),
         ]
+    }
+
+    func timeline(sinceMs: Int64) async throws -> [RecallMoment] {
+        try await timeline().filter { $0.capturedAtMs >= sinceMs }
     }
 
     func moments(sessionID: String) async throws -> [RecallMoment] {

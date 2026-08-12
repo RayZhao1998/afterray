@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize as _;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -21,6 +22,9 @@ pub enum Request {
     RecordStop,
     SessionsList,
     TimelineList,
+    TimelineSince {
+        since_ms: i64,
+    },
     MomentsList {
         session_id: String,
     },
@@ -147,6 +151,12 @@ pub struct ArtifactPayload {
     pub bytes: Vec<u8>,
 }
 
+impl Drop for ArtifactPayload {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
 impl ArtifactPayload {
     #[must_use]
     pub fn meta(&self) -> ArtifactMeta {
@@ -157,6 +167,11 @@ impl ArtifactPayload {
         }
     }
 
+    /// Encodes the JSON response header preceding the raw artifact bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response metadata cannot be serialized as JSON.
     pub fn header_line(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut header = serde_json::to_vec(&Response::success(self.meta()))?;
         header.push(b'\n');
@@ -184,6 +199,12 @@ mod tests {
         assert_eq!(json, r#"{"type":"record_start"}"#);
         let decoded: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Request::RecordStart));
+    }
+
+    #[test]
+    fn timeline_cursor_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::TimelineSince { since_ms: 42 }).unwrap();
+        assert_eq!(json, r#"{"type":"timeline_since","since_ms":42}"#);
     }
 
     #[test]

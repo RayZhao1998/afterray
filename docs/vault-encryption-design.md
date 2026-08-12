@@ -27,7 +27,7 @@ Swift UI 不直接读取数据库、artifact 文件或密钥。Rust daemon 是 V
 
 数据库由从 Vault 主密钥派生的独立数据库密钥保护。数据库密钥和 artifact 加密密钥必须使用不同的派生上下文，不能直接复用同一段 key bytes。
 
-V0 当前允许先使用单一 Vault key 配合每个 artifact 的唯一 nonce 完成独立 AEAD 加密；在对外发布前必须升级为 wrapped per-artifact DEK。该升级不能改变 Swift/Rust 的所有权边界。
+当前实现已经使用 wrapped per-artifact DEK。旧 V0 的单一 Vault key + nonce 文件会在打开 Vault 时逐文件迁移；数据库也会从直接使用 Vault key 自动 rekey 为独立派生的 database key。该迁移不改变 Swift/Rust 的所有权边界。
 
 ## 3. 算法与文件组织
 
@@ -91,6 +91,25 @@ V0 当前允许先使用单一 Vault key 配合每个 artifact 的唯一 nonce �
 
 ## 8. V0 与正式版出口
 
+### 8.1 当前实现状态（2026-08-13）
+
+已完成：
+
+- macOS Data Protection Keychain 保存主密钥，使用 `AccessibleWhenUnlockedThisDeviceOnly` 且禁止同步；旧 Keychain item 会安全迁移。
+- 数据库与 artifact wrapping key 使用独立的 BLAKE3 derive-key context。
+- SQLCipher 开启 memory security、secure delete、内存 temp store 和 WAL。
+- 每个 artifact 使用随机 DEK；密文文件只包含版本 header、data nonce 和 ciphertext，wrapped DEK 与 wrapping nonce 保存在 SQLCipher 中。
+- artifact id、content type、格式版本和用途进入 AEAD authenticated data。
+- ARV0 artifact 与旧数据库 key 自动迁移；迁移采用新旧文件并存、数据库切换、最后删除旧文件的崩溃安全顺序。
+- 私有目录为 `0700`，文件为 `0600`；artifact 写入经过 `fsync` 和原子 rename；启动时清理孤立密文、迁移残留与明文 capture staging。
+- 已有 Vault 丢失 Keychain key 时 fail-closed，不会生成替代 key 覆盖恢复入口。
+- 锁屏、睡眠和用户切换时停止 daemon 与录制，并清理 Timeline、搜索结果、音频、编码 artifact cache 和解码图片 cache；恢复活动会重新启动 daemon 与录制。
+- retention 先在 SQLCipher 事务中删除 wrapped DEK，再删除 artifact 文件，使内容立即不可通过正常 Vault 路径恢复。
+
+尚未产品化的可选能力只有“用户主动创建的口令恢复包”。它需要单独确定口令强度、丢失提示和恢复 UI；AfterRay 不因此保留服务器端密钥。
+
+### 8.2 交付要求
+
 V0 必须满足：
 
 - SQLCipher 保护结构化数据和索引。
@@ -114,4 +133,3 @@ V0 必须满足：
 - Swift UI 直接打开 SQLCipher 或访问 Keychain key。
 - 一个包含全部历史的巨大加密容器。
 - 服务器保存主密钥或可绕过用户密钥的恢复后门。
-

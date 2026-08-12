@@ -8,6 +8,20 @@ import ScreenCaptureKit
 
 private let afterRayAppBundleIdentifier = "dev.afterray.app"
 
+private func hardenPrivateFile(_ url: URL) throws {
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o600))],
+        ofItemAtPath: url.path
+    )
+}
+
+private func hardenPrivateDirectory(_ url: URL) throws {
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o700))],
+        ofItemAtPath: url.path
+    )
+}
+
 private struct Options {
     let outputDirectory: URL
     let audioSegmentSeconds: Double
@@ -319,6 +333,7 @@ private func captureAccessibilityTree(
         .appendingPathComponent("accessibility-\(UUID().uuidString)")
         .appendingPathExtension("json")
     try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    try hardenPrivateFile(url)
     events.send(.artifact(
         kind: .accessibility,
         url: url,
@@ -454,6 +469,16 @@ private final class AudioSegmentWriter {
         writer.finishWriting { [events, kind, sendableWriter] in
             let completedWriter = sendableWriter.value
             if completedWriter.status == .completed {
+                do {
+                    try hardenPrivateFile(outputURL)
+                } catch {
+                    events.send(.warning(
+                        code: "audio_file_permissions",
+                        message: error.localizedDescription
+                    ))
+                    completion.signal()
+                    return
+                }
                 events.send(.artifact(
                     kind: kind,
                     url: outputURL,
@@ -544,6 +569,7 @@ private func captureScreen(
         .appendingPathComponent("screen-\(UUID().uuidString)")
         .appendingPathExtension("jpg")
     try data.write(to: url, options: Data.WritingOptions.atomic)
+    try hardenPrivateFile(url)
     let now = Int64((Date().timeIntervalSince1970 * 1_000).rounded())
     events.send(.artifact(
         kind: .screen,
@@ -580,6 +606,7 @@ private enum AfterRayCaptureShim {
                 at: options.outputDirectory,
                 withIntermediateDirectories: true
             )
+            try hardenPrivateDirectory(options.outputDirectory)
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false,
                 onScreenWindowsOnly: true
