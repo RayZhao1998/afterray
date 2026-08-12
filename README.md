@@ -134,6 +134,10 @@ The vault key is created in macOS Keychain. Metadata is stored in an encrypted
 SQLCipher database, while screenshot and audio artifacts are encrypted
 individually before being persisted.
 
+The accepted threat model, key hierarchy, runtime locking rules, and V0 versus
+release requirements are documented in the
+[Vault encryption design](docs/vault-encryption-design.md).
+
 ## CLI and daemon
 
 Run only the daemon when developing the CLI:
