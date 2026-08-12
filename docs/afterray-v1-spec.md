@@ -1,6 +1,7 @@
 # AfterRay v1 产品与技术规格草案
 
-> 状态：Draft 0.2，首发边界已部分冻结  
+> 状态：Deferred product vision；当前实现以 `docs/afterray-v0-implementation-plan.md` 为准，本文件不作为 V0 的任务或验收依据。  
+> 原状态：Draft 0.2，首发边界已部分冻结  
 > 研究截止：2026-08-12  
 > 目标：macOS Apple Silicon 个人版  
 > 文档原则：把已经决定的事项、建议默认值、待验证假设和开放问题分开，不用“看起来合理”冒充实验结果。
