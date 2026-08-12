@@ -172,21 +172,25 @@ private final class RecallOverlayController {
 private final class PermissionGuideController {
     static let shared = PermissionGuideController()
 
+    private let panelSize = NSSize(width: 392, height: 214)
     private var panel: PermissionGuidePanel?
 
     func show(for permission: RequiredPermission) {
-        let size = NSSize(width: 392, height: 214)
-        let panel = panel ?? makePanel(size: size)
-        panel.contentView = NSHostingView(
+        let panel = panel ?? makePanel()
+        let hostingView = NSHostingView(
             rootView: PermissionDropGuide(permission: permission)
+                .frame(width: panelSize.width, height: panelSize.height)
         )
+        hostingView.frame = NSRect(origin: .zero, size: panelSize)
+        hostingView.autoresizingMask = []
+        panel.contentView = hostingView
 
         let screen = targetScreen
         let origin = NSPoint(
-            x: screen.visibleFrame.maxX - size.width - 28,
-            y: screen.visibleFrame.maxY - size.height - 28
+            x: screen.visibleFrame.maxX - panelSize.width - 28,
+            y: screen.visibleFrame.maxY - panelSize.height - 28
         )
-        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.setFrame(NSRect(origin: origin, size: panelSize), display: true)
         panel.alphaValue = 0
         NSApp.unhideWithoutActivation()
         panel.orderFrontRegardless()
@@ -210,13 +214,17 @@ private final class PermissionGuideController {
         panel.alphaValue = 1
     }
 
-    private func makePanel(size: NSSize) -> PermissionGuidePanel {
+    private func makePanel() -> PermissionGuidePanel {
         let panel = PermissionGuidePanel(
-            contentRect: NSRect(origin: .zero, size: size),
+            contentRect: NSRect(origin: .zero, size: panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        panel.minSize = panelSize
+        panel.maxSize = panelSize
+        panel.contentMinSize = panelSize
+        panel.contentMaxSize = panelSize
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
@@ -314,7 +322,7 @@ private struct PermissionDropGuide: View {
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(width: 392, height: 214, alignment: .topLeading)
         .background(.ultraThinMaterial)
         .background(Color.black.opacity(0.62))
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
