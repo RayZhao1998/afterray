@@ -13,6 +13,7 @@ afterray-protocol = { path = "../afterray-protocol" }
 afterray-store = { path = "../afterray-store" }
 anyhow.workspace = true
 blake3.workspace = true
+chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

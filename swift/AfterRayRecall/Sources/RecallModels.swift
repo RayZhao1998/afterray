@@ -420,6 +420,65 @@ public struct RecordStopResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct AskCitation: Codable, Equatable, Identifiable, Sendable {
+    public let momentId: String
+    public let capturedAtMs: Int64
+    public let label: String
+    public let excerpt: String
+
+    public var id: String { "\(momentId):\(capturedAtMs)" }
+
+    public init(momentId: String, capturedAtMs: Int64, label: String, excerpt: String) {
+        self.momentId = momentId
+        self.capturedAtMs = capturedAtMs
+        self.label = label
+        self.excerpt = excerpt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case momentId = "moment_id"
+        case capturedAtMs = "captured_at_ms"
+        case label
+        case excerpt
+    }
+
+    public func asSearchHit() -> RecallSearchHit {
+        RecallSearchHit(
+            momentId: momentId,
+            sessionId: "",
+            capturedAtMs: capturedAtMs,
+            source: "ask",
+            text: excerpt,
+            score: 1
+        )
+    }
+}
+
+public struct AskAnswer: Codable, Equatable, Sendable {
+    public let answer: String
+    public let citations: [AskCitation]
+    public let modelMissing: Bool
+
+    public init(answer: String, citations: [AskCitation] = [], modelMissing: Bool = false) {
+        self.answer = answer
+        self.citations = citations
+        self.modelMissing = modelMissing
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case answer
+        case citations
+        case modelMissing = "model_missing"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        answer = try container.decode(String.self, forKey: .answer)
+        citations = try container.decodeIfPresent([AskCitation].self, forKey: .citations) ?? []
+        modelMissing = try container.decodeIfPresent(Bool.self, forKey: .modelMissing) ?? false
+    }
+}
+
 public struct RecallSearchHit: Codable, Equatable, Identifiable, Sendable {
     public let momentId: String
     public let sessionId: String

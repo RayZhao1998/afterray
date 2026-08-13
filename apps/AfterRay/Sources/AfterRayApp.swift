@@ -803,6 +803,12 @@ private struct AfterRayRootView: View {
                     onSearch: { Task { await control.search() } },
                     onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
                 )
+                ImmersiveAskBar(
+                    model: control,
+                    onAsk: submitAsk,
+                    onOpenSettings: { AfterRaySettingsController.shared.show() },
+                    onSelectCitation: openAskCitation
+                )
                 if let message = control.message, !control.isRecording {
                     CaptureFailureBanner(message: message, onRetry: toggleRecording)
                 }
@@ -874,6 +880,8 @@ private struct AfterRayRootView: View {
             }
         }
         .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
+        .animation(.easeOut(duration: 0.14), value: control.isAsking)
+        .animation(.easeOut(duration: 0.14), value: control.askAnswer == nil)
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
@@ -993,6 +1001,15 @@ private struct AfterRayRootView: View {
             isLive = false
         }
         Task { await store.openSearchHit(hit) }
+    }
+
+    private func submitAsk() {
+        control.dismissSearch()
+        Task { await control.ask() }
+    }
+
+    private func openAskCitation(_ citation: AskCitation) {
+        openSearchHit(citation.asSearchHit())
     }
 }
 
@@ -1215,6 +1232,147 @@ private struct ImmersiveControlBar: View {
         case .stopping: return "Stopping"
         case .failed: return "Capture failed"
         }
+    }
+}
+
+private struct ImmersiveAskBar: View {
+    @ObservedObject var model: AfterRayControlModel
+    let onAsk: () -> Void
+    let onOpenSettings: () -> Void
+    let onSelectCitation: (AskCitation) -> Void
+    @FocusState private var isAskFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(RecallPalette.ray.opacity(0.92))
+                TextField("Ask about your day", text: $model.askQuestion)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .focused($isAskFocused)
+                    .onSubmit(onAsk)
+                if model.isAsking {
+                    ProgressView().controlSize(.small)
+                } else if !model.askQuestion.isEmpty {
+                    Button(action: model.dismissAsk) {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear question")
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(width: 420, height: 36)
+            .recallGlass(in: .capsule)
+
+            if model.isAsking || model.askAnswer != nil || model.askMessage != nil {
+                AskAnswerPanel(
+                    isAsking: model.isAsking,
+                    answer: model.askAnswer,
+                    error: model.askMessage,
+                    onOpenSettings: onOpenSettings,
+                    onSelectCitation: onSelectCitation,
+                    onDismiss: model.dismissAsk
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+            }
+        }
+    }
+}
+
+private struct AskAnswerPanel: View {
+    let isAsking: Bool
+    let answer: AskAnswer?
+    let error: String?
+    let onOpenSettings: () -> Void
+    let onSelectCitation: (AskCitation) -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(panelTitle)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .tracking(1.4)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: onDismiss) { Image(systemName: "xmark") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+            }
+
+            if isAsking {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading today's memory…")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.78))
+                }
+            } else if let error {
+                Text(error)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let answer {
+                Text(answer.answer)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !answer.citations.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(Array(answer.citations.prefix(3))) { citation in
+                            Button {
+                                onSelectCitation(citation)
+                            } label: {
+                                Text(citationChipTitle(citation))
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(AskCitationChipStyle())
+                            .help(citation.excerpt)
+                        }
+                    }
+                }
+                if answer.modelMissing {
+                    Button("Open Settings", action: onOpenSettings)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(RecallPalette.ray)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 420, alignment: .leading)
+        .recallGlass(in: .rounded(10))
+    }
+
+    private var panelTitle: String {
+        if isAsking { return "ASKING" }
+        if answer?.modelMissing == true { return "MODEL MISSING" }
+        if error != nil { return "ASK FAILED" }
+        return "ANSWER"
+    }
+
+    private func citationChipTitle(_ citation: AskCitation) -> String {
+        let time = Date(timeIntervalSince1970: TimeInterval(citation.capturedAtMs) / 1_000)
+            .formatted(date: .omitted, time: .shortened)
+        if citation.label.isEmpty {
+            return time
+        }
+        return "\(time) · \(citation.label)"
+    }
+}
+
+private struct AskCitationChipStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.88))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.white.opacity(configuration.isPressed ? 0.08 : 0.12), in: Capsule())
     }
 }
 

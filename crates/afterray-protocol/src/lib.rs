@@ -67,6 +67,13 @@ pub enum Request {
     Summarize {
         session_id: String,
     },
+    Ask {
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_ms: Option<i64>,
+    },
     Settings,
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,6 +334,53 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskCitation {
+    pub moment_id: String,
+    pub captured_at_ms: i64,
+    pub label: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskAnswer {
+    pub answer: String,
+    #[serde(default)]
+    pub citations: Vec<AskCitation>,
+    #[serde(default)]
+    pub model_missing: bool,
+}
+
+/// Inclusive local-calendar day bounds containing `now_ms`.
+///
+/// Used when an [`Request::Ask`] omits `from_ms` / `to_ms`.
+#[must_use]
+pub fn local_calendar_day_bounds_ms(now_ms: i64) -> (i64, i64) {
+    use chrono::{Local, NaiveTime};
+
+    let now = chrono::DateTime::from_timestamp_millis(now_ms)
+        .unwrap_or_else(chrono::Utc::now)
+        .with_timezone(&Local);
+    let date = now.date_naive();
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default();
+    let start_naive = date.and_time(midnight);
+    let start_ms = resolve_local_ms(start_naive).unwrap_or(now_ms);
+    let end_ms = date
+        .succ_opt()
+        .and_then(|next| resolve_local_ms(next.and_time(midnight)))
+        .map_or(now_ms, |next_start| next_start.saturating_sub(1));
+    (start_ms.min(end_ms), end_ms.max(start_ms))
+}
+
+fn resolve_local_ms(naive: chrono::NaiveDateTime) -> Option<i64> {
+    use chrono::{Local, TimeZone as _};
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&naive).latest())
+        .map(|dt| dt.timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +428,60 @@ mod tests {
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
         );
+    }
+
+    #[test]
+    fn ask_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::Ask {
+                question: "我今天做了什么".into(),
+                from_ms: None,
+                to_ms: None,
+            })
+            .unwrap(),
+            r#"{"type":"ask","question":"我今天做了什么"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Ask {
+                question: "what did I do".into(),
+                from_ms: Some(10),
+                to_ms: Some(20),
+            })
+            .unwrap(),
+            r#"{"type":"ask","question":"what did I do","from_ms":10,"to_ms":20}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"ask","question":"hello"}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::Ask {
+                ref question,
+                from_ms: None,
+                to_ms: None
+            } if question == "hello"
+        ));
+    }
+
+    #[test]
+    fn ask_answer_defaults_missing_model_flag() {
+        let parsed: AskAnswer = serde_json::from_str(r#"{"answer":"ok","citations":[]}"#).unwrap();
+        assert_eq!(parsed.answer, "ok");
+        assert!(!parsed.model_missing);
+        assert!(parsed.citations.is_empty());
+    }
+
+    #[test]
+    fn local_calendar_day_contains_now() {
+        let now = 1_786_694_400_000; // 2026-08-14 12:00:00 UTC
+        let (start, end) = local_calendar_day_bounds_ms(now);
+        assert!(start <= now, "start={start} now={now}");
+        assert!(now <= end, "now={now} end={end}");
+        let span = end.saturating_sub(start);
+        assert!(
+            (23 * 60 * 60 * 1000..26 * 60 * 60 * 1000).contains(&span),
+            "day span should be ~24h, got {span}ms"
+        );
+        assert_eq!(local_calendar_day_bounds_ms(now), (start, end));
     }
 
     #[test]
