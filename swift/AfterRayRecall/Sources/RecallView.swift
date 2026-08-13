@@ -575,7 +575,7 @@ private final class RecallStillPlayer: ObservableObject {
         while isCurrentFade(generation) {
             let elapsed = CACurrentMediaTime() - began
             let t = duration <= 0 ? 1 : min(elapsed / duration, 1)
-            incomingOpacity = easeInOut(t)
+            incomingOpacity = RecallStillGate.fadeProgress(at: t)
             view(incomingSlot)?.setContentOpacity(incomingOpacity)
             if t >= 1 { break }
             try? await Task.sleep(for: .milliseconds(8))
@@ -595,10 +595,6 @@ private final class RecallStillPlayer: ObservableObject {
 
     private func isCurrentFade(_ generation: UInt64) -> Bool {
         !Task.isCancelled && fadeGeneration == generation && isAnimating
-    }
-
-    private func easeInOut(_ t: CGFloat) -> CGFloat {
-        t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
     }
 }
 

@@ -342,10 +342,16 @@ enum RecallDisplayedFrame {
 /// 3. When the fade finishes, `pendingID` (latest wins) starts the next tick
 ///    immediately, so dragging keeps the picture moving.
 struct RecallStillGate: Equatable {
-    static let intervalMilliseconds = 150
+    static let intervalMilliseconds = 70
     static var interval: Duration { .milliseconds(intervalMilliseconds) }
     static var animationDuration: TimeInterval {
         TimeInterval(intervalMilliseconds) / 1_000
+    }
+
+    /// Incoming still fade. `cubic-bezier(0.22, 0.85, 0.87, 0.22)`:
+    /// fast, then a hold around halfway, then fast again.
+    static func fadeProgress(at linearTime: CGFloat) -> CGFloat {
+        CGFloat(unitBezier(Double(linearTime), x1: 0.22, y1: 0.85, x2: 0.87, y2: 0.22))
     }
 
     enum Phase: Equatable {
@@ -447,4 +453,31 @@ struct RecallStillGate: Equatable {
         if pendingID == id { return nil }
         return pendingID
     }
+}
+
+/// Solve y for x on the unit cubic Bézier (0,0) → (x1,y1) → (x2,y2) → (1,1).
+private func unitBezier(_ x: Double, x1: Double, y1: Double, x2: Double, y2: Double) -> Double {
+    if x <= 0 { return 0 }
+    if x >= 1 { return 1 }
+
+    var t = x
+    for _ in 0..<8 {
+        let current = sampleBezier(t, p1: x1, p2: x2)
+        let delta = current - x
+        if abs(delta) < 1e-6 { break }
+        let derivative = sampleBezierDerivative(t, p1: x1, p2: x2)
+        if abs(derivative) < 1e-6 { break }
+        t = min(max(t - delta / derivative, 0), 1)
+    }
+    return min(max(sampleBezier(t, p1: y1, p2: y2), 0), 1)
+}
+
+private func sampleBezier(_ t: Double, p1: Double, p2: Double) -> Double {
+    let inverse = 1 - t
+    return 3 * inverse * inverse * t * p1 + 3 * inverse * t * t * p2 + t * t * t
+}
+
+private func sampleBezierDerivative(_ t: Double, p1: Double, p2: Double) -> Double {
+    let inverse = 1 - t
+    return 3 * inverse * inverse * p1 + 6 * inverse * t * (p2 - p1) + 3 * t * t * (1 - p2)
 }

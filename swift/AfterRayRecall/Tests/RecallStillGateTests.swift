@@ -2,13 +2,27 @@ import XCTest
 @testable import AfterRayRecall
 
 final class RecallStillGateTests: XCTestCase {
-    func testIntervalIsOneHundredFiftyMilliseconds() {
-        XCTAssertEqual(RecallStillGate.intervalMilliseconds, 150)
+    func testIntervalIsSeventyMilliseconds() {
+        XCTAssertEqual(RecallStillGate.intervalMilliseconds, 70)
         XCTAssertEqual(
             RecallStillGate.animationDuration,
             TimeInterval(RecallStillGate.intervalMilliseconds) / 1_000,
             accuracy: 0.000_001
         )
+    }
+
+    func testFadeBezierIsFastSlowFast() {
+        XCTAssertEqual(RecallStillGate.fadeProgress(at: 0), 0, accuracy: 0.000_001)
+        XCTAssertEqual(RecallStillGate.fadeProgress(at: 1), 1, accuracy: 0.000_001)
+
+        let early = RecallStillGate.fadeProgress(at: 0.25)
+        let mid = RecallStillGate.fadeProgress(at: 0.5)
+        let late = RecallStillGate.fadeProgress(at: 0.75)
+        XCTAssertGreaterThan(early, 0.35)
+        XCTAssertLessThan(early, 0.50)
+        XCTAssertEqual(mid, 0.52, accuracy: 0.04)
+        XCTAssertLessThan(late - mid, early)
+        XCTAssertGreaterThan(1 - late, late - mid)
     }
 
     func testFirstReadyFrameStaysBusyUntilCommitSettle() {
