@@ -35,6 +35,9 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     public let accessibilityArtifactId: String?
     public let applicationName: String?
     public let bundleIdentifier: String?
+    public let windowTitle: String?
+    public let url: String?
+    public let document: String?
 
     public init(
         id: String,
@@ -50,7 +53,10 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         audioStartedAtMs: Int64? = nil,
         accessibilityArtifactId: String? = nil,
         applicationName: String? = nil,
-        bundleIdentifier: String? = nil
+        bundleIdentifier: String? = nil,
+        windowTitle: String? = nil,
+        url: String? = nil,
+        document: String? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -66,6 +72,9 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.accessibilityArtifactId = accessibilityArtifactId
         self.applicationName = applicationName
         self.bundleIdentifier = bundleIdentifier
+        self.windowTitle = windowTitle
+        self.url = url
+        self.document = document
     }
 
     public var hasVisibleTranscript: Bool {
@@ -88,6 +97,9 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case accessibilityArtifactId = "accessibility_artifact_id"
         case applicationName = "application_name"
         case bundleIdentifier = "bundle_identifier"
+        case windowTitle = "window_title"
+        case url
+        case document
     }
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +118,9 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         accessibilityArtifactId = try container.decodeIfPresent(String.self, forKey: .accessibilityArtifactId)
         applicationName = try container.decodeIfPresent(String.self, forKey: .applicationName)
         bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+        windowTitle = try container.decodeIfPresent(String.self, forKey: .windowTitle)
+        url = try container.decodeIfPresent(String.self, forKey: .url)
+        document = try container.decodeIfPresent(String.self, forKey: .document)
     }
 
     public var displayCacheKey: String {

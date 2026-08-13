@@ -375,6 +375,15 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 Err(error) => Response::failure(error.to_string()),
             }
         }
+        Request::ActivitySpans {
+            from_ms,
+            to_ms,
+            limit,
+        } => into_response(
+            state
+                .store
+                .activity_spans(from_ms, to_ms, limit.clamp(1, 500)),
+        ),
         Request::ModelsStatus => Response::success(model_library(state)),
         Request::JobsList => Response::success(state.models.list().await),
         Request::JobRetry { job_id } => match state.models.retry(&job_id).await {

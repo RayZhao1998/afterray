@@ -7,7 +7,9 @@
 )]
 
 use afterray_core::{CoreError, Store};
-use afterray_protocol::{ArtifactPayload, AudioSegment, AudioTrack, Moment, SearchHit, Session};
+use afterray_protocol::{
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Moment, SearchHit, Session,
+};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chacha20poly1305::{
@@ -40,6 +42,7 @@ use std::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod activity;
 mod gop;
 mod jpeg;
 
@@ -49,7 +52,7 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -450,6 +453,9 @@ impl Vault {
                     m.accessibility_artifact_id,
                     m.application_name,
                     m.bundle_identifier,
+                    m.window_title,
+                    m.url,
+                    m.document,
                     m.gop_segment_id,
                     m.gop_index,
                     m.still_origin,
@@ -490,6 +496,9 @@ impl Vault {
                     m.accessibility_artifact_id,
                     m.application_name,
                     m.bundle_identifier,
+                    m.window_title,
+                    m.url,
+                    m.document,
                     m.gop_segment_id,
                     m.gop_index,
                     m.still_origin,
@@ -530,6 +539,9 @@ impl Vault {
                     m.accessibility_artifact_id,
                     m.application_name,
                     m.bundle_identifier,
+                    m.window_title,
+                    m.url,
+                    m.document,
                     m.gop_segment_id,
                     m.gop_index,
                     m.still_origin,
@@ -567,6 +579,9 @@ impl Vault {
             accessibility_artifact_id: None,
             application_name: None,
             bundle_identifier: None,
+            window_title: None,
+            url: None,
+            document: None,
             gop: None,
             still_origin: "capture".to_owned(),
         };
@@ -665,6 +680,11 @@ impl Vault {
             return Ok(None);
         }
 
+        let context = activity::merge_activity_context(
+            activity::parse_accessibility_context(snapshot),
+            application_name,
+            bundle_identifier,
+        );
         let artifact_id = self.put_artifact(content_type, snapshot)?;
         let update_result = {
             let connection = self.connection.lock().unwrap();
@@ -672,9 +692,20 @@ impl Vault {
                 "UPDATE moments
                     SET accessibility_artifact_id = ?2,
                         application_name = ?3,
-                        bundle_identifier = ?4
+                        bundle_identifier = ?4,
+                        window_title = ?5,
+                        url = ?6,
+                        document = ?7
                   WHERE id = ?1",
-                params![moment_id, artifact_id, application_name, bundle_identifier],
+                params![
+                    moment_id,
+                    artifact_id,
+                    context.application_name.as_deref(),
+                    context.bundle_identifier.as_deref(),
+                    context.window_title.as_deref(),
+                    context.url.as_deref(),
+                    context.document.as_deref()
+                ],
             )
         };
         if let Err(error) = update_result {
@@ -684,11 +715,48 @@ impl Vault {
         if let Some(previous) = previous_artifact {
             self.delete_artifact_record_and_file(&previous)?;
         }
-        if is_lock_screen_identity(application_name, bundle_identifier) {
+        if is_lock_screen_identity(
+            context.application_name.as_deref(),
+            context.bundle_identifier.as_deref(),
+        ) {
             self.delete_moment_and_artifacts(&moment_id)?;
             return Ok(None);
         }
         Ok(Some(artifact_id))
+    }
+
+    pub fn activity_spans(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ActivitySpan>, StoreError> {
+        if limit == 0 || from_ms > to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms, application_name, bundle_identifier,
+                    window_title, url, document
+               FROM moments
+              WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+              ORDER BY captured_at_ms, id",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(activity::ActivityMomentRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                application_name: row.get(2)?,
+                bundle_identifier: row.get(3)?,
+                window_title: row.get(4)?,
+                url: row.get(5)?,
+                document: row.get(6)?,
+            })
+        })?;
+        let moments = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        Ok(activity::fold_activity_spans(&moments, limit))
     }
 
     pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {
@@ -1477,26 +1545,32 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_query_indexes(connection)?;
     migrate_schema_6(connection)?;
     migrate_schema_7(connection)?;
-    let has_accessibility_artifact = {
-        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .any(|column| column == "accessibility_artifact_id")
-    };
-    if !has_accessibility_artifact {
+    migrate_legacy_moment_columns(connection)?;
+    migrate_schema_8(connection)?;
+    migrate_artifact_columns(connection)?;
+    connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
+    Ok(())
+}
+
+fn moment_column_names(connection: &Connection) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+    statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn migrate_legacy_moment_columns(connection: &Connection) -> Result<(), StoreError> {
+    let moment_columns = moment_column_names(connection)?;
+    if !moment_columns
+        .iter()
+        .any(|column| column == "accessibility_artifact_id")
+    {
         connection.execute(
             "ALTER TABLE moments ADD COLUMN accessibility_artifact_id TEXT REFERENCES artifacts(id)",
             [],
         )?;
     }
-    let moment_columns = {
-        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
     if !moment_columns
         .iter()
         .any(|column| column == "application_name")
@@ -1509,8 +1583,6 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     {
         connection.execute("ALTER TABLE moments ADD COLUMN bundle_identifier TEXT", [])?;
     }
-    migrate_artifact_columns(connection)?;
-    connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
 }
 
@@ -1687,6 +1759,16 @@ fn migrate_schema_7(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_schema_8(connection: &Connection) -> Result<(), StoreError> {
+    let moment_columns = moment_column_names(connection)?;
+    for column in ["window_title", "url", "document"] {
+        if !moment_columns.iter().any(|name| name == column) {
+            connection.execute(&format!("ALTER TABLE moments ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS moments_time_id ON moments(captured_at_ms, id);
@@ -1714,13 +1796,19 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         accessibility_artifact_id: row.get(9)?,
         application_name: row.get(10)?,
         bundle_identifier: row.get(11)?,
-        gop: match (row.get::<_, Option<String>>(12)?, row.get::<_, Option<i64>>(13)?) {
+        window_title: row.get(12)?,
+        url: row.get(13)?,
+        document: row.get(14)?,
+        gop: match (
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, Option<i64>>(16)?,
+        ) {
             (Some(segment_id), Some(index)) => Some(afterray_protocol::GopRef {
                 segment_id,
                 index: u16::try_from(index).unwrap_or(0),
                 keyframe_index: 0,
                 frame_count: row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(18)?
                     .and_then(|count| u16::try_from(count).ok())
                     .unwrap_or(0),
                 codec: "av01".to_owned(),
@@ -1728,7 +1816,7 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
             _ => None,
         },
         still_origin: row
-            .get::<_, Option<String>>(14)?
+            .get::<_, Option<String>>(17)?
             .unwrap_or_else(|| "capture".to_owned()),
     })
 }
@@ -2090,7 +2178,8 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 2, "image/jpeg", b"private-screen-text")
             .unwrap();
-        let on_disk = fs::read(vault.artifact_path(moment.image_artifact_id.as_deref().unwrap())).unwrap();
+        let on_disk =
+            fs::read(vault.artifact_path(moment.image_artifact_id.as_deref().unwrap())).unwrap();
         assert_eq!(&on_disk[..4], ARTIFACT_MAGIC);
         assert!(
             !on_disk
@@ -2114,7 +2203,9 @@ mod tests {
                 .windows(wrapped_key.len())
                 .any(|window| window == wrapped_key)
         );
-        let payload = vault.read_artifact(moment.image_artifact_id.as_deref().unwrap()).unwrap();
+        let payload = vault
+            .read_artifact(moment.image_artifact_id.as_deref().unwrap())
+            .unwrap();
         assert_eq!(payload.bytes, b"private-screen-text");
         drop(directory);
     }
@@ -2701,5 +2792,220 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leftover, 0);
+    }
+
+    #[test]
+    fn safari_ax_fixture_attaches_url_to_the_moment() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", b"screen")
+            .unwrap();
+        let snapshot = br#"{
+            "application_name": "Safari",
+            "bundle_identifier": "com.apple.Safari",
+            "window_title": "Example Domain",
+            "url": "https://example.com/",
+            "root": {
+                "role": "AXApplication",
+                "children": [{
+                    "role": "AXWindow",
+                    "title": "Example Domain",
+                    "children": [{
+                        "role": "AXWebArea",
+                        "url": "https://example.com/"
+                    }]
+                }]
+            }
+        }"#;
+        assert!(
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    10_000,
+                    "application/vnd.afterray.ax+json",
+                    snapshot,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .is_some()
+        );
+        let moment = &vault.moments_sync(&session.id).unwrap()[0];
+        assert_eq!(moment.application_name.as_deref(), Some("Safari"));
+        assert_eq!(
+            moment.bundle_identifier.as_deref(),
+            Some("com.apple.Safari")
+        );
+        assert_eq!(moment.window_title.as_deref(), Some("Example Domain"));
+        assert_eq!(moment.url.as_deref(), Some("https://example.com/"));
+        assert!(moment.document.is_none());
+    }
+
+    #[test]
+    fn chrome_like_tree_url_is_copied_onto_the_moment() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 20, "image/jpeg", b"screen")
+            .unwrap();
+        let snapshot = br#"{
+            "application_name": "Google Chrome",
+            "bundle_identifier": "com.google.Chrome",
+            "root": {
+                "role": "AXApplication",
+                "children": [{
+                    "role": "AXWindow",
+                    "title": "Example Domain",
+                    "children": [{
+                        "role": "AXWebArea",
+                        "title": "Example Domain",
+                        "url": "https://example.com/"
+                    }]
+                }]
+            }
+        }"#;
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                20,
+                "application/vnd.afterray.ax+json",
+                snapshot,
+                Some("Google Chrome"),
+                Some("com.google.Chrome"),
+            )
+            .unwrap();
+        let moment = &vault.moments_sync(&session.id).unwrap()[0];
+        assert_eq!(moment.url.as_deref(), Some("https://example.com/"));
+        assert_eq!(moment.window_title.as_deref(), Some("Example Domain"));
+    }
+
+    #[test]
+    fn activity_spans_merge_consecutive_moments_with_duration() {
+        let (_directory, vault) = test_vault(20);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 0, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", b"two")
+            .unwrap();
+        let third = vault
+            .insert_moment(&session.id, 1_560_000, "image/jpeg", b"three")
+            .unwrap();
+        let fourth = vault
+            .insert_moment(&session.id, 1_570_000, "image/jpeg", b"four")
+            .unwrap();
+        let safari = br#"{"application_name":"Safari","bundle_identifier":"com.apple.Safari","window_title":"Example Domain","url":"https://example.com/"}"#;
+        let xcode = br#"{"application_name":"Xcode","bundle_identifier":"com.apple.dt.Xcode","window_title":"Package.swift","document":"/tmp/Package.swift"}"#;
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                0,
+                "application/vnd.afterray.ax+json",
+                safari,
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                10_000,
+                "application/vnd.afterray.ax+json",
+                safari,
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_560_000,
+                "application/vnd.afterray.ax+json",
+                safari,
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_570_000,
+                "application/vnd.afterray.ax+json",
+                xcode,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let spans = vault.activity_spans(0, 2_000_000, 10).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].application_name.as_deref(), Some("Safari"));
+        assert_eq!(spans[0].url.as_deref(), Some("https://example.com/"));
+        assert_eq!(spans[0].start_ms, 0);
+        assert_eq!(spans[0].end_ms, 1_570_000);
+        assert_eq!(spans[0].duration_ms, 1_570_000);
+        assert_eq!(
+            spans[0].moment_ids,
+            [first.id.clone(), second.id.clone(), third.id.clone()]
+        );
+        assert_eq!(spans[1].application_name.as_deref(), Some("Xcode"));
+        assert_eq!(
+            spans[1].document.as_deref(),
+            Some("file:///tmp/Package.swift")
+        );
+        assert_eq!(spans[1].moment_ids, [fourth.id]);
+        assert!(vault.activity_spans(2_000_000, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_8_adds_activity_columns_without_resetting_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [7_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            max_unstarred_moments: 10,
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "ALTER TABLE moments DROP COLUMN window_title;
+                     ALTER TABLE moments DROP COLUMN url;
+                     ALTER TABLE moments DROP COLUMN document;
+                     UPDATE schema_meta SET version = 7;",
+                )
+                .unwrap();
+            session.id
+        };
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let columns = {
+            let connection = vault.connection.lock().unwrap();
+            let mut statement = connection.prepare("PRAGMA table_info(moments)").unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(columns.iter().any(|column| column == "window_title"));
+        assert!(columns.iter().any(|column| column == "url"));
+        assert!(columns.iter().any(|column| column == "document"));
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
     }
 }
