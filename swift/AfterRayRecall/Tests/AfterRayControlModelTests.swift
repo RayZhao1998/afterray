@@ -92,6 +92,28 @@ private actor ControlDaemon: AfterRayDaemonServing {
         DaemonShutdownResult(stopping: true, pid: nil)
     }
 
+    func modelLibrary() async throws -> ModelLibrary {
+        ModelLibrary(directory: "/tmp/afterray-models", packs: [])
+    }
+
+    func settings() async throws -> AppSettings {
+        AppSettings(
+            dataDir: "/tmp/afterray-data",
+            modelDir: "/tmp/afterray-models",
+            recordAudio: true,
+            captureIntervalSeconds: 10
+        )
+    }
+
+    func updateSettings(recordAudio: Bool) async throws -> AppSettings {
+        AppSettings(
+            dataDir: "/tmp/afterray-data",
+            modelDir: "/tmp/afterray-models",
+            recordAudio: recordAudio,
+            captureIntervalSeconds: 10
+        )
+    }
+
     func search(query: String, limit: Int) async throws -> [RecallSearchHit] {
         lastSearchQuery = query
         return [

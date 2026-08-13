@@ -15,11 +15,15 @@ public struct RecallView: View {
     public var artifactLoader: RecallArtifactLoader?
     public var onToggleFavorite: (() -> Void)?
     public var onToggleAudio: ((RecallMoment) -> Void)?
+    public var isAudioPlaying: Bool
+    public var isAudioBuffering: Bool
+    public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var movementDirection = -1
     @State private var showsDetails = false
+    @State private var detailsPage = RecallDetailsPage.root
     @State private var timelineViewportWidth: CGFloat = 720
 
     public init(
@@ -32,6 +36,9 @@ public struct RecallView: View {
         artifactLoader: RecallArtifactLoader? = nil,
         onToggleFavorite: (() -> Void)? = nil,
         onToggleAudio: ((RecallMoment) -> Void)? = nil,
+        isAudioPlaying: Bool = false,
+        isAudioBuffering: Bool = false,
+        playingAudioArtifactID: String? = nil,
         onReload: (() -> Void)? = nil
     ) {
         self.moments = moments
@@ -43,7 +50,15 @@ public struct RecallView: View {
         self.artifactLoader = artifactLoader
         self.onToggleFavorite = onToggleFavorite
         self.onToggleAudio = onToggleAudio
+        self.isAudioPlaying = isAudioPlaying
+        self.isAudioBuffering = isAudioBuffering
+        self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
+    }
+
+    private var selectedAudioIsActive: Bool {
+        selectedMoment?.audioArtifactId != nil
+            && selectedMoment?.audioArtifactId == playingAudioArtifactID
     }
 
     private var selectedMoment: RecallMoment? {
@@ -64,18 +79,13 @@ public struct RecallView: View {
                 RecallPalette.background.ignoresSafeArea()
             }
 
-            switch loadState {
-            case .loading where moments.isEmpty:
-                loadingView
-            case .failed(let message) where moments.isEmpty:
+            if !moments.isEmpty || isLive {
+                recallContent
+            } else if case .failed(let message) = loadState {
                 FailureView(message: message, onReload: onReload)
-            default:
-                if moments.isEmpty {
-                    EmptyRecallView(isProcessing: isProcessing)
-                        .padding(40)
-                } else {
-                    recallContent
-                }
+            } else {
+                EmptyRecallView(isProcessing: isProcessing)
+                    .padding(40)
             }
         }
         .preferredColorScheme(.dark)
@@ -84,20 +94,6 @@ public struct RecallView: View {
     private var isProcessing: Bool {
         if case .processing = loadState { return true }
         return false
-    }
-
-    private var loadingView: some View {
-        VStack(spacing: 14) {
-            ProgressView().controlSize(.large)
-            ProgressView().controlSize(.large).tint(RecallPalette.textPrimary)
-            Text("Opening your memory…")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(RecallPalette.textPrimary)
-        }
-        .padding(.horizontal, 32)
-        .padding(.vertical, 24)
-        .recallOverlayPanel(cornerRadius: 20)
-        .shadow(color: .black.opacity(0.42), radius: 28, y: 12)
     }
 
     private var recallContent: some View {
@@ -122,6 +118,22 @@ public struct RecallView: View {
 
                 Spacer(minLength: 100)
 
+                if !isLive {
+                    TranscriptCaption(
+                        text: selectedMoment?.transcriptText,
+                        canPlay: selectedMoment?.audioArtifactId != nil,
+                        isPlaying: isAudioPlaying && selectedAudioIsActive,
+                        isBuffering: isAudioBuffering && selectedAudioIsActive,
+                        onToggleAudio: {
+                            if let moment = selectedMoment {
+                                onToggleAudio?(moment)
+                            }
+                        }
+                    )
+                    .padding(.horizontal, 48)
+                    .padding(.bottom, 12)
+                }
+
                 AppUsageTimeline(
                     layout: timelineLayout,
                     playheadMs: playheadMs,
@@ -135,14 +147,22 @@ public struct RecallView: View {
                 .padding(.bottom, 18)
             }
 
-            if showsDetails, !isLive {
-                detailsPanel
-                    .frame(width: 340)
-                    .padding(.top, 76)
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 154)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            if showsDetails, !isLive, let moment = selectedMoment {
+                RecallDetailsMenu(
+                    moment: moment,
+                    page: $detailsPage,
+                    isProcessing: isProcessing,
+                    artifactLoader: artifactLoader,
+                    onToggleAudio: onToggleAudio,
+                    isAudioPlaying: isAudioPlaying,
+                    isAudioBuffering: isAudioBuffering,
+                    playingAudioArtifactID: playingAudioArtifactID,
+                    onClose: { showsDetails = false }
+                )
+                .padding(.top, 76)
+                .padding(.trailing, 24)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
 
             ScrollWheelMonitor(onScroll: handleScroll)
@@ -151,6 +171,13 @@ public struct RecallView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
+        .onKeyPress(.space) {
+            guard !isLive, let moment = selectedMoment, moment.audioArtifactId != nil else {
+                return .ignored
+            }
+            onToggleAudio?(moment)
+            return .handled
+        }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection)") {
             prefetchAroundSelection()
@@ -210,7 +237,14 @@ public struct RecallView: View {
                 symbol: showsDetails ? "sidebar.right" : "info.circle",
                 help: showsDetails ? "Hide captured context" : "Show captured context",
                 tint: .white,
-                action: { showsDetails.toggle() }
+                action: {
+                    if showsDetails {
+                        showsDetails = false
+                    } else {
+                        detailsPage = .root
+                        showsDetails = true
+                    }
+                }
             )
         }
     }
@@ -231,62 +265,6 @@ public struct RecallView: View {
         }
         .buttonStyle(RecallPressButtonStyle())
         .help(help)
-    }
-
-    private var detailsPanel: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    Text("CAPTURED CONTEXT")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .tracking(1.4)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button { showsDetails = false } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                }
-
-                EvidenceBlock(
-                    eyebrow: "ON SCREEN",
-                    icon: "text.viewfinder",
-                    text: selectedMoment?.ocrText,
-                    emptyText: isProcessing ? "OCR is processing…" : "No screen text found"
-                )
-
-                if
-                    let artifactID = selectedMoment?.accessibilityArtifactId,
-                    let artifactLoader
-                {
-                    AccessibilitySnapshotBlock(artifactID: artifactID, loader: artifactLoader)
-                }
-
-                EvidenceBlock(
-                    eyebrow: "HEARD",
-                    icon: "waveform",
-                    text: selectedMoment?.transcriptText,
-                    emptyText: isProcessing ? "Transcript is processing…" : "No transcript near this moment"
-                )
-
-                if let moment = selectedMoment, moment.audioArtifactId != nil {
-                    Button { onToggleAudio?(moment) } label: {
-                        Label("Play from this moment", systemImage: "play.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(RecallCapsuleButtonStyle())
-                    .disabled(onToggleAudio == nil)
-                }
-            }
-            .padding(20)
-        }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(.white.opacity(0.13), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.5), radius: 28, y: 12)
     }
 
     private var recallDrag: some Gesture {
@@ -798,6 +776,11 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         func start() {
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
                 guard let self, event.window === self.hostView?.window else { return event }
+                if let hit = event.window?.contentView?.hitTest(event.locationInWindow),
+                   hit.enclosingScrollView != nil
+                {
+                    return event
+                }
                 let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
                 pendingDelta = RecallGeometry.accumulatedScrollDelta(
@@ -852,38 +835,345 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
     }
 }
 
-private struct AccessibilitySnapshotBlock: View {
-    let artifactID: String
-    let loader: RecallArtifactLoader
-    @State private var expanded = false
+private enum RecallDetailsPage: Equatable {
+    case root
+    case ocr
+    case transcript
+    case accessibility
+}
+
+private struct TranscriptCaption: View {
+    let text: String?
+    let canPlay: Bool
+    let isPlaying: Bool
+    let isBuffering: Bool
+    let onToggleAudio: () -> Void
+
+    private var transcript: String? {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var playHelp: String {
+        if isBuffering { return "Cancel audio" }
+        if isPlaying { return "Pause audio" }
+        return "Play audio from this moment"
+    }
+
+    var body: some View {
+        if transcript != nil || canPlay {
+            HStack(alignment: .center, spacing: 12) {
+                if canPlay {
+                    Button(action: onToggleAudio) {
+                        ZStack {
+                            if isBuffering {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .frame(width: 32, height: 32)
+                        .background(RecallPalette.ray.opacity(0.9), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(playHelp)
+                }
+                if let transcript {
+                    Text(transcript)
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(isBuffering ? "Starting…" : "Play the audio captured around this moment")
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.leading, 8)
+            .padding(.trailing, 16)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 720)
+            .background(.black.opacity(0.38), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(.white.opacity(0.12), lineWidth: 1)
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+private struct RecallDetailsMenu: View {
+    let moment: RecallMoment
+    @Binding var page: RecallDetailsPage
+    let isProcessing: Bool
+    let artifactLoader: RecallArtifactLoader?
+    let onToggleAudio: ((RecallMoment) -> Void)?
+    let isAudioPlaying: Bool
+    let isAudioBuffering: Bool
+    let playingAudioArtifactID: String?
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider().overlay(Color.white.opacity(0.08))
+            Group {
+                switch page {
+                case .root:
+                    rootList
+                case .ocr:
+                    RecallDetailsTextPage(
+                        title: "On Screen",
+                        text: moment.ocrText,
+                        emptyText: isProcessing ? "OCR is processing…" : "No screen text found",
+                        fileName: "afterray-ocr.txt"
+                    )
+                case .transcript:
+                    RecallDetailsTextPage(
+                        title: "Heard",
+                        text: moment.transcriptText,
+                        emptyText: isProcessing ? "Transcript is processing…" : "No transcript near this moment",
+                        fileName: "afterray-transcript.txt"
+                    )
+                case .accessibility:
+                    RecallDetailsAccessibilityPage(
+                        artifactID: moment.accessibilityArtifactId,
+                        loader: artifactLoader
+                    )
+                }
+            }
+            .frame(maxHeight: 320, alignment: .top)
+        }
+        .frame(width: 340)
+        .recallOverlayPanel(cornerRadius: 18)
+        .shadow(color: .black.opacity(0.5), radius: 28, y: 12)
+        .onChange(of: moment.id) { _, _ in
+            page = .root
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            if page != .root {
+                Button {
+                    page = .root
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+            Text(page == .root ? "CAPTURED CONTEXT" : pageTitle)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(1.4)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+    }
+
+    private var pageTitle: String {
+        switch page {
+        case .root: "CAPTURED CONTEXT"
+        case .ocr: "ON SCREEN"
+        case .transcript: "HEARD"
+        case .accessibility: "ACCESSIBILITY TREE"
+        }
+    }
+
+    private var rootList: some View {
+        ScrollView {
+            VStack(spacing: 4) {
+                detailsRow(
+                    icon: "app.badge",
+                    title: moment.applicationName ?? "Unknown app",
+                    subtitle: moment.bundleIdentifier ?? "No bundle identifier"
+                )
+                detailsRow(
+                    icon: "text.viewfinder",
+                    title: "On Screen",
+                    subtitle: preview(moment.ocrText, empty: isProcessing ? "Processing…" : "No screen text")
+                ) {
+                    page = .ocr
+                }
+                detailsRow(
+                    icon: "waveform",
+                    title: "Heard",
+                    subtitle: preview(moment.transcriptText, empty: isProcessing ? "Processing…" : "No transcript")
+                ) {
+                    page = .transcript
+                }
+                detailsRow(
+                    icon: "point.3.connected.trianglepath.dotted",
+                    title: "Accessibility tree",
+                    subtitle: moment.accessibilityArtifactId == nil
+                        ? "No snapshot for this moment"
+                        : "Full AX JSON for this screen"
+                ) {
+                    page = .accessibility
+                }
+                if moment.audioArtifactId != nil {
+                    let isThis = moment.audioArtifactId == playingAudioArtifactID
+                    Button {
+                        onToggleAudio?(moment)
+                    } label: {
+                        Label(detailsAudioTitle(isThis: isThis), systemImage: detailsAudioSymbol(isThis: isThis))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(RecallCapsuleButtonStyle())
+                    .disabled(onToggleAudio == nil)
+                    .padding(.top, 8)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private func detailsRow(
+        icon: String,
+        title: String,
+        subtitle: String,
+        action: (() -> Void)? = nil
+    ) -> some View {
+        Button {
+            action?()
+        } label: {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(RecallPalette.ray)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                if action != nil {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(action == nil)
+    }
+
+    private func preview(_ text: String?, empty: String) -> String {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return empty }
+        if trimmed.count <= 80 { return trimmed }
+        return String(trimmed.prefix(80)) + "…"
+    }
+
+    private func detailsAudioTitle(isThis: Bool) -> String {
+        if isThis && isAudioBuffering { return "Cancel audio" }
+        if isThis && isAudioPlaying { return "Pause audio" }
+        return "Play from this moment"
+    }
+
+    private func detailsAudioSymbol(isThis: Bool) -> String {
+        if isThis && isAudioBuffering { return "stop.fill" }
+        if isThis && isAudioPlaying { return "pause.fill" }
+        return "play.fill"
+    }
+}
+
+private struct RecallDetailsTextPage: View {
+    let title: String
+    let text: String?
+    let emptyText: String
+    let fileName: String
+
+    private var displayText: String {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? emptyText : trimmed
+    }
+
+    private var hasContent: Bool {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !trimmed.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if hasContent {
+                HStack(spacing: 8) {
+                    Button("Copy") { RecallTextActions.copy(displayText) }
+                    Button("Open") { RecallTextActions.open(displayText, name: fileName) }
+                    Spacer()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(RecallPalette.ray)
+                .padding(.horizontal, 16)
+            }
+
+            ScrollView {
+                Text(displayText)
+                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                    .foregroundStyle(hasContent ? .primary : .secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+            }
+        }
+        .padding(.top, 10)
+    }
+}
+
+private struct RecallDetailsAccessibilityPage: View {
+    let artifactID: String?
+    let loader: RecallArtifactLoader?
     @State private var snapshot = ""
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(snapshot.isEmpty ? "Loading…" : snapshot)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 10)
-            }
-            .frame(maxHeight: 240)
-        } label: {
-            Label("ACCESSIBILITY TREE", systemImage: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
-                .tracking(1.3)
-                .foregroundStyle(RecallPalette.ray.opacity(0.9))
-        }
-        .task(id: expanded) {
-            guard expanded, snapshot.isEmpty else { return }
+        RecallDetailsTextPage(
+            title: "Accessibility tree",
+            text: snapshotText,
+            emptyText: emptyText,
+            fileName: "afterray-accessibility.json"
+        )
+        .task(id: artifactID) {
+            snapshot = ""
+            guard let artifactID, let loader else { return }
+            snapshot = " "
             guard let data = try? await loader(artifactID) else {
-                snapshot = "The snapshot could not be loaded."
+                snapshot = ""
                 return
             }
             if
                 let object = try? JSONSerialization.jsonObject(with: data),
-                let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+                let pretty = try? JSONSerialization.data(
+                    withJSONObject: object,
+                    options: [.prettyPrinted, .sortedKeys]
+                )
             {
                 snapshot = String(decoding: pretty, as: UTF8.self)
             } else {
@@ -891,25 +1181,32 @@ private struct AccessibilitySnapshotBlock: View {
             }
         }
     }
+
+    private var snapshotText: String? {
+        let trimmed = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : snapshot
+    }
+
+    private var emptyText: String {
+        if artifactID == nil { return "No snapshot for this moment" }
+        if snapshot == " " { return "Loading…" }
+        return "The snapshot could not be loaded."
+    }
 }
 
-private struct EvidenceBlock: View {
-    let eyebrow: String
-    let icon: String
-    let text: String?
-    let emptyText: String
+private enum RecallTextActions {
+    static func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(eyebrow, systemImage: icon)
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
-                .tracking(1.3)
-                .foregroundStyle(RecallPalette.ray.opacity(0.9))
-            Text(text?.isEmpty == false ? text! : emptyText)
-                .font(.system(size: 13, weight: .regular, design: .rounded))
-                .foregroundStyle(text?.isEmpty == false ? .primary : .secondary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+    static func open(_ text: String, name: String) {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.open(url)
+        } catch {
+            copy(text)
         }
     }
 }

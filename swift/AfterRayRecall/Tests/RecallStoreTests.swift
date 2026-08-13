@@ -23,7 +23,7 @@ final class RecallStoreTests: XCTestCase {
 
         await store.loadTimeline()
 
-        XCTAssertEqual(store.loadState, .loading)
+        XCTAssertEqual(store.loadState, .ready)
     }
 
     func testStartupFailureIsNotHiddenByConnectionRetry() async {
@@ -61,7 +61,7 @@ final class RecallStoreTests: XCTestCase {
         store.clearSensitiveState()
         XCTAssertTrue(store.sessions.isEmpty)
         XCTAssertTrue(store.moments.isEmpty)
-        XCTAssertEqual(store.loadState, .loading)
+        XCTAssertEqual(store.loadState, .ready)
 
         let artifactDaemon = CountingArtifactDaemon()
         let repository = RecallImageRepository(daemon: artifactDaemon)

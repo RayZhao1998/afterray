@@ -38,6 +38,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.id, "m1")
         XCTAssertEqual(moment.ocrText, "hello")
         XCTAssertNil(moment.audioArtifactId)
+        XCTAssertNil(moment.audioStartedAtMs)
         XCTAssertNil(moment.accessibilityArtifactId)
     }
 
@@ -62,6 +63,45 @@ final class DaemonWireTests: XCTestCase {
         let status = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
         XCTAssertEqual(status.recordingState, .recording)
         XCTAssertEqual(status.activeSessionId, "s1")
+    }
+
+    func testSettingsRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "settings"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "settings")
+        XCTAssertNil(json["record_audio"])
+    }
+
+    func testUpdateSettingsRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "update_settings", recordAudio: false))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["record_audio"] as? Bool, false)
+    }
+
+    func testAppSettingsDecodesRustShape() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":false,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.dataDir, "/tmp/data")
+        XCTAssertEqual(settings.modelDir, "/tmp/models")
+        XCTAssertFalse(settings.recordAudio)
+        XCTAssertEqual(settings.captureIntervalSeconds, 10)
+    }
+
+    func testModelLibraryDecodesInstalledPack() throws {
+        let json = #"{"directory":"/tmp/models","packs":[{"id":"asr","name":"Qwen3 ASR","capability":"asr","path":"/tmp/models/Qwen3-ASR-1.7B-8bit","present":true,"bytes":1024,"required":true,"note":"qwen3"}]}"#
+        let library = try JSONDecoder().decode(ModelLibrary.self, from: Data(json.utf8))
+        XCTAssertEqual(library.directory, "/tmp/models")
+        XCTAssertEqual(library.packs.first?.id, "asr")
+        XCTAssertEqual(library.packs.first?.bytes, 1024)
+        XCTAssertNil(library.packs.first?.expectedBytes)
+        XCTAssertEqual(library.installedBytes, 1024)
+    }
+
+    func testModelPackDecodesExpectedBytes() throws {
+        let json = #"{"id":"asr","name":"Qwen3 ASR","capability":"asr","path":"/tmp/qwen","present":false,"bytes":0,"required":true,"expected_bytes":2460000000}"#
+        let pack = try JSONDecoder().decode(ModelPack.self, from: Data(json.utf8))
+        XCTAssertEqual(pack.expectedBytes, 2_460_000_000)
     }
 
     func testShutdownRequestMatchesRustShape() throws {

@@ -222,6 +222,10 @@ fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
 export AFTERRAY_NATIVE_MODEL_WORKER="$native_model_worker"
 mkdir -p "$AFTERRAY_DATA_DIR"
+default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B-8bit"
+if [[ -z "${AFTERRAY_ASR_MODEL:-}" && -d "$default_asr_model" ]]; then
+  export AFTERRAY_ASR_MODEL="$default_asr_model"
+fi
 default_whisper_model="$repo_root/.afterray/models/ggml-large-v3-turbo-q5_0.bin"
 if [[ -z "${AFTERRAY_WHISPER_MODEL:-}" && -f "$default_whisper_model" ]]; then
   export AFTERRAY_WHISPER_MODEL="$default_whisper_model"
@@ -268,6 +272,8 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_CAPTURE_SHIM
     AFTERRAY_NATIVE_MODEL_WORKER
     AFTERRAY_MODEL_WORKER
+    AFTERRAY_ASR_MODEL
+    AFTERRAY_ASR_BACKEND
     AFTERRAY_WHISPER_MODEL
     AFTERRAY_EMBEDDING_MODEL
     AFTERRAY_LLM_MODEL

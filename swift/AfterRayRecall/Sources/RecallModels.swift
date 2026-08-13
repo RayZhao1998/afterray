@@ -29,6 +29,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
 
     /// Optional until the daemon's recall read model attaches the nearest audio segment.
     public let audioArtifactId: String?
+    public let audioStartedAtMs: Int64?
     public let accessibilityArtifactId: String?
     public let applicationName: String?
     public let bundleIdentifier: String?
@@ -42,6 +43,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         ocrText: String? = nil,
         transcriptText: String? = nil,
         audioArtifactId: String? = nil,
+        audioStartedAtMs: Int64? = nil,
         accessibilityArtifactId: String? = nil,
         applicationName: String? = nil,
         bundleIdentifier: String? = nil
@@ -54,6 +56,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.ocrText = ocrText
         self.transcriptText = transcriptText
         self.audioArtifactId = audioArtifactId
+        self.audioStartedAtMs = audioStartedAtMs
         self.accessibilityArtifactId = accessibilityArtifactId
         self.applicationName = applicationName
         self.bundleIdentifier = bundleIdentifier
@@ -68,6 +71,7 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case ocrText = "ocr_text"
         case transcriptText = "transcript_text"
         case audioArtifactId = "audio_artifact_id"
+        case audioStartedAtMs = "audio_started_at_ms"
         case accessibilityArtifactId = "accessibility_artifact_id"
         case applicationName = "application_name"
         case bundleIdentifier = "bundle_identifier"
@@ -152,6 +156,92 @@ public struct RecordStartResult: Codable, Equatable, Sendable {
         case session
         case sessionId = "session_id"
         case alreadyRecording = "already_recording"
+    }
+}
+
+public struct ModelLibrary: Codable, Equatable, Sendable {
+    public let directory: String
+    public let packs: [ModelPack]
+
+    public init(directory: String, packs: [ModelPack]) {
+        self.directory = directory
+        self.packs = packs
+    }
+
+    public var installedBytes: UInt64 {
+        packs.reduce(0) { $0 + $1.bytes }
+    }
+}
+
+public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let name: String
+    public let capability: String
+    public let path: String
+    public let present: Bool
+    public let bytes: UInt64
+    public let required: Bool
+    public let note: String?
+    public let expectedBytes: UInt64?
+
+    public init(
+        id: String,
+        name: String,
+        capability: String,
+        path: String,
+        present: Bool,
+        bytes: UInt64,
+        required: Bool,
+        note: String? = nil,
+        expectedBytes: UInt64? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.capability = capability
+        self.path = path
+        self.present = present
+        self.bytes = bytes
+        self.required = required
+        self.note = note
+        self.expectedBytes = expectedBytes
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case capability
+        case path
+        case present
+        case bytes
+        case required
+        case note
+        case expectedBytes = "expected_bytes"
+    }
+}
+
+public struct AppSettings: Codable, Equatable, Sendable {
+    public let dataDir: String
+    public let modelDir: String
+    public let recordAudio: Bool
+    public let captureIntervalSeconds: UInt64
+
+    public init(
+        dataDir: String,
+        modelDir: String,
+        recordAudio: Bool,
+        captureIntervalSeconds: UInt64
+    ) {
+        self.dataDir = dataDir
+        self.modelDir = modelDir
+        self.recordAudio = recordAudio
+        self.captureIntervalSeconds = captureIntervalSeconds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case dataDir = "data_dir"
+        case modelDir = "model_dir"
+        case recordAudio = "record_audio"
+        case captureIntervalSeconds = "capture_interval_seconds"
     }
 }
 

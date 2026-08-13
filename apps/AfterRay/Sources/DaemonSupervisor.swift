@@ -7,8 +7,16 @@ final class DaemonSupervisor {
     static let shared = DaemonSupervisor()
 
     let socketPath: String
-    private let defaultDataDirectory: URL
-    private let defaultModelDirectory: URL
+    let defaultDataDirectory: URL
+    let defaultModelDirectory: URL
+
+    var dataDirectory: URL { defaultDataDirectory }
+    var modelDirectory: URL { defaultModelDirectory }
+    var mlxRuntimeDirectory: URL {
+        defaultModelDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("mlx-runtime", isDirectory: true)
+    }
     private var process: Process?
     private var processOutput: DaemonOutputBuffer?
     private var recoveryTask: Task<Bool, Error>?
@@ -97,6 +105,7 @@ final class DaemonSupervisor {
             bundledName: "afterray_model_worker.py",
             developmentPath: "scripts/download-models/afterray_model_worker.py"
         ).path
+        environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
         applyModelDefaults(to: &environment)
         child.environment = environment
         let output = DaemonOutputBuffer()
@@ -221,6 +230,8 @@ final class DaemonSupervisor {
 
     private func applyModelDefaults(to environment: inout [String: String]) {
         let defaults = [
+            "AFTERRAY_ASR_MODEL": defaultModelDirectory
+                .appendingPathComponent("Qwen3-ASR-1.7B-8bit"),
             "AFTERRAY_WHISPER_MODEL": defaultModelDirectory
                 .appendingPathComponent("ggml-large-v3-turbo-q5_0.bin"),
             "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory

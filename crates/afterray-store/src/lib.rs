@@ -424,6 +424,14 @@ impl Vault {
                       ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
                         audio.started_at_ms DESC
                       LIMIT 1),
+                    (SELECT audio.started_at_ms
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
                     m.accessibility_artifact_id,
                     m.application_name,
                     m.bundle_identifier
@@ -445,6 +453,14 @@ impl Vault {
                         AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
                         AND te.source = 'transcript'),
                     (SELECT audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
+                    (SELECT audio.started_at_ms
                        FROM audio_segments audio
                       WHERE audio.session_id = m.session_id
                         AND audio.started_at_ms <= m.captured_at_ms + 30000
@@ -480,6 +496,14 @@ impl Vault {
                       ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
                         audio.started_at_ms DESC
                       LIMIT 1),
+                    (SELECT audio.started_at_ms
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
                     m.accessibility_artifact_id,
                     m.application_name,
                     m.bundle_identifier
@@ -508,6 +532,7 @@ impl Vault {
             ocr_text: None,
             transcript_text: None,
             audio_artifact_id: None,
+            audio_started_at_ms: None,
             accessibility_artifact_id: None,
             application_name: None,
             bundle_identifier: None,
@@ -1410,9 +1435,10 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         ocr_text: row.get(5)?,
         transcript_text: row.get(6)?,
         audio_artifact_id: row.get(7)?,
-        accessibility_artifact_id: row.get(8)?,
-        application_name: row.get(9)?,
-        bundle_identifier: row.get(10)?,
+        audio_started_at_ms: row.get(8)?,
+        accessibility_artifact_id: row.get(9)?,
+        application_name: row.get(10)?,
+        bundle_identifier: row.get(11)?,
     })
 }
 

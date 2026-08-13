@@ -2,9 +2,12 @@ use afterray_models::{
     JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
     ProcessAdapterConfig, QueueConfig,
 };
-use afterray_platform_macos::{ArtifactKind, CaptureConfig, CaptureEvent, MacOsCaptureBackend};
+use afterray_platform_macos::{
+    ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
+};
 use afterray_protocol::{
-    ArtifactPayload, PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit, Status,
+    AppSettings, ArtifactPayload, PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit,
+    Status,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
@@ -67,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     if removed_staging_files > 0 {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
+    let persisted = load_persisted_settings(&vault_config.data_dir);
+    let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
     let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
     if repaired_sessions > 0 {
@@ -76,7 +81,9 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from("apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim"),
         PathBuf::from,
     );
-    let capture = MacOsCaptureBackend::new(CaptureConfig::new(shim_path, staging_dir.clone()));
+    let mut capture_config = CaptureConfig::new(shim_path, staging_dir.clone());
+    capture_config.record_audio = persisted.record_audio;
+    let capture = MacOsCaptureBackend::new(capture_config);
 
     let worker_path = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
         || PathBuf::from("scripts/download-models/afterray_model_worker.py"),
@@ -104,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10),
         ),
+        data_dir,
         shutdown: shutdown_tx,
     });
     println!("afterrayd listening on {}", socket.display());
@@ -178,7 +186,11 @@ fn local_model_adapters(
 ) -> Vec<Arc<dyn ModelAdapter>> {
     [
         (ModelCapability::Ocr, native_worker, "vision-ocr"),
-        (ModelCapability::Asr, general_worker.clone(), "whisper-cpp"),
+        (
+            ModelCapability::Asr,
+            general_worker.clone(),
+            "mlx-qwen3-asr",
+        ),
         (
             ModelCapability::Embedding,
             general_worker.clone(),
@@ -201,7 +213,24 @@ struct AppState {
     models: ModelQueue,
     recording: Mutex<RecordingRuntime>,
     capture_interval: Duration,
+    data_dir: PathBuf,
     shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedSettings {
+    #[serde(default = "default_record_audio")]
+    record_audio: bool,
+}
+
+const fn default_record_audio() -> bool {
+    true
+}
+
+impl Default for PersistedSettings {
+    fn default() -> Self {
+        Self { record_audio: true }
+    }
 }
 
 #[derive(Default)]
@@ -317,13 +346,15 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 Err(error) => Response::failure(error.to_string()),
             }
         }
-        Request::ModelsStatus => Response::success(model_status()),
+        Request::ModelsStatus => Response::success(model_library()),
         Request::JobsList => Response::success(state.models.list().await),
         Request::JobRetry { job_id } => match state.models.retry(&job_id).await {
             Ok(snapshot) => Response::success(snapshot),
             Err(error) => Response::failure(error.to_string()),
         },
         Request::Summarize { session_id } => summarize(state, &session_id).await,
+        Request::Settings => Response::success(current_settings(state)),
+        Request::UpdateSettings { record_audio } => update_settings(state, record_audio).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
             Response::success(serde_json::json!({
@@ -343,38 +374,46 @@ async fn record_start(state: &Arc<AppState>) -> Response {
         Ok(session) => session,
         Err(error) => return Response::failure(error.to_string()),
     };
-    if let Err(error) = state.capture.start_capture().await {
+    recording.active_session_id = Some(session.id.clone());
+    drop(recording);
+    if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         let _ = state.store.end_session_sync(&session.id, now_ms());
-        return Response::failure(error.to_string());
+        let mut recording = state.recording.lock().await;
+        if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
+            recording.active_session_id = None;
+        }
+        return Response::failure(error);
+    }
+    Response::success(serde_json::json!({"session": session}))
+}
+
+async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Result<(), String> {
+    if let Err(error) = state.capture.start_capture().await {
+        return Err(error.to_string());
     }
     match tokio::time::timeout(Duration::from_secs(15), state.capture.next_event()).await {
         Ok(Some(Ok(CaptureEvent::Ready { .. }))) => {}
         Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
             let _ = state.capture.stop_capture().await;
-            let _ = state.store.end_session_sync(&session.id, now_ms());
-            return Response::failure(format!("capture startup failed [{code}]: {message}"));
+            return Err(format!("capture startup failed [{code}]: {message}"));
         }
         Ok(Some(Ok(event))) => {
             let _ = state.capture.stop_capture().await;
-            let _ = state.store.end_session_sync(&session.id, now_ms());
-            return Response::failure(format!(
+            return Err(format!(
                 "capture helper returned {event:?} before it was ready"
             ));
         }
         Ok(Some(Err(error))) => {
             let _ = state.capture.stop_capture().await;
-            let _ = state.store.end_session_sync(&session.id, now_ms());
-            return Response::failure(error.to_string());
+            return Err(error.to_string());
         }
         Ok(None) => {
             let _ = state.capture.stop_capture().await;
-            let _ = state.store.end_session_sync(&session.id, now_ms());
-            return Response::failure("capture helper exited before it was ready");
+            return Err("capture helper exited before it was ready".to_owned());
         }
         Err(_) => {
             let _ = state.capture.stop_capture().await;
-            let _ = state.store.end_session_sync(&session.id, now_ms());
-            return Response::failure("capture helper did not become ready within 15 seconds");
+            return Err("capture helper did not become ready within 15 seconds".to_owned());
         }
     }
 
@@ -393,14 +432,92 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     });
 
     let event_state = Arc::clone(state);
-    let session_id = session.id.clone();
+    let consumer_session = session_id.clone();
     let event_consumer = tokio::spawn(async move {
-        consume_capture_events(event_state, session_id).await;
+        consume_capture_events(event_state, consumer_session).await;
     });
-    recording.active_session_id = Some(session.id.clone());
+    let mut recording = state.recording.lock().await;
+    if recording.active_session_id.as_deref() != Some(session_id.as_str()) {
+        scheduler.abort();
+        let _ = state.capture.stop_capture().await;
+        return Ok(());
+    }
     recording.scheduler = Some(scheduler);
     recording.event_consumer = Some(event_consumer);
-    Response::success(serde_json::json!({"session": session}))
+    Ok(())
+}
+
+async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
+    let (session_id, consumer) = {
+        let mut recording = state.recording.lock().await;
+        let Some(session_id) = recording.active_session_id.clone() else {
+            return Ok(());
+        };
+        if let Some(scheduler) = recording.scheduler.take() {
+            scheduler.abort();
+        }
+        (session_id, recording.event_consumer.take())
+    };
+    match state.capture.stop_capture().await {
+        Ok(()) | Err(CaptureError::NotRunning) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if let Some(consumer) = consumer {
+        let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
+    }
+    start_capture_runtime(state, session_id).await
+}
+
+fn current_settings(state: &AppState) -> AppSettings {
+    AppSettings {
+        data_dir: state.data_dir.display().to_string(),
+        model_dir: default_model_dir().display().to_string(),
+        record_audio: state.capture.record_audio(),
+        capture_interval_seconds: state.capture_interval.as_secs(),
+    }
+}
+
+async fn update_settings(state: &Arc<AppState>, record_audio: Option<bool>) -> Response {
+    if let Some(enabled) = record_audio {
+        let previous = state.capture.record_audio();
+        state.capture.set_record_audio(enabled);
+        if let Err(error) = save_persisted_settings(
+            &state.data_dir,
+            &PersistedSettings {
+                record_audio: enabled,
+            },
+        ) {
+            state.capture.set_record_audio(previous);
+            return Response::failure(format!("could not save settings: {error}"));
+        }
+        if previous != enabled
+            && let Err(error) = restart_capture_runtime(state).await
+        {
+            return Response::failure(format!(
+                "audio preference saved, but capture could not restart: {error}"
+            ));
+        }
+    }
+    Response::success(current_settings(state))
+}
+
+fn settings_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("settings.json")
+}
+
+fn load_persisted_settings(data_dir: &Path) -> PersistedSettings {
+    let Ok(text) = std::fs::read_to_string(settings_path(data_dir)) else {
+        return PersistedSettings::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(
+        settings_path(data_dir),
+        serde_json::to_vec_pretty(settings)?,
+    )
 }
 
 async fn record_stop(state: &Arc<AppState>) -> Response {
@@ -742,15 +859,138 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     }
 }
 
-fn model_status() -> serde_json::Value {
-    serde_json::json!({
-        "runtime": "afterray-managed",
-        "ocr_worker": std::env::var("AFTERRAY_NATIVE_MODEL_WORKER")
-            .unwrap_or_else(|_| ".build/release/afterray-native-model-worker".to_owned()),
-        "model_worker": std::env::var("AFTERRAY_MODEL_WORKER")
-            .unwrap_or_else(|_| "scripts/download-models/afterray_model_worker.py".to_owned()),
-        "capabilities": ["ocr", "asr", "embedding", "llm"]
-    })
+fn model_library() -> afterray_protocol::ModelLibrary {
+    let directory = default_model_dir();
+    afterray_protocol::ModelLibrary {
+        directory: directory.display().to_string(),
+        packs: vec![
+            inspect_pack(
+                "asr",
+                "Qwen3 ASR",
+                "asr",
+                env_or_join("AFTERRAY_ASR_MODEL", &directory, "Qwen3-ASR-1.7B-8bit"),
+                true,
+                Some("mlx-community/Qwen3-ASR-1.7B-8bit · ~2.5 GB · ZH/EN/JA"),
+                Some(2_460_000_000),
+            ),
+            inspect_pack(
+                "asr-whisper",
+                "Whisper ASR (fallback)",
+                "asr",
+                env_or_join(
+                    "AFTERRAY_WHISPER_MODEL",
+                    &directory,
+                    "ggml-large-v3-turbo-q5_0.bin",
+                ),
+                false,
+                Some("optional whisper.cpp large-v3-turbo q5 · AFTERRAY_ASR_BACKEND=whisper"),
+                Some(547_000_000),
+            ),
+            inspect_pack(
+                "embedding",
+                "Text embeddings",
+                "embedding",
+                env_or_join(
+                    "AFTERRAY_EMBEDDING_MODEL",
+                    &directory,
+                    "nomic-embed-text-v1.5.Q4_K_M.gguf",
+                ),
+                true,
+                Some("nomic-embed-text v1.5 Q4"),
+                Some(84_000_000),
+            ),
+            inspect_pack(
+                "llm",
+                "Local LLM",
+                "llm",
+                env_or_join("AFTERRAY_LLM_MODEL", &directory, "gemma-4-26b-a4b-it-4bit"),
+                false,
+                Some("Gemma 4 26B-A4B 4bit · about 15 GB"),
+                Some(15_000_000_000),
+            ),
+        ],
+    }
+}
+
+fn default_model_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("AFTERRAY_MODEL_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("AFTERRAY_ASR_MODEL") {
+        if let Some(parent) = Path::new(&path).parent() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(path) = std::env::var_os("AFTERRAY_WHISPER_MODEL") {
+        if let Some(parent) = Path::new(&path).parent() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
+        let data = PathBuf::from(path);
+        if let Some(parent) = data.parent() {
+            return parent.join("models");
+        }
+    }
+    PathBuf::from(".afterray/models")
+}
+
+fn env_or_join(key: &str, directory: &Path, file_name: &str) -> PathBuf {
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.join(file_name))
+}
+
+fn inspect_pack(
+    id: &str,
+    name: &str,
+    capability: &str,
+    path: PathBuf,
+    required: bool,
+    note: Option<&str>,
+    expected_bytes: Option<u64>,
+) -> afterray_protocol::ModelPack {
+    let (present, bytes) = inspect_model_path(&path);
+    afterray_protocol::ModelPack {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        capability: capability.to_owned(),
+        path: path.display().to_string(),
+        present,
+        bytes,
+        required,
+        note: note.map(ToOwned::to_owned),
+        expected_bytes,
+    }
+}
+
+fn inspect_model_path(path: &Path) -> (bool, u64) {
+    if path.is_file() {
+        return (
+            true,
+            std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+        );
+    }
+    if path.is_dir() {
+        return (true, directory_size(path));
+    }
+    (false, 0)
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += directory_size(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 fn into_response<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Response {

@@ -13,14 +13,33 @@ final class SystemPermissionCoordinator: ObservableObject {
     @Published private(set) var microphone = false
     @Published private(set) var accessibility = false
     @Published private(set) var isRequesting = false
+    @Published private(set) var recordsAudio = AfterRayPreferences.recordAudio
 
     private let defaults: UserDefaults
+    private var preferenceObserver: NSObjectProtocol?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        preferenceObserver = NotificationCenter.default.addObserver(
+            forName: .afterRayPreferencesDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.recordsAudio = AfterRayPreferences.recordAudio
+            }
+        }
     }
 
-    var allGranted: Bool { screenRecording && microphone && accessibility }
+    deinit {
+        if let preferenceObserver {
+            NotificationCenter.default.removeObserver(preferenceObserver)
+        }
+    }
+
+    var allGranted: Bool {
+        screenRecording && accessibility && (microphone || !recordsAudio)
+    }
 
     func requestInitialPermissionsOnce() async {
         guard !isRequesting else { return }

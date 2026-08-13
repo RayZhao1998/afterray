@@ -26,14 +26,21 @@ private struct Options {
     let outputDirectory: URL
     let audioSegmentSeconds: Double
     let jpegQuality: Double
+    let recordAudio: Bool
 
     static func parse(_ arguments: [String]) throws -> Self {
         var outputDirectory: URL?
         var audioSegmentSeconds = 300.0
         var jpegQuality = 0.95
+        var recordAudio = true
         var index = 1
         while index < arguments.count {
             let key = arguments[index]
+            if key == "--no-audio" {
+                recordAudio = false
+                index += 1
+                continue
+            }
             guard index + 1 < arguments.count else {
                 throw ShimError.invalidArguments("missing value for \(key)")
             }
@@ -62,7 +69,8 @@ private struct Options {
         return Self(
             outputDirectory: outputDirectory,
             audioSegmentSeconds: audioSegmentSeconds,
-            jpegQuality: jpegQuality
+            jpegQuality: jpegQuality,
+            recordAudio: recordAudio
         )
     }
 }
@@ -505,23 +513,28 @@ private final class AudioSegmentWriter {
 
 private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let events: EventWriter
-    private let systemAudio: AudioSegmentWriter
-    private let microphone: AudioSegmentWriter
+    private let systemAudio: AudioSegmentWriter?
+    private let microphone: AudioSegmentWriter?
 
     init(options: Options, events: EventWriter) {
         self.events = events
-        systemAudio = AudioSegmentWriter(
-            kind: .systemAudio,
-            outputDirectory: options.outputDirectory,
-            segmentDuration: options.audioSegmentSeconds,
-            events: events
-        )
-        microphone = AudioSegmentWriter(
-            kind: .microphone,
-            outputDirectory: options.outputDirectory,
-            segmentDuration: options.audioSegmentSeconds,
-            events: events
-        )
+        if options.recordAudio {
+            systemAudio = AudioSegmentWriter(
+                kind: .systemAudio,
+                outputDirectory: options.outputDirectory,
+                segmentDuration: options.audioSegmentSeconds,
+                events: events
+            )
+            microphone = AudioSegmentWriter(
+                kind: .microphone,
+                outputDirectory: options.outputDirectory,
+                segmentDuration: options.audioSegmentSeconds,
+                events: events
+            )
+        } else {
+            systemAudio = nil
+            microphone = nil
+        }
     }
 
     func stream(_: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -529,9 +542,9 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
         case .screen:
             break
         case .audio:
-            systemAudio.append(sampleBuffer)
+            systemAudio?.append(sampleBuffer)
         case .microphone:
-            microphone.append(sampleBuffer)
+            microphone?.append(sampleBuffer)
         @unknown default:
             break
         }
@@ -542,8 +555,8 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
     }
 
     func finishAudio() {
-        systemAudio.finish()
-        microphone.finish()
+        systemAudio?.finish()
+        microphone?.finish()
     }
 }
 
@@ -619,11 +632,11 @@ private enum AfterRayCaptureShim {
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 5)
             configuration.queueDepth = 3
             configuration.showsCursor = true
-            configuration.capturesAudio = true
+            configuration.capturesAudio = options.recordAudio
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48_000
             configuration.channelCount = 2
-            configuration.captureMicrophone = true
+            configuration.captureMicrophone = options.recordAudio
 
             let screenshotConfiguration = SCStreamConfiguration()
             let screenshotPixelSize = nativePixelSize(for: display)
@@ -643,8 +656,10 @@ private enum AfterRayCaptureShim {
             let output = CaptureOutput(options: options, events: events)
             let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)
-            try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
-            try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
+            if options.recordAudio {
+                try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
+                try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
+            }
             try await stream.startCapture()
             events.send(.ready(display: display))
 

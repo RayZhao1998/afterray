@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -25,6 +26,7 @@ pub struct CaptureConfig {
     pub output_dir: PathBuf,
     pub audio_segment_seconds: u64,
     pub jpeg_quality: f64,
+    pub record_audio: bool,
 }
 
 impl CaptureConfig {
@@ -35,6 +37,7 @@ impl CaptureConfig {
             output_dir: output_dir.into(),
             audio_segment_seconds: 300,
             jpeg_quality: 0.95,
+            record_audio: true,
         }
     }
 
@@ -136,6 +139,7 @@ struct RunningShim {
 /// bound.
 pub struct MacOsCaptureBackend {
     config: CaptureConfig,
+    record_audio: AtomicBool,
     running: Mutex<Option<RunningShim>>,
     events_tx: mpsc::Sender<Result<CaptureEvent, CaptureError>>,
     events_rx: Mutex<mpsc::Receiver<Result<CaptureEvent, CaptureError>>>,
@@ -145,12 +149,23 @@ impl MacOsCaptureBackend {
     #[must_use]
     pub fn new(config: CaptureConfig) -> Arc<Self> {
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+        let record_audio = AtomicBool::new(config.record_audio);
         Arc::new(Self {
             config,
+            record_audio,
             running: Mutex::new(None),
             events_tx,
             events_rx: Mutex::new(events_rx),
         })
+    }
+
+    pub fn set_record_audio(&self, enabled: bool) {
+        self.record_audio.store(enabled, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn record_audio(&self) -> bool {
+        self.record_audio.load(Ordering::Relaxed)
     }
 
     /// Starts the native helper and its bounded event reader.
@@ -167,13 +182,18 @@ impl MacOsCaptureBackend {
         }
         tokio::fs::create_dir_all(&self.config.output_dir).await?;
 
-        let mut child = Command::new(&self.config.shim_path)
+        let mut command = Command::new(&self.config.shim_path);
+        command
             .arg("--output-dir")
             .arg(&self.config.output_dir)
             .arg("--audio-segment-seconds")
             .arg(self.config.audio_segment_seconds.to_string())
             .arg("--jpeg-quality")
-            .arg(self.config.jpeg_quality.to_string())
+            .arg(self.config.jpeg_quality.to_string());
+        if !self.record_audio() {
+            command.arg("--no-audio");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

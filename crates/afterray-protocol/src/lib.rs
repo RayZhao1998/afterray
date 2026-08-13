@@ -52,7 +52,33 @@ pub enum Request {
     Summarize {
         session_id: String,
     },
+    Settings,
+    UpdateSettings {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        record_audio: Option<bool>,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelLibrary {
+    pub directory: String,
+    pub packs: Vec<ModelPack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPack {
+    pub id: String,
+    pub name: String,
+    pub capability: String,
+    pub path: String,
+    pub present: bool,
+    pub bytes: u64,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +122,14 @@ pub struct Status {
     pub active_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppSettings {
+    pub data_dir: String,
+    pub model_dir: String,
+    pub record_audio: bool,
+    pub capture_interval_seconds: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -113,6 +147,7 @@ pub struct Moment {
     pub ocr_text: Option<String>,
     pub transcript_text: Option<String>,
     pub audio_artifact_id: Option<String>,
+    pub audio_started_at_ms: Option<i64>,
     pub accessibility_artifact_id: Option<String>,
     pub application_name: Option<String>,
     pub bundle_identifier: Option<String>,
@@ -212,6 +247,21 @@ mod tests {
     fn timeline_cursor_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::TimelineSince { since_ms: 42 }).unwrap();
         assert_eq!(json, r#"{"type":"timeline_since","since_ms":42}"#);
+    }
+
+    #[test]
+    fn settings_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::Settings).unwrap(),
+            r#"{"type":"settings"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::UpdateSettings {
+                record_audio: Some(false)
+            })
+            .unwrap(),
+            r#"{"type":"update_settings","record_audio":false}"#
+        );
     }
 
     #[test]

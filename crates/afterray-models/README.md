@@ -53,13 +53,13 @@ cancellation drops and kills the worker process.
 The repository includes two real workers:
 
 - `afterray-native-model-worker` performs screenshot OCR through macOS Vision;
-- `afterray_model_worker.py` invokes AfterRay-managed MLX, llama.cpp, and
-  whisper.cpp runtimes for the remaining capabilities.
+- `afterray_model_worker.py` invokes AfterRay-managed MLX (Qwen3-ASR + Gemma),
+  llama.cpp embeddings, and an optional whisper.cpp fallback.
 
 Install native development dependencies and download model assets:
 
 ```sh
-brew install ffmpeg whisper-cpp llama.cpp
+brew install ffmpeg llama.cpp
 scripts/download-models/download.sh
 ```
 
@@ -71,11 +71,13 @@ Configuration variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AFTERRAY_NATIVE_MODEL_WORKER` | bundled Swift worker | OCR executable |
+| `AFTERRAY_ASR_MODEL` | AfterRay model directory | Qwen3-ASR MLX weights |
+| `AFTERRAY_ASR_BACKEND` | `qwen3` | `qwen3` or `whisper` |
 | `AFTERRAY_EMBEDDING_MODEL` | AfterRay model directory | embedding weights |
 | `AFTERRAY_LLM_MODEL` | AfterRay model directory | MLX generation weights |
 | `AFTERRAY_FFMPEG_BIN` | `ffmpeg` | audio conversion executable |
-| `AFTERRAY_WHISPER_BIN` | `whisper-cli` | whisper.cpp executable |
-| `AFTERRAY_WHISPER_MODEL` | none | required local GGML model path |
+| `AFTERRAY_WHISPER_BIN` | `whisper-cli` | optional whisper.cpp executable |
+| `AFTERRAY_WHISPER_MODEL` | none | optional whisper.cpp GGML fallback |
 
 If a binary, input file, or model is missing, the job ends as `failed` with an
 actionable error. No adapter returns placeholder inference data.

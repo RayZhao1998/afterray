@@ -3,8 +3,8 @@
 
 Reads one WorkerRequest JSON object from stdin and writes one WorkerResponse to
 stdout. OCR is handled by the native Swift worker. This process runs ASR with
-whisper.cpp, embeddings with llama.cpp, and Gemma 4 with MLX directly. It never
-contacts an Ollama service.
+mlx-audio (Qwen3-ASR by default, whisper.cpp fallback), embeddings with
+llama.cpp, and Gemma 4 with MLX directly. It never contacts an Ollama service.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -126,58 +127,227 @@ def required_model(config_name: str, fallback: str) -> Path:
     return model
 
 
+QWEN_LANGUAGE_NAMES = {
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "zh-hans": "Chinese",
+    "cmn": "Chinese",
+    "yue": "Cantonese",
+    "zh-hk": "Cantonese",
+    "zh-yue": "Cantonese",
+    "en": "English",
+    "ja": "Japanese",
+    "jp": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "es": "Spanish",
+    "fr": "French",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+}
+
+
+def requested_language(model_input: dict) -> str | None:
+    language = model_input.get("language")
+    if isinstance(language, str) and language.strip():
+        return language.strip()
+    return None
+
+
+def qwen3_language(language: str | None) -> str | None:
+    if language is None:
+        return None
+    return QWEN_LANGUAGE_NAMES.get(language.lower(), language)
+
+
+def asr_backend() -> str:
+    configured = env("AFTERRAY_ASR_BACKEND", "qwen3").strip().lower()
+    if configured in {"whisper", "whisper.cpp", "whisper-cpp"}:
+        return "whisper"
+    return "qwen3"
+
+
+def qwen3_model_path() -> Path:
+    return Path(env("AFTERRAY_ASR_MODEL", ".afterray/models/Qwen3-ASR-1.7B-8bit")).expanduser()
+
+
+def whisper_model_path() -> Path:
+    return Path(env("AFTERRAY_WHISPER_MODEL", "")).expanduser()
+
+
+def qwen3_model_available(path: Path) -> bool:
+    return path.is_dir() and (path / "config.json").is_file()
+
+
 def extract_whisper_text(document: dict) -> str:
     transcription = document.get("transcription")
     if isinstance(transcription, list):
         parts = [part.get("text", "") for part in transcription if isinstance(part, dict)]
-        return " ".join(part.strip() for part in parts if part.strip())
+        return sanitize_asr_text(" ".join(part.strip() for part in parts if part.strip()))
     if isinstance(transcription, str):
-        return transcription.strip()
+        return sanitize_asr_text(transcription)
     text = document.get("text")
     if isinstance(text, str):
-        return text.strip()
+        return sanitize_asr_text(text)
     raise WorkerError("whisper.cpp JSON did not contain transcription text")
+
+
+def extract_stt_text(result: object) -> str:
+    if isinstance(result, str):
+        return sanitize_asr_text(result)
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        return sanitize_asr_text(text)
+    if isinstance(result, dict) and isinstance(result.get("text"), str):
+        return sanitize_asr_text(result["text"])
+    segments = getattr(result, "segments", None)
+    if segments is None and isinstance(result, dict):
+        segments = result.get("segments")
+    if isinstance(segments, list):
+        parts: list[str] = []
+        for segment in segments:
+            if isinstance(segment, dict):
+                part = segment.get("text", "")
+            else:
+                part = getattr(segment, "text", "")
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+        if parts:
+            return sanitize_asr_text(" ".join(parts))
+    raise WorkerError("ASR model returned no transcription text")
+
+
+def extract_stt_language(result: object, fallback: str | None) -> str | None:
+    language = getattr(result, "language", None)
+    if isinstance(language, str) and language.strip():
+        return language
+    if isinstance(result, dict) and isinstance(result.get("language"), str):
+        return result["language"]
+    return fallback
+
+
+def sanitize_asr_text(text: str) -> str:
+    cleaned = text.strip()
+    words = re.findall(r"[a-z']+", cleaned.lower())
+    if len(words) < 4:
+        return cleaned
+    filler = {"thank", "thanks", "you", "thankyou"}
+    if sum(1 for word in words if word in filler) / len(words) >= 0.7:
+        return ""
+    return cleaned
+
+
+def normalize_audio(audio_path: Path, directory: Path) -> Path:
+    ffmpeg = require_executable("AFTERRAY_FFMPEG_BIN", "ffmpeg")
+    wav_path = directory / "normalized.wav"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return wav_path
 
 
 def run_asr(model_input: dict) -> dict:
     audio_path = Path(model_input["audio_path"])
     if not audio_path.is_file():
         raise WorkerError(f"ASR audio does not exist: {audio_path}")
-    ffmpeg = require_executable("AFTERRAY_FFMPEG_BIN", "ffmpeg")
-    whisper = require_executable("AFTERRAY_WHISPER_BIN", "whisper-cli")
-    model = Path(env("AFTERRAY_WHISPER_MODEL", ""))
-    if not model.is_file():
+    language = requested_language(model_input)
+    backend = asr_backend()
+    qwen_path = qwen3_model_path()
+    whisper_path = whisper_model_path()
+
+    if backend == "qwen3":
+        if qwen3_model_available(qwen_path):
+            return run_qwen3_asr(audio_path, language, qwen_path)
+        if whisper_path.is_file():
+            print(
+                "Qwen3-ASR is missing; falling back to whisper.cpp",
+                file=sys.stderr,
+            )
+            return run_whisper_asr(audio_path, language, whisper_path)
+        raise WorkerError(
+            "Qwen3-ASR model is missing; set AFTERRAY_ASR_MODEL or run "
+            "scripts/download-models/download.sh"
+        )
+
+    if not whisper_path.is_file():
         raise WorkerError(
             "whisper.cpp model is missing; set AFTERRAY_WHISPER_MODEL or run "
             "scripts/download-models/download.sh"
         )
+    return run_whisper_asr(audio_path, language, whisper_path)
 
+
+def run_qwen3_asr(audio_path: Path, language: str | None, model_path: Path) -> dict:
+    with tempfile.TemporaryDirectory(prefix="afterray-asr-") as temporary:
+        wav_path = normalize_audio(audio_path, Path(temporary))
+        qwen_language = qwen3_language(language)
+        try:
+            try:
+                from mlx_audio.stt import load as load_stt
+            except ImportError:
+                load_stt = None
+            if load_stt is not None:
+                model = load_stt(str(model_path))
+                kwargs = {}
+                if qwen_language:
+                    kwargs["language"] = qwen_language
+                result = model.generate(str(wav_path), **kwargs)
+            else:
+                from mlx_audio.stt.generate import generate_transcription
+                from mlx_audio.stt.utils import load_model
+
+                model = load_model(str(model_path))
+                kwargs = {"verbose": False}
+                if qwen_language:
+                    kwargs["language"] = qwen_language
+                result = generate_transcription(
+                    model=model,
+                    audio=str(wav_path),
+                    output_path=str(Path(temporary) / "transcript"),
+                    format="txt",
+                    **kwargs,
+                )
+        except ImportError as error:
+            raise WorkerError(
+                "AfterRay's MLX audio runtime is missing; run scripts/download-models/download.sh"
+            ) from error
+        except WorkerError:
+            raise
+        except Exception as error:
+            raise WorkerError(f"Qwen3-ASR failed: {error}", retryable=True) from error
+        return {
+            "type": "asr",
+            "text": extract_stt_text(result),
+            "language": extract_stt_language(result, language),
+        }
+
+
+def run_whisper_asr(audio_path: Path, language: str | None, model: Path) -> dict:
+    whisper = require_executable("AFTERRAY_WHISPER_BIN", "whisper-cli")
     with tempfile.TemporaryDirectory(prefix="afterray-asr-") as temporary:
         temporary_path = Path(temporary)
-        wav_path = temporary_path / "normalized.wav"
+        wav_path = normalize_audio(audio_path, temporary_path)
         output_prefix = temporary_path / "transcript"
-        subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(audio_path),
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-                str(wav_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
         command = [
             whisper,
             "-m",
@@ -188,7 +358,7 @@ def run_asr(model_input: dict) -> dict:
             "-of",
             str(output_prefix),
         ]
-        if language := model_input.get("language"):
+        if language:
             command.extend(["-l", language])
         completed = subprocess.run(command, check=False, capture_output=True, text=True)
         if completed.returncode != 0:
@@ -204,7 +374,7 @@ def run_asr(model_input: dict) -> dict:
         return {
             "type": "asr",
             "text": extract_whisper_text(document),
-            "language": detected_language or model_input.get("language"),
+            "language": detected_language or language,
         }
 
 

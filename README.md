@@ -33,16 +33,16 @@ stay local.
 
 - Apple Silicon Mac (M3 or newer recommended).
 - macOS 15 or newer.
-- Around 14 GB of free space for the default development model set, plus space
+- Around 18 GB of free space for the default development model set, plus space
   for recordings.
 - Xcode and the Xcode Command Line Tools.
 - A current Rust toolchain.
-- `ffmpeg`, `whisper.cpp`, and `llama.cpp` for the current developer build.
+- `ffmpeg` and `llama.cpp` for the current developer build.
 
 Install the command-line dependencies with Homebrew:
 
 ```sh
-brew install ffmpeg whisper-cpp llama.cpp
+brew install ffmpeg llama.cpp
 ```
 
 Install Rust from [rustup.rs](https://rustup.rs/) if `cargo --version` is not
@@ -225,6 +225,8 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
 | `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
 | `AFTERRAY_MODEL_WORKER` | Typed local model worker | Bundled AfterRay worker |
+| `AFTERRAY_ASR_MODEL` | Default Qwen3-ASR MLX weights | `.afterray/models/Qwen3-ASR-1.7B-8bit` |
+| `AFTERRAY_ASR_BACKEND` | ASR runtime | `qwen3` (`whisper` is the fallback) |
 
 ## Troubleshooting
 

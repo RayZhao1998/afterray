@@ -35,6 +35,9 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func recordStop() async throws -> RecordStopResult
     func search(query: String, limit: Int) async throws -> [RecallSearchHit]
     func shutdown() async throws -> DaemonShutdownResult
+    func modelLibrary() async throws -> ModelLibrary
+    func settings() async throws -> AppSettings
+    func updateSettings(recordAudio: Bool) async throws -> AppSettings
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
@@ -76,6 +79,21 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func shutdown() async throws -> DaemonShutdownResult {
         try await request(WireRequest(type: "shutdown"), as: DaemonShutdownResult.self)
+    }
+
+    public func modelLibrary() async throws -> ModelLibrary {
+        try await request(WireRequest(type: "models_status"), as: ModelLibrary.self)
+    }
+
+    public func settings() async throws -> AppSettings {
+        try await request(WireRequest(type: "settings"), as: AppSettings.self)
+    }
+
+    public func updateSettings(recordAudio: Bool) async throws -> AppSettings {
+        try await request(
+            WireRequest(type: "update_settings", recordAudio: recordAudio),
+            as: AppSettings.self
+        )
     }
 
     public func search(query: String, limit: Int = 30) async throws -> [RecallSearchHit] {
@@ -159,6 +177,7 @@ struct WireRequest: Encodable, Equatable {
     var favorite: Bool?
     var query: String?
     var sinceMs: Int64?
+    var recordAudio: Bool?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -170,6 +189,7 @@ struct WireRequest: Encodable, Equatable {
         case favorite
         case query
         case sinceMs = "since_ms"
+        case recordAudio = "record_audio"
     }
 }
 

@@ -5,6 +5,8 @@ import SwiftUI
 
 private extension Notification.Name {
     static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
+    static let afterRayRecallWillHide = Notification.Name("dev.afterray.recall-will-hide")
+    static let afterRayRecallToggleAudio = Notification.Name("dev.afterray.recall-toggle-audio")
     static let afterRaySystemSessionWillSuspend = Notification.Name(
         "dev.afterray.system-session-will-suspend"
     )
@@ -66,6 +68,14 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
             action: #selector(quitAfterRay),
@@ -76,6 +86,10 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func openSettings() {
+        AfterRaySettingsController.shared.show()
     }
 
     @objc private func quitAfterRay() {
@@ -152,6 +166,13 @@ private final class AfterRayMenuBar: NSObject {
         )
         openItem.target = self
         menu.addItem(openItem)
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
@@ -189,6 +210,10 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func openAfterRay() {
         RecallOverlayController.shared.show()
+    }
+
+    @objc private func openSettings() {
+        AfterRaySettingsController.shared.show()
     }
 
     @objc private func quitAfterRay() {
@@ -235,7 +260,7 @@ private let recallHotKeyHandler: EventHandlerUPP = { _, _, _ in
 }
 
 @MainActor
-private final class RecallOverlayController {
+final class RecallOverlayController {
     static let shared = RecallOverlayController()
 
     private var panel: RecallOverlayPanel?
@@ -280,6 +305,7 @@ private final class RecallOverlayController {
             queue: .main
         ) { _ in
             Task { @MainActor in
+                if AfterRaySettingsController.shared.isVisible { return }
                 RecallOverlayController.shared.hide(returnFocus: false)
             }
         }
@@ -290,7 +316,13 @@ private final class RecallOverlayController {
 
     var isVisible: Bool { panel?.isVisible == true }
 
+    func makeKeyIfVisible() {
+        guard let panel, panel.isVisible else { return }
+        panel.makeKeyAndOrderFront(nil)
+    }
+
     func stop() {
+        NotificationCenter.default.post(name: .afterRayRecallWillHide, object: nil)
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
@@ -339,6 +371,7 @@ private final class RecallOverlayController {
 
     func hide(returnFocus: Bool) {
         guard let panel, panel.isVisible else { return }
+        NotificationCenter.default.post(name: .afterRayRecallWillHide, object: nil)
         let application = returnFocus ? previousApplication : nil
         panel.orderOut(nil)
         panel.alphaValue = 1
@@ -355,11 +388,15 @@ private final class RecallOverlayController {
 
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard RecallOverlayController.shared.shouldConsumeCloseKey(event) else {
-                return event
+            if RecallOverlayController.shared.shouldConsumeCloseKey(event) {
+                RecallOverlayController.shared.closeFromKeyboard()
+                return nil
             }
-            RecallOverlayController.shared.closeFromKeyboard()
-            return nil
+            if RecallOverlayController.shared.shouldConsumeAudioToggleKey(event) {
+                NotificationCenter.default.post(name: .afterRayRecallToggleAudio, object: nil)
+                return nil
+            }
+            return event
         }
     }
 
@@ -371,6 +408,15 @@ private final class RecallOverlayController {
         if event.keyCode == 53 { return true }
         return event.modifierFlags.contains(.command)
             && event.charactersIgnoringModifiers == "w"
+    }
+
+    fileprivate func shouldConsumeAudioToggleKey(_ event: NSEvent) -> Bool {
+        guard panel?.isVisible == true, panel?.isKeyWindow == true else { return false }
+        guard event.keyCode == 49 else { return false }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.isEmpty else { return false }
+        if panel?.firstResponder is NSTextView { return false }
+        return true
     }
 
     fileprivate func closeFromKeyboard() {
@@ -688,8 +734,11 @@ private struct AfterRayRootView: View {
                 Task { await store.toggleFavorite() }
             },
             onToggleAudio: { moment in
-                Task { await audioPlayer.toggle(moment: moment) }
+                audioPlayer.toggle(moment: moment)
             },
+            isAudioPlaying: audioPlayer.isPlaying,
+            isAudioBuffering: audioPlayer.isBuffering,
+            playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -699,6 +748,21 @@ private struct AfterRayRootView: View {
                 ? Color.clear
                 : Color(red: 0.025, green: 0.022, blue: 0.026)
         )
+        .overlay(alignment: .topTrailing) {
+            Button(action: { AfterRaySettingsController.shared.show() }) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.84))
+                    .frame(width: 36, height: 36)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .background(.black.opacity(0.28), in: Circle())
+                    .overlay { Circle().stroke(.white.opacity(0.13), lineWidth: 1) }
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+            .padding(.top, controlBarTopPadding)
+            .padding(.trailing, 22)
+        }
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
@@ -729,10 +793,17 @@ private struct AfterRayRootView: View {
             }
         }
         .onExitCommand {
+            audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
+        }
+        .onChange(of: isLive) { _, live in
+            if live { audioPlayer.stop() }
         }
         .onChange(of: control.isRecording, initial: true) { _, isRecording in
             AfterRayMenuBar.shared.setRecording(isRecording)
+        }
+        .task(id: audioPrefetchKey) {
+            audioPlayer.prefetch(artifactID: audioPrefetchKey.isEmpty ? nil : audioPrefetchKey)
         }
         .task {
             await bootstrap()
@@ -761,7 +832,15 @@ private struct AfterRayRootView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
+            audioPlayer.stop()
             isLive = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
+            audioPlayer.stop()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallToggleAudio)) { _ in
+            guard !isLive, let moment = store.selectedMoment, moment.audioArtifactId != nil else { return }
+            audioPlayer.toggle(moment: moment)
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
             Task {
@@ -784,6 +863,11 @@ private struct AfterRayRootView: View {
 
     private var controlBarTopPadding: CGFloat {
         RecallGeometry.controlBarTopPadding(safeAreaTop: overlayLayout.topSafeAreaInset)
+    }
+
+    private var audioPrefetchKey: String {
+        guard !isLive, let artifactID = store.selectedMoment?.audioArtifactId else { return "" }
+        return artifactID
     }
 
     private func bootstrap() async {
@@ -865,9 +949,13 @@ private struct PermissionPanel: View {
                         .font(.system(size: 11, weight: .bold, design: .rounded))
                         .tracking(1.8)
                         .foregroundStyle(.red)
-                    Text("Three local permissions are required")
+                    Text(coordinator.recordsAudio
+                         ? "Three local permissions are required"
+                         : "Two local permissions are required")
                         .font(.title2.weight(.semibold))
-                    Text("AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded.")
+                    Text(coordinator.recordsAudio
+                         ? "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
+                         : "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -875,7 +963,9 @@ private struct PermissionPanel: View {
 
                 VStack(spacing: 9) {
                     ForEach(RequiredPermission.allCases) { permission in
-                        permissionRow(permission)
+                        if permission != .microphone || coordinator.recordsAudio || coordinator.microphone {
+                            permissionRow(permission)
+                        }
                     }
                 }
 
