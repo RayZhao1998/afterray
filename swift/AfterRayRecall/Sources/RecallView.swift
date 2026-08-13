@@ -371,63 +371,230 @@ public struct RecallView: View {
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
-    @State private var tick = RecallImageTick()
-    @State private var loadedArtifactID: String?
-    @State private var frame: RecallDisplayFrame?
+    @StateObject private var player = RecallStillPlayer()
 
     var body: some View {
-        let targetID = tick.displayedArtifactID ?? artifactID
-        let displayed = RecallDisplayedFrame.choose(
-            artifactID: targetID,
-            cached: RecallDecodedImageCache.shared.cached(artifactID: targetID),
-            loadedID: loadedArtifactID,
-            loadedFrame: frame
-        )
         ZStack {
-            ArtifactYUVView(frame: displayed)
-            if displayed == nil {
+            // Two host views only. SwiftUI never feeds them frames — the player
+            // owns pixels and opacity so a visible layer cannot be retargeted.
+            ArtifactYUVView(
+                bindsOpacity: false,
+                attachment: player.slotA
+            )
+            .id("recall-slot-a")
+            .zIndex(player.overlaySlotIsA ? 1 : 0)
+            ArtifactYUVView(
+                bindsOpacity: false,
+                attachment: player.slotB
+            )
+            .id("recall-slot-b")
+            .zIndex(player.overlaySlotIsA ? 0 : 1)
+            if !player.hasVisibleStill {
                 ProgressView().controlSize(.small).tint(.white.opacity(0.65))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
-        .onAppear { _ = tick.request(artifactID) }
+        .onAppear {
+            player.updateLoader(loader)
+            player.request(artifactID)
+        }
         .onChange(of: artifactID) { _, newID in
-            _ = tick.request(newID)
+            player.request(newID)
         }
-        .task(id: tick.displayedArtifactID) {
-            await loadDisplayedImage()
-        }
-        .task(id: tick.generation) {
-            await waitForThrottleWindow()
+        .onDisappear {
+            player.invalidate()
         }
     }
+}
 
-    private func loadDisplayedImage() async {
-        guard let artifactID = tick.displayedArtifactID else { return }
-        if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
-            loadedArtifactID = artifactID
-            frame = cached
-            _ = tick.updateFinished(for: artifactID)
+private struct PresentedStill: Equatable {
+    let id: String
+    let frame: RecallDisplayFrame
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.frame === rhs.frame
+    }
+}
+
+/// Exactly two layers. A slot's frame is only replaced while its opacity is 0.
+/// When the incoming slot reaches 100% it becomes the base; the old base is
+/// hidden and cleared. Display stills are always decoded fresh — no cache.
+@MainActor
+private final class RecallStillPlayer: ObservableObject {
+    let slotA = ArtifactViewAttachment()
+    let slotB = ArtifactViewAttachment()
+    @Published private(set) var hasVisibleStill = false
+    /// Incoming slot is always drawn above the base so a ping-pong fade
+    /// is never hidden under the previous still.
+    @Published private(set) var overlaySlotIsA = false
+
+    private enum Slot {
+        case a, b
+
+        var other: Slot { self == .a ? .b : .a }
+    }
+
+    private var gate = RecallStillGate()
+    private var loader: RecallImageLoader?
+    private var loadTask: Task<Void, Never>?
+    private var transitionTask: Task<Void, Never>?
+    private var loadGeneration: UInt64 = 0
+    private var fadeGeneration: UInt64 = 0
+    private var isAnimating = false
+    private var incomingOpacity: CGFloat = 0
+    private var baseSlot: Slot = .a
+    private var incomingSlot: Slot { baseSlot.other }
+
+    func updateLoader(_ loader: @escaping RecallImageLoader) {
+        self.loader = loader
+    }
+
+    func request(_ artifactID: String) {
+        handle(gate.request(artifactID))
+    }
+
+    func invalidate() {
+        loadTask?.cancel()
+        transitionTask?.cancel()
+        fadeGeneration &+= 1
+        isAnimating = false
+    }
+
+    private func handle(_ step: RecallStillGate.Step) {
+        switch step {
+        case .none:
             return
+        case .needFrame(let id):
+            acquire(id)
         }
-        let loaded = await RecallDecodedImageCache.shared.frame(
-            artifactID: artifactID,
-            loader: loader
-        )
-        guard !Task.isCancelled else { return }
-        if let loaded {
-            loadedArtifactID = artifactID
-            frame = loaded
-        }
-        _ = tick.updateFinished(for: artifactID)
     }
 
-    private func waitForThrottleWindow() async {
-        guard tick.isThrottling else { return }
-        try? await Task.sleep(for: RecallImageTick.interval)
-        guard !Task.isCancelled else { return }
-        _ = tick.throttleEnded()
+    private func acquire(_ id: String) {
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        loadTask?.cancel()
+        loadTask = Task { [weak self] in
+            guard let self else { return }
+            let frame = await self.loadFresh(id)
+            guard !Task.isCancelled, generation == self.loadGeneration else { return }
+            if let frame {
+                self.consumeReady(id, frame: frame)
+            } else {
+                self.handle(self.gate.loadFailed(id))
+            }
+        }
+    }
+
+    private func loadFresh(_ id: String) async -> RecallDisplayFrame? {
+        guard let loader else { return nil }
+        guard let data = try? await loader(id) else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            RecallFrameDecoder.decode(data)
+        }.value
+    }
+
+    private func consumeReady(_ id: String, frame: RecallDisplayFrame) {
+        switch gate.frameReady(id) {
+        case .ignore:
+            return
+        case .settle:
+            Task { [weak self] in
+                guard let self else { return }
+                await self.waitForViews()
+                self.installBase(PresentedStill(id: id, frame: frame))
+                self.handle(self.gate.commitSettle(id))
+            }
+        case .transition:
+            startIncomingFade(PresentedStill(id: id, frame: frame))
+        }
+    }
+
+    private func waitForViews() async {
+        for _ in 0..<40 {
+            if slotA.view != nil, slotB.view != nil { return }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(8))
+        }
+    }
+
+    private func installBase(_ still: PresentedStill) {
+        fadeGeneration &+= 1
+        isAnimating = false
+        incomingOpacity = 0
+        overlaySlotIsA = incomingSlot == .a
+        view(incomingSlot)?.clearDisplayedContent()
+        let base = view(baseSlot)
+        base?.display(still.frame)
+        base?.setContentOpacity(1)
+        hasVisibleStill = true
+    }
+
+    private func startIncomingFade(_ still: PresentedStill) {
+        guard !isAnimating else { return }
+        isAnimating = true
+        fadeGeneration &+= 1
+        let generation = fadeGeneration
+        transitionTask?.cancel()
+        transitionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.waitForViews()
+            guard self.isCurrentFade(generation) else { return }
+            let incoming = self.view(self.incomingSlot)
+            incoming?.setContentOpacity(0)
+            incoming?.display(still.frame)
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(8))
+            guard self.isCurrentFade(generation) else { return }
+            await self.rampIncoming(generation: generation)
+            guard self.isCurrentFade(generation) else { return }
+            self.promoteIncomingToBase()
+            self.isAnimating = false
+            self.handle(self.gate.transitionFinished())
+        }
+    }
+
+    private func promoteIncomingToBase() {
+        let outgoing = view(baseSlot)
+        outgoing?.setContentOpacity(0)
+        outgoing?.clearDisplayedContent()
+        baseSlot = incomingSlot
+        incomingOpacity = 0
+        overlaySlotIsA = incomingSlot == .a
+        hasVisibleStill = true
+    }
+
+    private func rampIncoming(generation: UInt64) async {
+        let duration = RecallStillGate.animationDuration
+        let began = CACurrentMediaTime()
+        incomingOpacity = 0
+        while isCurrentFade(generation) {
+            let elapsed = CACurrentMediaTime() - began
+            let t = duration <= 0 ? 1 : min(elapsed / duration, 1)
+            incomingOpacity = easeInOut(t)
+            view(incomingSlot)?.setContentOpacity(incomingOpacity)
+            if t >= 1 { break }
+            try? await Task.sleep(for: .milliseconds(8))
+        }
+        if isCurrentFade(generation) {
+            incomingOpacity = 1
+            view(incomingSlot)?.setContentOpacity(1)
+        }
+    }
+
+    private func view(_ slot: Slot) -> ArtifactLayerView? {
+        switch slot {
+        case .a: slotA.view
+        case .b: slotB.view
+        }
+    }
+
+    private func isCurrentFade(_ generation: UInt64) -> Bool {
+        !Task.isCancelled && fadeGeneration == generation && isAnimating
+    }
+
+    private func easeInOut(_ t: CGFloat) -> CGFloat {
+        t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
     }
 }
 

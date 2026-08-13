@@ -7,15 +7,42 @@ import QuartzCore
 import SwiftUI
 import VideoToolbox
 
+final class ArtifactViewAttachment {
+    weak var view: ArtifactLayerView?
+}
+
 struct ArtifactYUVView: NSViewRepresentable {
     var frame: RecallDisplayFrame?
+    /// When false, SwiftUI must not touch layer opacity. The still player
+    /// ramps it directly so parent rerenders cannot replay a stale value.
+    var bindsOpacity: Bool = true
+    var contentOpacity: CGFloat = 1
+    var attachment: ArtifactViewAttachment?
 
     func makeNSView(context: Context) -> ArtifactLayerView {
-        ArtifactLayerView()
+        let view = ArtifactLayerView()
+        attachment?.view = view
+        return view
     }
 
     func updateNSView(_ view: ArtifactLayerView, context: Context) {
+        attachment?.view = view
+        guard bindsOpacity else { return }
+        let frameID = frame.map { ObjectIdentifier($0) }
+        if context.coordinator.frameID != frameID {
+            view.setContentOpacity(0)
+            context.coordinator.frameID = frameID
+        }
         view.display(frame)
+        view.setContentOpacity(contentOpacity)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        var frameID: ObjectIdentifier?
     }
 }
 
@@ -25,8 +52,10 @@ final class ArtifactLayerView: NSView {
     override func makeBackingLayer() -> CALayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = .resizeAspect
-        layer.backgroundColor = NSColor.black.cgColor
-        layer.isOpaque = true
+        // Clear, not black: a newly mounted or flushed layer must not punch a
+        // black hole through the still underneath while the next sample lands.
+        layer.backgroundColor = NSColor.clear.cgColor
+        layer.isOpaque = false
         layer.preventsDisplaySleepDuringVideoPlayback = false
         return layer
     }
@@ -51,10 +80,18 @@ final class ArtifactLayerView: NSView {
         display(displayedFrame)
     }
 
+    func setContentOpacity(_ value: CGFloat) {
+        let opacity = Float(min(max(value, 0), 1))
+        guard let layer, layer.opacity != opacity else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = opacity
+        CATransaction.commit()
+    }
+
     func display(_ frame: RecallDisplayFrame?) {
-        let needsRecovery = videoRenderer?.status == .failed
-            || videoRenderer?.requiresFlushToResumeDecoding == true
-        if displayedFrame === frame, !needsRecovery {
+        guard let frame else {
+            clearDisplayedContent()
             return
         }
         guard let sample = RecallSampleBuffer.makeDisplayImmediately(from: frame) else {
@@ -62,6 +99,15 @@ final class ArtifactLayerView: NSView {
         }
         displayedFrame = frame
         enqueue(sample)
+    }
+
+    func clearDisplayedContent() {
+        displayedFrame = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoRenderer?.flush()
+        layer?.opacity = 0
+        CATransaction.commit()
     }
 
     private var videoRenderer: AVSampleBufferVideoRenderer? {

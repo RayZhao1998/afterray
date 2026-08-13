@@ -333,64 +333,118 @@ enum RecallDisplayedFrame {
     }
 }
 
-/// Latest-wins throttle for the immersive still while the playhead scrubs.
+/// Throttle, not debounce: stills keep updating while the playhead moves,
+/// at most one committed frame per `intervalMilliseconds`.
 ///
-/// At most one new image is started every `interval`. If a later position
-/// arrives during a load or the 16ms window, it overwrites
-/// `nextTickPosition`. When both the load and the window are clear, that
-/// pending position is taken and the next tick starts.
-struct RecallImageTick: Equatable {
-    static let interval: Duration = .milliseconds(16)
+/// 1. Idle: start the latest requested still immediately.
+/// 2. Once a still is loading or fading, newer requests only overwrite
+///    `pendingID`. The in-flight still is still shown — it is not skipped.
+/// 3. When the fade finishes, `pendingID` (latest wins) starts the next tick
+///    immediately, so dragging keeps the picture moving.
+struct RecallStillGate: Equatable {
+    static let intervalMilliseconds = 150
+    static var interval: Duration { .milliseconds(intervalMilliseconds) }
+    static var animationDuration: TimeInterval {
+        TimeInterval(intervalMilliseconds) / 1_000
+    }
 
-    private(set) var displayedArtifactID: String?
-    private(set) var nextTickPosition: String?
-    private(set) var isUpdating = false
-    private(set) var isThrottling = false
-    /// Bumps each time a tick starts so the view can restart its 16ms sleep.
-    private(set) var generation: UInt64 = 0
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case transitioning
+    }
 
-    enum Action: Equatable {
+    enum Step: Equatable {
         case none
-        case start(String)
+        case needFrame(String)
     }
 
-    mutating func request(_ artifactID: String) -> Action {
-        if artifactID == displayedArtifactID {
-            nextTickPosition = nil
+    private(set) var currentID: String?
+    private(set) var targetID: String?
+    private(set) var pendingID: String?
+    private(set) var phase: Phase = .idle
+
+    var isBusy: Bool { phase != .idle }
+
+    mutating func request(_ id: String) -> Step {
+        if phase == .idle {
+            if currentID == id {
+                pendingID = nil
+                return .none
+            }
+            return begin(id)
+        }
+        if targetID == id {
+            pendingID = nil
             return .none
         }
-        if isUpdating || isThrottling {
-            nextTickPosition = artifactID
-            return .none
+        pendingID = id
+        return .none
+    }
+
+    /// The target frame is in memory. Show it even if something newer is
+    /// already pending — that is what makes this a throttle.
+    ///
+    /// The first still stays in `.loading` until `commitSettle`, so playhead
+    /// motion during view attach cannot start a second load.
+    mutating func frameReady(_ id: String) -> Prepared {
+        guard phase == .loading, targetID == id else { return .ignore }
+        if currentID == nil {
+            return .settle(id)
         }
-        return begin(artifactID)
+        phase = .transitioning
+        return .transition(to: id)
     }
 
-    mutating func throttleEnded() -> Action {
-        isThrottling = false
-        return advance()
+    mutating func commitSettle(_ id: String) -> Step {
+        guard phase == .loading, targetID == id, currentID == nil else { return .none }
+        currentID = id
+        targetID = nil
+        phase = .idle
+        if let next = takePending(otherThan: currentID) {
+            return begin(next)
+        }
+        return .none
     }
 
-    mutating func updateFinished(for artifactID: String) -> Action {
-        guard isUpdating, displayedArtifactID == artifactID else { return .none }
-        isUpdating = false
-        return advance()
+    mutating func loadFailed(_ id: String) -> Step {
+        guard phase == .loading, targetID == id else { return .none }
+        targetID = nil
+        phase = .idle
+        if let next = takePending(otherThan: currentID) {
+            return begin(next)
+        }
+        return .none
     }
 
-    private mutating func begin(_ artifactID: String) -> Action {
-        displayedArtifactID = artifactID
-        nextTickPosition = nil
-        isUpdating = true
-        isThrottling = true
-        generation &+= 1
-        return .start(artifactID)
+    mutating func transitionFinished() -> Step {
+        guard phase == .transitioning, let targetID else { return .none }
+        currentID = targetID
+        self.targetID = nil
+        phase = .idle
+        if let next = takePending(otherThan: currentID) {
+            return begin(next)
+        }
+        return .none
     }
 
-    private mutating func advance() -> Action {
-        guard !isUpdating, !isThrottling else { return .none }
-        guard let next = nextTickPosition else { return .none }
-        nextTickPosition = nil
-        if next == displayedArtifactID { return .none }
-        return begin(next)
+    enum Prepared: Equatable {
+        case ignore
+        case settle(String)
+        case transition(to: String)
+    }
+
+    private mutating func begin(_ id: String) -> Step {
+        targetID = id
+        pendingID = nil
+        phase = .loading
+        return .needFrame(id)
+    }
+
+    private mutating func takePending(otherThan id: String?) -> String? {
+        guard let pendingID else { return nil }
+        self.pendingID = nil
+        if pendingID == id { return nil }
+        return pendingID
     }
 }
