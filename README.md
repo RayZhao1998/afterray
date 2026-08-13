@@ -1,5 +1,7 @@
 # AfterRay
 
+**AfterRay** — a ray that persists after the day is gone.
+
 **A private timeline for everything you saw and heard on your Mac.**
 
 AfterRay continuously captures your screen, system audio, microphone audio,
