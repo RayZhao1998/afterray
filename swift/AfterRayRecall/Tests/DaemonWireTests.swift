@@ -64,6 +64,19 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(status.activeSessionId, "s1")
     }
 
+    func testShutdownRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "shutdown"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "shutdown")
+    }
+
+    func testShutdownResultDecodesDaemonPid() throws {
+        let json = #"{"stopping":true,"pid":4321}"#
+        let result = try JSONDecoder().decode(DaemonShutdownResult.self, from: Data(json.utf8))
+        XCTAssertTrue(result.stopping)
+        XCTAssertEqual(result.pid, 4321)
+    }
+
     func testSearchRequestMatchesRustShape() throws {
         let request = WireRequest(type: "search", limit: 30, query: "design review")
         let data = try JSONEncoder().encode(request)

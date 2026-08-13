@@ -88,6 +88,10 @@ private actor ControlDaemon: AfterRayDaemonServing {
         return RecordStopResult(sessionId: "s1")
     }
 
+    func shutdown() async throws -> DaemonShutdownResult {
+        DaemonShutdownResult(stopping: true, pid: nil)
+    }
+
     func search(query: String, limit: Int) async throws -> [RecallSearchHit] {
         lastSearchQuery = query
         return [

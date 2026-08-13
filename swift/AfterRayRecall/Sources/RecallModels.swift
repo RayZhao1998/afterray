@@ -155,6 +155,16 @@ public struct RecordStartResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct DaemonShutdownResult: Codable, Equatable, Sendable {
+    public let stopping: Bool
+    public let pid: Int32?
+
+    public init(stopping: Bool, pid: Int32? = nil) {
+        self.stopping = stopping
+        self.pid = pid
+    }
+}
+
 public struct RecordStopResult: Codable, Equatable, Sendable {
     public let sessionId: String?
     public let alreadyStopped: Bool?
@@ -222,8 +232,8 @@ public struct RecallVisualTuning: Equatable, Sendable {
     public var dragPointsPerMoment: Double
 
     public init(
-        topScrimOpacity: Double = 0.58,
-        bottomScrimOpacity: Double = 0.92,
+        topScrimOpacity: Double = 0.29,
+        bottomScrimOpacity: Double = 0.46,
         timelineDensity: Double = 0.12,
         timelineSegmentHeight: Double = 48,
         timelineSegmentGap: Double = 2,

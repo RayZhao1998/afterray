@@ -52,6 +52,7 @@ pub enum Request {
     Summarize {
         session_id: String,
     },
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +200,12 @@ mod tests {
         assert_eq!(json, r#"{"type":"record_start"}"#);
         let decoded: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Request::RecordStart));
+    }
+
+    #[test]
+    fn shutdown_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::Shutdown).unwrap();
+        assert_eq!(json, r#"{"type":"shutdown"}"#);
     }
 
     #[test]

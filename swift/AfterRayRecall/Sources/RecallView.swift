@@ -65,11 +65,11 @@ public struct RecallView: View {
             }
 
             switch loadState {
-            case .loading:
+            case .loading where moments.isEmpty:
                 loadingView
-            case .failed(let message):
+            case .failed(let message) where moments.isEmpty:
                 FailureView(message: message, onReload: onReload)
-            case .ready, .processing:
+            default:
                 if moments.isEmpty {
                     EmptyRecallView(isProcessing: isProcessing)
                         .padding(40)
@@ -89,17 +89,14 @@ public struct RecallView: View {
     private var loadingView: some View {
         VStack(spacing: 14) {
             ProgressView().controlSize(.large)
+            ProgressView().controlSize(.large).tint(RecallPalette.textPrimary)
             Text("Opening your memory…")
                 .font(.callout.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(RecallPalette.textPrimary)
         }
         .padding(.horizontal, 32)
         .padding(.vertical, 24)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(.white.opacity(0.13), lineWidth: 1)
-        }
+        .recallOverlayPanel(cornerRadius: 20)
         .shadow(color: .black.opacity(0.42), radius: 28, y: 12)
     }
 
@@ -170,14 +167,14 @@ public struct RecallView: View {
             LinearGradient(
                 stops: [
                     .init(color: .clear, location: 0.52),
-                    .init(color: .black.opacity(0.35), location: 0.72),
+                    .init(color: .black.opacity(0.18), location: 0.72),
                     .init(color: .black.opacity(tuning.bottomScrimOpacity), location: 1),
                 ],
                 startPoint: .top,
                 endPoint: .bottom
             )
             LinearGradient(
-                colors: [.black.opacity(0.34), .clear, .black.opacity(0.22)],
+                colors: [.black.opacity(0.17), .clear, .black.opacity(0.11)],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -948,11 +945,20 @@ private struct FailureView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "bolt.horizontal.circle")
+            Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(RecallPalette.ray)
-            Text("AfterRay daemon is unavailable").font(.title3.weight(.medium))
-            Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Text("Couldn’t open your memory")
+                .font(.title3.weight(.medium))
+            Text("The local AfterRay daemon failed to start.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+                .frame(maxWidth: 460, alignment: .leading)
             if let onReload {
                 Button("Try Again", action: onReload)
                     .buttonStyle(RecallCapsuleButtonStyle())
@@ -990,11 +996,16 @@ private struct RecallCapsuleButtonStyle: ButtonStyle {
     }
 }
 
-private enum RecallPalette {
-    static let background = Color(red: 0.018, green: 0.016, blue: 0.020)
-    static let ray = Color(red: 1.0, green: 0.20, blue: 0.14)
+public enum RecallPalette {
+    public static let background = Color(red: 0.018, green: 0.016, blue: 0.020)
+    public static let ray = Color(red: 1.0, green: 0.20, blue: 0.14)
+    public static let textPrimary = Color.white
+    public static let textSecondary = Color.white.opacity(0.82)
+    public static let textTertiary = Color.white.opacity(0.66)
+    public static let panelDim = Color.black.opacity(0.58)
+    public static let panelStroke = Color.white.opacity(0.16)
 
-    static func appColor(seed: String) -> Color {
+    public static func appColor(seed: String) -> Color {
         let palette = [
             Color(red: 0.93, green: 0.20, blue: 0.14),
             Color(red: 0.86, green: 0.34, blue: 0.16),
@@ -1005,5 +1016,15 @@ private enum RecallPalette {
         ]
         let hash = seed.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
         return palette[Int(UInt(bitPattern: hash) % UInt(palette.count))]
+    }
+}
+
+public extension View {
+    func recallOverlayPanel(cornerRadius: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return self
+            .background(.ultraThinMaterial, in: shape)
+            .background(RecallPalette.panelDim, in: shape)
+            .overlay { shape.stroke(RecallPalette.panelStroke, lineWidth: 1) }
     }
 }

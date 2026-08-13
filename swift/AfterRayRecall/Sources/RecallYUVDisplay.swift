@@ -1,8 +1,8 @@
 import AppKit
+import AVFoundation
 import CoreMedia
 import CoreVideo
 import ImageIO
-import IOSurface
 import QuartzCore
 import SwiftUI
 import VideoToolbox
@@ -20,18 +20,23 @@ struct ArtifactYUVView: NSViewRepresentable {
 }
 
 final class ArtifactLayerView: NSView {
-    private var retainedBuffer: CVPixelBuffer?
+    private var displayedFrame: RecallDisplayFrame?
+
+    override func makeBackingLayer() -> CALayer {
+        let layer = AVSampleBufferDisplayLayer()
+        layer.videoGravity = .resizeAspect
+        layer.backgroundColor = NSColor.black.cgColor
+        layer.isOpaque = true
+        layer.preventsDisplaySleepDuringVideoPlayback = false
+        return layer
+    }
+
+    override var acceptsFirstResponder: Bool { false }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layerContentsRedrawPolicy = .never
-        layer?.isOpaque = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        layer?.contentsGravity = .resizeAspect
-        layer?.minificationFilter = .linear
-        layer?.magnificationFilter = .linear
-        layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
     }
 
     @available(*, unavailable)
@@ -41,27 +46,136 @@ final class ArtifactLayerView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        layer?.contentsScale = window?.backingScaleFactor ?? layer?.contentsScale ?? 2
-    }
-
-    override func viewDidChangeBackingProperties() {
-        super.viewDidChangeBackingProperties()
-        layer?.contentsScale = window?.backingScaleFactor ?? 2
+        guard window != nil, let displayedFrame else { return }
+        self.displayedFrame = nil
+        display(displayedFrame)
     }
 
     func display(_ frame: RecallDisplayFrame?) {
-        layer?.contentsScale = window?.backingScaleFactor ?? layer?.contentsScale ?? 2
-        if let buffer = frame?.pixelBuffer, let surface = CVPixelBufferGetIOSurface(buffer) {
-            retainedBuffer = buffer
-            layer?.contents = surface
+        let needsRecovery = videoRenderer?.status == .failed
+            || videoRenderer?.requiresFlushToResumeDecoding == true
+        if displayedFrame === frame, !needsRecovery {
             return
         }
-        retainedBuffer = nil
-        if let image = frame?.fallbackImage {
-            layer?.contents = image
+        guard let sample = RecallSampleBuffer.makeDisplayImmediately(from: frame) else {
             return
         }
-        layer?.contents = nil
+        displayedFrame = frame
+        enqueue(sample)
+    }
+
+    private var videoRenderer: AVSampleBufferVideoRenderer? {
+        (layer as? AVSampleBufferDisplayLayer)?.sampleBufferRenderer
+    }
+
+    private func enqueue(_ sample: CMSampleBuffer) {
+        guard let renderer = videoRenderer else { return }
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding
+            || !renderer.isReadyForMoreMediaData
+        {
+            renderer.flush()
+        }
+        renderer.enqueue(sample)
+    }
+}
+
+enum RecallSampleBuffer {
+    static func makeDisplayImmediately(from frame: RecallDisplayFrame?) -> CMSampleBuffer? {
+        guard let frame else { return nil }
+        if let buffer = frame.pixelBuffer {
+            return makeDisplayImmediately(from: buffer)
+        }
+        guard let image = frame.fallbackImage, let buffer = pixelBuffer(from: image) else {
+            return nil
+        }
+        return makeDisplayImmediately(from: buffer)
+    }
+
+    static func makeDisplayImmediately(from pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+        var format: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &format
+        )
+        guard formatStatus == noErr, let format else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: .zero,
+            decodeTimeStamp: .invalid
+        )
+        var sample: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: format,
+            sampleTiming: &timing,
+            sampleBufferOut: &sample
+        )
+        guard sampleStatus == noErr, let sample else { return nil }
+        markDisplayImmediately(sample)
+        return sample
+    }
+
+    static func hasDisplayImmediately(_ sample: CMSampleBuffer) -> Bool {
+        guard
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                sample,
+                createIfNecessary: false
+            ) as? [[CFString: Any]]
+        else { return false }
+        return attachments.first?[kCMSampleAttachmentKey_DisplayImmediately] as? Bool == true
+    }
+
+    private static func markDisplayImmediately(_ sample: CMSampleBuffer) {
+        guard
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                sample,
+                createIfNecessary: true
+            )
+        else { return }
+        let dictionary = unsafeBitCast(
+            CFArrayGetValueAtIndex(attachments, 0),
+            to: CFMutableDictionary.self
+        )
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
+    }
+
+    private static func pixelBuffer(from image: CGImage) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            image.width,
+            image.height,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+            ] as CFDictionary,
+            &buffer
+        )
+        guard status == kCVReturnSuccess, let buffer else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard
+            let context = CGContext(
+                data: CVPixelBufferGetBaseAddress(buffer),
+                width: image.width,
+                height: image.height,
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+                space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue
+                    | CGImageAlphaInfo.premultipliedFirst.rawValue
+            )
+        else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return buffer
     }
 }
 

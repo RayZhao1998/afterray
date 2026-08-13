@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         QueueConfig::default(),
     )?;
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
     let state = Arc::new(AppState {
         store,
@@ -103,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10),
         ),
+        shutdown: shutdown_tx,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -125,6 +127,11 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             () = &mut shutdown => break,
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+            }
         }
     }
 
@@ -194,6 +201,7 @@ struct AppState {
     models: ModelQueue,
     recording: Mutex<RecordingRuntime>,
     capture_interval: Duration,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -316,6 +324,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Err(error) => Response::failure(error.to_string()),
         },
         Request::Summarize { session_id } => summarize(state, &session_id).await,
+        Request::Shutdown => {
+            let _ = state.shutdown.send(true);
+            Response::success(serde_json::json!({
+                "stopping": true,
+                "pid": std::process::id(),
+            }))
+        }
     }
 }
 

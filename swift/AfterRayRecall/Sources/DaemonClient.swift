@@ -34,6 +34,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func recordStart() async throws -> RecordStartResult
     func recordStop() async throws -> RecordStopResult
     func search(query: String, limit: Int) async throws -> [RecallSearchHit]
+    func shutdown() async throws -> DaemonShutdownResult
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
@@ -71,6 +72,10 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func recordStop() async throws -> RecordStopResult {
         try await request(WireRequest(type: "record_stop"), as: RecordStopResult.self)
+    }
+
+    public func shutdown() async throws -> DaemonShutdownResult {
+        try await request(WireRequest(type: "shutdown"), as: DaemonShutdownResult.self)
     }
 
     public func search(query: String, limit: Int = 30) async throws -> [RecallSearchHit] {

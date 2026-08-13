@@ -266,6 +266,6 @@ enum RecallDisplayedFrame {
     ) -> Frame? {
         if let cached { return cached }
         if loadedID == artifactID { return loadedFrame }
-        return nil
+        return loadedFrame
     }
 }

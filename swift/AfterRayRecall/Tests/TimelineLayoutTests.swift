@@ -130,14 +130,15 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertFalse(isLive)
     }
 
-    func testDisplayedFrameNeverFallsBackToAPreviousArtifact() {
-        XCTAssertNil(
+    func testDisplayedFrameKeepsPreviousArtifactUntilTheNextOneArrives() {
+        XCTAssertEqual(
             RecallDisplayedFrame.choose(
                 artifactID: "B",
                 cached: nil as String?,
                 loadedID: "A",
                 loadedFrame: "frame-A"
-            )
+            ),
+            "frame-A"
         )
         XCTAssertEqual(
             RecallDisplayedFrame.choose(

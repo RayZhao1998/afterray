@@ -36,59 +36,46 @@ struct AfterRayApp: App {
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     private var workspaceObservers: [NSObjectProtocol] = []
-    private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        installStatusItem()
+        installAppMenu()
+        AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
+    }
+
+    func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            RecallOverlayController.shared.stop()
+            await DaemonSupervisor.shared.shutdown()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_: Notification) {
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.forEach(center.removeObserver)
         workspaceObservers.removeAll()
-        if let statusItem {
-            NSStatusBar.system.removeStatusItem(statusItem)
-        }
-        statusItem = nil
+        AfterRayMenuBar.shared.remove()
         RecallOverlayController.shared.stop()
         DaemonSupervisor.shared.stop()
     }
 
-    private func installStatusItem() {
-        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            button.image = NSImage(
-                systemSymbolName: "clock.arrow.circlepath",
-                accessibilityDescription: "AfterRay"
-            )
-            button.toolTip = "AfterRay"
-        }
-
-        let menu = NSMenu()
-        let openItem = NSMenuItem(
-            title: "Open AfterRay",
-            action: #selector(openAfterRay),
-            keyEquivalent: ""
-        )
-        openItem.target = self
-        menu.addItem(openItem)
-        menu.addItem(.separator())
+    private func installAppMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
             action: #selector(quitAfterRay),
             keyEquivalent: "q"
         )
         quitItem.target = self
-        menu.addItem(quitItem)
-        statusItem.menu = menu
-        self.statusItem = statusItem
-    }
-
-    @objc private func openAfterRay() {
-        RecallOverlayController.shared.show()
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     @objc private func quitAfterRay() {
@@ -132,6 +119,100 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+@MainActor
+private final class AfterRayMenuBar: NSObject {
+    static let shared = AfterRayMenuBar()
+
+    private var statusItem: NSStatusItem?
+    private var isRecording = true
+    private var isOverlayVisible = false
+
+    private override init() {
+        super.init()
+    }
+
+    func install() {
+        guard statusItem == nil else {
+            refresh()
+            return
+        }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.isVisible = true
+        if let button = item.button {
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.setButtonType(.momentaryPushIn)
+        }
+
+        let menu = NSMenu()
+        let openItem = NSMenuItem(
+            title: "Open AfterRay",
+            action: #selector(openAfterRay),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        menu.addItem(openItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "Quit AfterRay",
+            action: #selector(quitAfterRay),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        menu.addItem(quitItem)
+        item.menu = menu
+        statusItem = item
+        refresh()
+        print(
+            "AfterRay: menu extra installed visible=\(item.isVisible) button=\(item.button != nil)"
+        )
+    }
+
+    func remove() {
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
+        statusItem = nil
+    }
+
+    func setRecording(_ isRecording: Bool) {
+        guard self.isRecording != isRecording else { return }
+        self.isRecording = isRecording
+        refresh()
+    }
+
+    func setOverlayVisible(_ isVisible: Bool) {
+        guard isOverlayVisible != isVisible else { return }
+        isOverlayVisible = isVisible
+        refresh()
+    }
+
+    @objc private func openAfterRay() {
+        RecallOverlayController.shared.show()
+    }
+
+    @objc private func quitAfterRay() {
+        NSApp.terminate(nil)
+    }
+
+    private func refresh() {
+        guard let button = statusItem?.button else { return }
+        let showPaused = !isOverlayVisible && !isRecording
+        statusItem?.isVisible = true
+        button.image = Self.icon(paused: showPaused)
+        button.toolTip = showPaused ? "AfterRay · Paused" : "AfterRay"
+    }
+
+    private static func icon(paused: Bool) -> NSImage {
+        let name = paused ? "pause.circle" : "clock.arrow.circlepath"
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: "AfterRay")
+            ?? NSImage(size: NSSize(width: 18, height: 18))
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = true
+        return image
+    }
+}
+
 private final class RecallOverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -162,6 +243,7 @@ private final class RecallOverlayController {
     private var hotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var resignKeyObserver: NSObjectProtocol?
+    private var keyMonitor: Any?
 
     func start() {
         guard panel == nil else { return }
@@ -202,20 +284,26 @@ private final class RecallOverlayController {
             }
         }
         registerHotKey()
+        installKeyMonitor()
         show()
     }
+
+    var isVisible: Bool { panel?.isVisible == true }
 
     func stop() {
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         hotKey = nil
         eventHandler = nil
+        keyMonitor = nil
         if let resignKeyObserver {
             NotificationCenter.default.removeObserver(resignKeyObserver)
         }
         resignKeyObserver = nil
         panel?.orderOut(nil)
         panel = nil
+        AfterRayMenuBar.shared.setOverlayVisible(false)
     }
 
     func toggle() {
@@ -245,6 +333,8 @@ private final class RecallOverlayController {
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
+        panel.makeFirstResponder(panel)
+        AfterRayMenuBar.shared.setOverlayVisible(true)
     }
 
     func hide(returnFocus: Bool) {
@@ -252,6 +342,7 @@ private final class RecallOverlayController {
         let application = returnFocus ? previousApplication : nil
         panel.orderOut(nil)
         panel.alphaValue = 1
+        AfterRayMenuBar.shared.setOverlayVisible(false)
         application?.activate(options: [])
     }
 
@@ -260,6 +351,34 @@ private final class RecallOverlayController {
         return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens[0]
+    }
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard RecallOverlayController.shared.shouldConsumeCloseKey(event) else {
+                return event
+            }
+            RecallOverlayController.shared.closeFromKeyboard()
+            return nil
+        }
+    }
+
+    fileprivate func shouldConsumeCloseKey(_ event: NSEvent) -> Bool {
+        if PermissionGuideController.shared.isVisible {
+            return event.keyCode == 53
+        }
+        guard panel?.isVisible == true, panel?.isKeyWindow == true else { return false }
+        if event.keyCode == 53 { return true }
+        return event.modifierFlags.contains(.command)
+            && event.charactersIgnoringModifiers == "w"
+    }
+
+    fileprivate func closeFromKeyboard() {
+        if PermissionGuideController.shared.isVisible {
+            PermissionGuideController.shared.hide()
+            return
+        }
+        hide(returnFocus: true)
     }
 
     private func registerHotKey() {
@@ -584,7 +703,8 @@ private struct AfterRayRootView: View {
             ImmersiveControlBar(
                 model: control,
                 onToggleRecording: toggleRecording,
-                onSearch: { Task { await control.search() } }
+                onSearch: { Task { await control.search() } },
+                onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
             )
             .padding(.top, controlBarTopPadding)
         }
@@ -608,6 +728,12 @@ private struct AfterRayRootView: View {
                     .transition(.opacity)
             }
         }
+        .onExitCommand {
+            RecallOverlayController.shared.hide(returnFocus: true)
+        }
+        .onChange(of: control.isRecording, initial: true) { _, isRecording in
+            AfterRayMenuBar.shared.setRecording(isRecording)
+        }
         .task {
             await bootstrap()
         }
@@ -626,7 +752,7 @@ private struct AfterRayRootView: View {
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
-                _ = try? await DaemonSupervisor.shared.startIfNeeded()
+                guard await startDaemonOrReportFailure() != nil else { return }
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
@@ -639,7 +765,7 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
             Task {
-                _ = try? await DaemonSupervisor.shared.startIfNeeded()
+                guard await startDaemonOrReportFailure() != nil else { return }
                 permissions.refresh()
                 if permissions.allGranted {
                     _ = await control.ensureRecording()
@@ -661,12 +787,7 @@ private struct AfterRayRootView: View {
     }
 
     private func bootstrap() async {
-        do {
-            try await DaemonSupervisor.shared.startIfNeeded()
-        } catch {
-            await control.refreshStatus()
-            return
-        }
+        guard await startDaemonOrReportFailure() != nil else { return }
         await permissions.requestInitialPermissionsOnce()
         if permissions.allGranted {
             _ = await control.ensureRecording()
@@ -685,13 +806,7 @@ private struct AfterRayRootView: View {
 
     private func reload() {
         Task {
-            do {
-                try await DaemonSupervisor.shared.startIfNeeded()
-            } catch {
-                await control.refreshStatus()
-                await store.refreshTimeline(preservingSelection: !isLive)
-                return
-            }
+            guard await startDaemonOrReportFailure() != nil else { return }
             async let status: Void = control.refreshStatus()
             async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
             _ = await (status, timeline)
@@ -700,22 +815,31 @@ private struct AfterRayRootView: View {
 
     private func keepDaemonAlive() async {
         while !Task.isCancelled {
-            do {
-                let restarted = try await DaemonSupervisor.shared.startIfNeeded()
-                if restarted {
-                    permissions.refresh()
-                    if permissions.allGranted {
-                        _ = await control.ensureRecording()
-                    } else {
-                        await control.refreshStatus()
-                    }
-                    await store.refreshTimeline(preservingSelection: !isLive)
+            if let restarted = await startDaemonOrReportFailure(), restarted {
+                permissions.refresh()
+                if permissions.allGranted {
+                    _ = await control.ensureRecording()
+                } else {
+                    await control.refreshStatus()
                 }
-            } catch {
-                // The next health tick retries. Daemon connectivity is an
-                // implementation detail and never becomes a user-facing error.
+                await store.refreshTimeline(preservingSelection: !isLive)
             }
             try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    /// Starts afterrayd. Returns whether this call launched a new process,
+    /// or `nil` when startup failed and the user-visible error was recorded.
+    @discardableResult
+    private func startDaemonOrReportFailure() async -> Bool? {
+        do {
+            return try await DaemonSupervisor.shared.startIfNeeded()
+        } catch let error as RuntimeError where !error.isUserVisibleFailure {
+            return nil
+        } catch {
+            store.reportFailure(error.localizedDescription)
+            await control.refreshStatus()
+            return nil
         }
     }
 
@@ -828,6 +952,8 @@ private struct ImmersiveControlBar: View {
     @ObservedObject var model: AfterRayControlModel
     let onToggleRecording: () -> Void
     let onSearch: () -> Void
+    let onClose: () -> Void
+    @FocusState private var isSearchFocused: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -861,6 +987,7 @@ private struct ImmersiveControlBar: View {
                 TextField("Search your day", text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .focused($isSearchFocused)
                     .onSubmit(onSearch)
                 if model.isSearching {
                     ProgressView().controlSize(.small)
@@ -872,6 +999,15 @@ private struct ImmersiveControlBar: View {
                 }
             }
             .frame(width: 224)
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Close AfterRay")
         }
         .padding(.horizontal, 14)
         .frame(height: 40)

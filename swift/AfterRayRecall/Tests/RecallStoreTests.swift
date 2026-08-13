@@ -26,6 +26,20 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.loadState, .loading)
     }
 
+    func testStartupFailureIsNotHiddenByConnectionRetry() async {
+        let store = RecallStore(daemon: ConnectionFailingDaemon())
+        store.reportFailure("afterrayd exited during startup (status 1).\n\nError: key provider: A required entitlement isn't present.")
+
+        await store.loadTimeline()
+
+        XCTAssertEqual(
+            store.loadState,
+            .failed(
+                message: "afterrayd exited during startup (status 1).\n\nError: key provider: A required entitlement isn't present."
+            )
+        )
+    }
+
     func testImageRepositoryCoalescesConcurrentArtifactLoads() async throws {
         let daemon = CountingArtifactDaemon()
         let repository = RecallImageRepository(daemon: daemon)

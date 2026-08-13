@@ -22,7 +22,12 @@ public final class RecallStore: ObservableObject {
     public func loadTimeline(preservingSelection: Bool = false) async {
         let requestGeneration = sensitiveGeneration
         if moments.isEmpty {
-            loadState = .loading
+            switch loadState {
+            case .failed:
+                break
+            default:
+                loadState = .loading
+            }
         }
         do {
             let loadedSessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
@@ -33,7 +38,10 @@ public final class RecallStore: ObservableObject {
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
-                loadState = .loading
+                if case .failed = loadState { return }
+                if moments.isEmpty {
+                    loadState = .loading
+                }
                 return
             }
             moments = []
@@ -67,9 +75,11 @@ public final class RecallStore: ObservableObject {
             apply(Array(prefix) + updated, preservingSelection: preservingSelection)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
-            if !Self.isDaemonConnectionError(error) {
-                loadState = .failed(message: error.localizedDescription)
+            if Self.isDaemonConnectionError(error) {
+                if case .failed = loadState { return }
+                return
             }
+            loadState = .failed(message: error.localizedDescription)
         }
     }
 
@@ -114,13 +124,19 @@ public final class RecallStore: ObservableObject {
 
     public func openSearchHit(_ hit: RecallSearchHit) async {
         let requestGeneration = sensitiveGeneration
-        loadState = .loading
+        switch loadState {
+        case .failed:
+            break
+        default:
+            loadState = .loading
+        }
         do {
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
             guard sensitiveGeneration == requestGeneration else { return }
             apply(loaded, selecting: hit.momentId)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
+            if Self.isDaemonConnectionError(error), case .failed = loadState { return }
             loadState = Self.isDaemonConnectionError(error)
                 ? .loading
                 : .failed(message: error.localizedDescription)
@@ -148,10 +164,15 @@ public final class RecallStore: ObservableObject {
         } catch {
             guard let index = moments.firstIndex(where: { $0.id == momentID }) else { return }
             moments[index].isFavorite = previous
+            if Self.isDaemonConnectionError(error), case .failed = loadState { return }
             loadState = Self.isDaemonConnectionError(error)
                 ? .loading
                 : .failed(message: error.localizedDescription)
         }
+    }
+
+    public func reportFailure(_ message: String) {
+        loadState = .failed(message: message)
     }
 
     public func clearSensitiveState() {

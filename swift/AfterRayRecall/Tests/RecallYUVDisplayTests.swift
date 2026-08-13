@@ -1,4 +1,6 @@
+import AVFoundation
 import AppKit
+import CoreMedia
 import CoreVideo
 import XCTest
 @testable import AfterRayRecall
@@ -30,6 +32,35 @@ final class RecallYUVDisplayTests: XCTestCase {
         let image = try XCTUnwrap(frame.fallbackImage)
         XCTAssertEqual(image.width, 32)
         XCTAssertEqual(image.height, 24)
+    }
+
+    func testJPEGPixelBufferWrapsAsImmediateSample() throws {
+        let jpeg = try encodeJPEG(width: 128, height: 80, color: .blue)
+        let frame = try XCTUnwrap(RecallFrameDecoder.decode(jpeg))
+        let buffer = try XCTUnwrap(frame.pixelBuffer)
+        let sample = try XCTUnwrap(RecallSampleBuffer.makeDisplayImmediately(from: buffer))
+        XCTAssertTrue(RecallSampleBuffer.hasDisplayImmediately(sample))
+        XCTAssertTrue(CMSampleBufferGetImageBuffer(sample) === buffer)
+    }
+
+    func testPNGFallbackWrapsAsImmediateSample() throws {
+        let png = try encodePNG(width: 32, height: 24, color: .green)
+        let frame = try XCTUnwrap(RecallFrameDecoder.decode(png))
+        let sample = try XCTUnwrap(RecallSampleBuffer.makeDisplayImmediately(from: frame))
+        XCTAssertTrue(RecallSampleBuffer.hasDisplayImmediately(sample))
+        let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+        XCTAssertEqual(CVPixelBufferGetWidth(buffer), 32)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 24)
+    }
+
+    func testDisplayLayerEnqueuesJPEGFrameWithoutFailing() throws {
+        let jpeg = try encodeJPEG(width: 128, height: 80, color: .blue)
+        let frame = try XCTUnwrap(RecallFrameDecoder.decode(jpeg))
+        let view = ArtifactLayerView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
+        XCTAssertTrue(view.layer is AVSampleBufferDisplayLayer)
+        view.display(frame)
+        let renderer = try XCTUnwrap((view.layer as? AVSampleBufferDisplayLayer)?.sampleBufferRenderer)
+        XCTAssertNotEqual(renderer.status, .failed)
     }
 
     private func encodeJPEG(width: Int, height: Int, color: NSColor) throws -> Data {

@@ -14,6 +14,8 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+#[cfg(target_os = "macos")]
+use core_foundation::{base::TCFType, string::CFString};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 #[cfg(target_os = "macos")]
@@ -95,37 +97,94 @@ impl KeyProvider for MacOsKeychainProvider {
     }
 }
 
+/// Developer ID helper tools cannot use the Data Protection keychain or
+/// `SecAccessControl`: both require entitlements that AMFI rejects without a
+/// provisioning profile (`errSecMissingEntitlement` or a launch-time kill).
+/// The file-based keychain with `WhenUnlockedThisDeviceOnly` and iCloud sync
+/// disabled meets the same device-bound, unlocked-only contract.
+#[cfg(target_os = "macos")]
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
+
+/// `kSecAttrAccessible` / `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`.
+/// security-framework does not expose this attribute key through a safe API.
+#[cfg(target_os = "macos")]
+const SEC_ATTR_ACCESSIBLE: &str = "pdmn";
+#[cfg(target_os = "macos")]
+const SEC_ATTR_ACCESSIBLE_WHEN_UNLOCKED_THIS_DEVICE_ONLY: &str = "aku";
+
 #[cfg(target_os = "macos")]
 fn load_keychain_key(account: &str) -> Result<Option<VaultKey>, StoreError> {
-    match generic_password(protected_keychain_query_options(account)) {
+    if let Some(key) = read_keychain_item(protected_keychain_query_options(account))? {
+        let _ = remove_file_keychain_item(account);
+        return Ok(Some(key));
+    }
+    if let Some(key) = read_keychain_item(file_keychain_query_options(account))? {
+        promote_keychain_item(account, &key)?;
+        return Ok(Some(key));
+    }
+    match generic_password(PasswordOptions::new_generic_password(
+        KEYCHAIN_SERVICE,
+        account,
+    )) {
         Ok(existing) => {
-            let existing = Zeroizing::new(existing);
+            let mut existing = Zeroizing::new(existing);
             let key = decode_key(&existing)?;
+            existing.zeroize();
+            persist_keychain_item(account, &key)?;
             remove_legacy_keychain_item(account)?;
             Ok(Some(key))
         }
-        Err(error) if error.code() == errSecItemNotFound => match generic_password(
-            PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, account),
-        ) {
-            Ok(existing) => {
-                let mut existing = Zeroizing::new(existing);
-                let key = decode_key(&existing)?;
-                existing.zeroize();
-                set_generic_password_options(&*key, protected_keychain_create_options(account)?)
-                    .map_err(|error| StoreError::KeyProvider(error.to_string()))?;
-                let verified = Zeroizing::new(
-                    generic_password(protected_keychain_query_options(account))
-                        .map_err(|error| StoreError::KeyProvider(error.to_string()))?,
-                );
-                if *decode_key(&verified)? != *key {
-                    return Err(StoreError::InvalidKey);
-                }
-                remove_legacy_keychain_item(account)?;
-                Ok(Some(key))
+        Err(error) if is_item_not_found(error) => Ok(None),
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_item(options: PasswordOptions) -> Result<Option<VaultKey>, StoreError> {
+    match generic_password(options) {
+        Ok(existing) => {
+            let existing = Zeroizing::new(existing);
+            Ok(Some(decode_key(&existing)?))
+        }
+        Err(error) if is_item_not_found(error) || is_missing_entitlement(error) => Ok(None),
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn persist_keychain_item(account: &str, key: &VaultKey) -> Result<(), StoreError> {
+    match set_generic_password_options(&**key, protected_keychain_create_options(account)?) {
+        Ok(()) => Ok(()),
+        Err(error) if is_missing_entitlement(error) => {
+            set_generic_password_options(&**key, file_keychain_create_options(account))
+                .map_err(|error| StoreError::KeyProvider(error.to_string()))
+        }
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn promote_keychain_item(account: &str, key: &VaultKey) -> Result<(), StoreError> {
+    match set_generic_password_options(&**key, protected_keychain_create_options(account)?) {
+        Ok(()) => {
+            let verified = read_keychain_item(protected_keychain_query_options(account))?
+                .ok_or(StoreError::InvalidKey)?;
+            if *verified != **key {
+                return Err(StoreError::InvalidKey);
             }
-            Err(legacy_error) if legacy_error.code() == errSecItemNotFound => Ok(None),
-            Err(legacy_error) => Err(StoreError::KeyProvider(legacy_error.to_string())),
-        },
+            let _ = remove_file_keychain_item(account);
+            Ok(())
+        }
+        Err(error) if is_missing_entitlement(error) => Ok(()),
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_file_keychain_item(account: &str) -> Result<(), StoreError> {
+    match delete_generic_password_options(file_keychain_query_options(account)) {
+        Ok(()) => Ok(()),
+        Err(error) if is_item_not_found(error) => Ok(()),
         Err(error) => Err(StoreError::KeyProvider(error.to_string())),
     }
 }
@@ -137,7 +196,7 @@ fn remove_legacy_keychain_item(account: &str) -> Result<(), StoreError> {
         account,
     )) {
         Ok(()) => Ok(()),
-        Err(error) if error.code() == errSecItemNotFound => Ok(()),
+        Err(error) if is_item_not_found(error) => Ok(()),
         Err(error) => Err(StoreError::KeyProvider(error.to_string())),
     }
 }
@@ -146,15 +205,34 @@ fn remove_legacy_keychain_item(account: &str) -> Result<(), StoreError> {
 fn create_keychain_key(account: &str) -> Result<VaultKey, StoreError> {
     let mut key = Zeroizing::new([0_u8; 32]);
     rand::rng().fill_bytes(key.as_mut());
-    set_generic_password_options(&*key, protected_keychain_create_options(account)?)
-        .map_err(|error| StoreError::KeyProvider(error.to_string()))?;
+    persist_keychain_item(account, &key)?;
     Ok(key)
 }
 
 #[cfg(target_os = "macos")]
-fn protected_keychain_query_options(account: &str) -> PasswordOptions {
+fn file_keychain_query_options(account: &str) -> PasswordOptions {
     let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, account);
     options.set_access_synchronized(Some(false));
+    options
+}
+
+#[cfg(target_os = "macos")]
+fn file_keychain_create_options(account: &str) -> PasswordOptions {
+    let mut options = file_keychain_query_options(account);
+    options.set_label("AfterRay Vault Key");
+    #[allow(deprecated)]
+    {
+        options.query.push((
+            CFString::from(SEC_ATTR_ACCESSIBLE),
+            CFString::from(SEC_ATTR_ACCESSIBLE_WHEN_UNLOCKED_THIS_DEVICE_ONLY).into_CFType(),
+        ));
+    }
+    options
+}
+
+#[cfg(target_os = "macos")]
+fn protected_keychain_query_options(account: &str) -> PasswordOptions {
+    let mut options = file_keychain_query_options(account);
     options.use_protected_keychain();
     options
 }
@@ -169,6 +247,16 @@ fn protected_keychain_create_options(account: &str) -> Result<PasswordOptions, S
     let mut options = protected_keychain_query_options(account);
     options.set_access_control(access_control);
     Ok(options)
+}
+
+#[cfg(target_os = "macos")]
+fn is_item_not_found(error: security_framework::base::Error) -> bool {
+    error.code() == errSecItemNotFound
+}
+
+#[cfg(target_os = "macos")]
+fn is_missing_entitlement(error: security_framework::base::Error) -> bool {
+    error.code() == ERR_SEC_MISSING_ENTITLEMENT
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1627,6 +1715,17 @@ mod tests {
         )
         .unwrap();
         (directory, vault)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_round_trip_works_without_data_protection_entitlement() {
+        let account = format!("afterray-test-{}", Uuid::now_v7());
+        let created = create_keychain_key(&account).expect("create vault key");
+        let loaded = load_keychain_key(&account).expect("load vault key");
+        let _ = remove_file_keychain_item(&account);
+        let _ = remove_legacy_keychain_item(&account);
+        assert_eq!(*created, *loaded.expect("created key should be readable"));
     }
 
     #[test]

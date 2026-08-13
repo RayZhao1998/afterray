@@ -66,6 +66,7 @@ enum RecordCommand {
 #[derive(Subcommand)]
 enum DaemonCommand {
     Start,
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -104,6 +105,9 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Command::Daemon {
+            command: DaemonCommand::Stop,
+        } => Request::Shutdown,
         Command::Status => Request::Status,
         Command::Record {
             command: RecordCommand::Start,
