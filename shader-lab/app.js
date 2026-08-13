@@ -7,6 +7,7 @@ const controls = {
   gravity: bindRange("gravity"),
   glow: bindRange("glow"),
   speed: bindRange("speed"),
+  particles: bindRange("particles"),
 };
 
 const gl = canvas.getContext("webgl2", {
@@ -46,8 +47,10 @@ uniform vec2 uPointer;
 uniform float uTime;
 uniform float uGravity;
 uniform float uGlow;
+uniform float uParticles;
 
 #define PI 3.141592653589793
+#define TAU 6.283185307179586
 
 float hash12(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -79,6 +82,99 @@ float fbm(vec2 p) {
 
 float lineMask(float distanceToLine, float width) {
   return exp(-pow(abs(distanceToLine) / max(width, 0.0001), 1.42));
+}
+
+float angleDelta(float a, float b) {
+  return atan(sin(a - b), cos(a - b));
+}
+
+// Hundreds of apparent particles are synthesized from a handful of polar grids.
+// Inner orbits advance faster, approximating the velocity gradient in an accretion flow.
+vec2 orbitalParticles(vec2 p, float time, float density) {
+  float r = length(p);
+  float angle = atan(p.y, p.x);
+  float dust = 0.0;
+  float hot = 0.0;
+
+  for (int i = 0; i < 7; i++) {
+    float fi = float(i);
+    float orbitRadius = 0.345 + fi * 0.052;
+    float count = 46.0 + fi * 11.0;
+    float omega = 0.22 / pow(orbitRadius, 1.35);
+    float movingGrid = (angle / TAU - time * omega) * count;
+    float cell = floor(movingGrid);
+    float seed = hash12(vec2(cell + fi * 47.0, fi * 19.7));
+    float center = 0.18 + 0.64 * hash12(vec2(cell * 1.37, fi + 8.2));
+    float tangent = (fract(movingGrid) - center) * TAU * orbitRadius / count;
+    float jitter = (hash12(vec2(cell + 91.3, fi * 7.4)) - 0.5) * (0.017 + fi * 0.002);
+    float radial = r - orbitRadius - jitter;
+    float size = mix(0.0018, 0.0042, hash12(vec2(cell * 2.1, fi * 31.0)));
+    float active = smoothstep(0.995 - min(density, 1.0) * 0.875, 1.0, seed);
+    active += max(density - 1.0, 0.0) * 0.65;
+
+    float d = length(vec2(radial, tangent * 1.35)) / size;
+    float spark = exp(-d * d * 1.7) * active;
+    float shortTrail = exp(-abs(radial) / (size * 0.72));
+    shortTrail *= exp(-max(tangent, 0.0) / (size * 4.8));
+    shortTrail *= smoothstep(-size * 9.0, 0.0, tangent) * active * 0.10;
+
+    dust += spark + shortTrail;
+    hot += spark * pow(seed, 5.0) * (1.25 - fi * 0.075);
+  }
+
+  float orbitalEnvelope = smoothstep(0.31, 0.35, r) * (1.0 - smoothstep(0.70, 0.78, r));
+  return vec2(dust, hot) * orbitalEnvelope;
+}
+
+// Artistic memory motes inside the shadow. They are intentionally not presented
+// as matter escaping the event horizon; their dim spiral is a product metaphor.
+vec2 memoryParticles(vec2 p, float time, float density) {
+  float r = length(p);
+  float angle = atan(p.y, p.x);
+  float motes = 0.0;
+  float glints = 0.0;
+
+  for (int i = 0; i < 5; i++) {
+    float fi = float(i);
+    float orbitRadius = 0.055 + fi * 0.043;
+    float count = 16.0 + fi * 7.0;
+    float omega = 0.34 / pow(orbitRadius + 0.12, 1.18);
+    float spiral = time * 0.015 + 0.012 * sin(time * 0.7 + fi * 2.3);
+    float movingGrid = (angle / TAU - time * omega) * count;
+    float cell = floor(movingGrid);
+    float seed = hash12(vec2(cell + fi * 29.0, fi * 13.7));
+    float center = 0.2 + 0.6 * hash12(vec2(cell * 1.91, fi + 4.0));
+    float tangent = (fract(movingGrid) - center) * TAU * orbitRadius / count;
+    float radialJitter = (hash12(vec2(cell + 55.0, fi * 5.0)) - 0.5) * 0.019;
+    float radial = r - max(orbitRadius - spiral * (0.15 + fi * 0.04), 0.022) - radialJitter;
+    float size = mix(0.0014, 0.0034, seed);
+    float active = smoothstep(0.995 - min(density, 1.0) * 0.755, 1.0, seed);
+    active += max(density - 1.0, 0.0) * 0.40;
+    float d = length(vec2(radial, tangent * 1.25)) / size;
+    float mote = exp(-d * d * 1.8) * active;
+    motes += mote;
+    glints += mote * pow(seed, 7.0);
+  }
+
+  float inside = 1.0 - smoothstep(0.245, 0.275, r);
+  return vec2(motes, glints) * inside;
+}
+
+float orbitingArc(
+  vec2 p,
+  float baseRadius,
+  float head,
+  float width,
+  float arcLength,
+  float phase
+) {
+  float r = length(p);
+  float angle = atan(p.y, p.x);
+  float warpedRadius = baseRadius + 0.014 * sin(angle * 3.0 + phase);
+  float radial = exp(-pow((r - warpedRadius) / width, 2.0));
+  float angular = exp(-pow(abs(angleDelta(angle, head)) / arcLength, 4.0));
+  float filament = 0.72 + 0.28 * sin(angle * 38.0 - phase * 3.0);
+  return radial * angular * filament;
 }
 
 vec3 redRamp(float energy) {
@@ -147,6 +243,15 @@ void main() {
   float corona = exp(-max(r - horizon, 0.0) * (9.2 - 2.4 * uGlow));
   corona *= (0.23 + 0.22 * turbulence) * (1.0 - smoothstep(horizon, 0.88, r));
 
+  vec2 orbitDust = orbitalParticles(p, t, uParticles);
+  vec2 memoryDust = memoryParticles(p, t, uParticles);
+
+  // Three offset filaments orbit at different radii and angular velocities.
+  float arcOne = orbitingArc(p, 0.372, t * 0.72 + 0.35, 0.0048, 0.88, t * 0.22);
+  float arcTwo = orbitingArc(p, 0.438, -t * 0.43 - 1.5, 0.0034, 0.67, 2.2 - t * 0.17);
+  float arcThree = orbitingArc(p, 0.535, t * 0.27 + 2.65, 0.0027, 0.48, 4.7 + t * 0.11);
+  float orbitingLight = (arcOne * 0.48 + arcTwo * 0.31 + arcThree * 0.18) * uParticles;
+
   vec3 background = vec3(0.0045, 0.004, 0.007);
   float vignette = 1.0 - smoothstep(0.32, 1.52, length(p * vec2(0.82, 1.0)));
   background *= 0.52 + 0.48 * vignette;
@@ -165,7 +270,10 @@ void main() {
     ringGlow * 0.31 * uGlow +
     upperArc * 0.24 +
     lowerArc * 0.16 +
-    corona * uGlow;
+    corona * uGlow +
+    orbitDust.x * 0.18 * uParticles +
+    orbitDust.y * 0.72 * uParticles +
+    orbitingLight;
 
   vec3 color = background + redRamp(energy) * energy;
 
@@ -176,6 +284,11 @@ void main() {
   // The shadow is applied last, so no noisy light leaks into the black-hole core.
   float shadow = 1.0 - smoothstep(horizon - 0.0025, horizon + 0.0025, r);
   color = mix(color, vec3(0.0003, 0.00025, 0.0005), shadow);
+
+  // Memory particles are added after the physical shadow pass by design. Their
+  // low red values keep the core perceptually black while making motion legible.
+  color += vec3(0.070, 0.006, 0.011) * memoryDust.x * uParticles;
+  color += vec3(0.48, 0.055, 0.045) * memoryDust.y * uParticles;
 
   // ACES-inspired compression keeps the white-hot regions from clipping flat.
   color = color * (2.51 * color + 0.03) / (color * (2.43 * color + 0.59) + 0.14);
@@ -194,6 +307,7 @@ const uniforms = {
   time: gl.getUniformLocation(program, "uTime"),
   gravity: gl.getUniformLocation(program, "uGravity"),
   glow: gl.getUniformLocation(program, "uGlow"),
+  particles: gl.getUniformLocation(program, "uParticles"),
 };
 
 const vertexArray = gl.createVertexArray();
@@ -309,6 +423,7 @@ function render(now) {
   gl.uniform1f(uniforms.time, elapsed);
   gl.uniform1f(uniforms.gravity, Number(controls.gravity.value));
   gl.uniform1f(uniforms.glow, Number(controls.glow.value));
+  gl.uniform1f(uniforms.particles, Number(controls.particles.value));
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   animationFrame = requestAnimationFrame(render);

@@ -612,12 +612,16 @@ private struct AppUsageTimeline: View {
                     AppUsageSegmentView(
                         run: run,
                         width: drawnWidth,
-                        height: tuning.timelineSegmentHeight
+                        height: run.isIdle ? 7 : tuning.timelineSegmentHeight
                     )
-                    .frame(width: run.width, alignment: .leading)
+                    .frame(
+                        width: run.width,
+                        height: tuning.timelineSegmentHeight,
+                        alignment: .center
+                    )
                     .help(
                         run.isIdle
-                            ? "休眠 · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
                             : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
                     )
                 }
@@ -626,7 +630,7 @@ private struct AppUsageTimeline: View {
             .contentShape(Rectangle())
             .gesture(
                 SpatialTapGesture().onEnded { value in
-                    onSelectMs(layout.ms(x: value.location.x))
+                    onSelectMs(layout.snapToRecordedMs(layout.ms(x: value.location.x)))
                 }
             )
 
@@ -665,19 +669,19 @@ private struct AppUsageSegmentView: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
+            RoundedRectangle(cornerRadius: run.isIdle ? 3 : 9, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: run.isIdle
-                            ? [Color.white.opacity(0.10), Color.white.opacity(0.04)]
+                            ? [Color.white.opacity(0.22), Color.white.opacity(0.10)]
                             : [color.opacity(0.92), color.opacity(0.62)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(.white.opacity(0.15), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: run.isIdle ? 3 : 9, style: .continuous)
+                        .stroke(.white.opacity(run.isIdle ? 0.20 : 0.15), lineWidth: 1)
                 }
 
             if width >= 42, !run.isIdle {

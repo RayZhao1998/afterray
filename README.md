@@ -175,9 +175,14 @@ swift run afterray-visual-lab
 ```
 
 The Visual Lab includes empty, short, long-day, processing, and favorites
-scenarios plus live controls for timeline scale, opacity, glow, and related
-presentation values. See [the Visual Lab workflow](docs/visual-lab-workflow.md)
+scenarios plus a Settings surface for iterating the settings page without
+opening the full overlay. See [the Visual Lab workflow](docs/visual-lab-workflow.md)
 for details.
+
+Logs append to `.afterray/logs/afterray.log` in a development checkout, or
+`~/Library/Logs/AfterRay/afterray.log` in a packaged build. Override with
+`AFTERRAY_LOG_DIR`. Settings → Diagnostics can reveal the folder or copy a
+report.
 
 ## Development
 

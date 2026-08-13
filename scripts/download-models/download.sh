@@ -19,10 +19,9 @@ want() {
   [ -z "$download_only" ] || [ "$download_only" = "$1" ]
 }
 
-for executable in curl ffmpeg llama-embedding python3; do
+for executable in curl python3; do
   if ! command -v "$executable" >/dev/null 2>&1; then
-    echo "error: $executable is required by AfterRay's local model runtime" >&2
-    echo "Install native tools with: brew install ffmpeg llama.cpp" >&2
+    echo "error: $executable is required to download AfterRay models" >&2
     exit 1
   fi
 done

@@ -40,6 +40,8 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_: Notification) {
+        AfterRayLog.install()
+        AfterRayLog.info("application launched")
         installAppMenu()
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()

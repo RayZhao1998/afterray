@@ -1,15 +1,26 @@
-# AfterRay V0 Visual Lab
+# AfterRay Visual Lab
 
 > 状态：Active  
 > 目标：像 Storybook 一样，用 mock 数据快速迭代 V0 的水平回溯组件。
 
 ## 1. 只解决一个问题
 
-Visual Lab 只用于调试：
+Visual Lab 用于不启动完整 App、不申请权限、不碰真实 vault 的情况下迭代 UI。
 
-> 左右拖拽时，用户能否清楚、顺滑且有视觉记忆点地回到另一个时刻？
+当前两个 surface：
 
-它不实现 Month/Day 层级、onboarding、会议检测、权限流程、付费状态或完整产品导航。
+- **Recall**：水平回溯手感。
+- **Settings**：设置页分区、模型下载状态和诊断文案。
+
+```sh
+make visual-lab          # Recall surface
+make settings-lab        # Settings surface, AI Models page
+# or: swift run afterray-visual-lab -- --settings --models
+```
+
+设置 Lab 使用 `SettingsPreviewModel`：Qwen3 默认缺失，点 Download 只是预览状态，不会真的拉模型。主 App 才走真实 `download.sh`。
+
+迭代设置页时只改 `AfterRaySettingsChrome.swift`，然后重新 `make settings-lab`。不需要 `make dev`，也不用反复打开 overlay。
 
 ## 2. 工程关系
 

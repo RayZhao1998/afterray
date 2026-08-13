@@ -17,6 +17,8 @@ final class DaemonSupervisor {
             .deletingLastPathComponent()
             .appendingPathComponent("mlx-runtime", isDirectory: true)
     }
+
+    var repositoryRoot: URL? { Self.developmentRepoRoot() }
     private var process: Process?
     private var processOutput: DaemonOutputBuffer?
     private var recoveryTask: Task<Bool, Error>?
@@ -320,6 +322,9 @@ private final class DaemonOutputBuffer: @unchecked Sendable {
                 return
             }
             self?.append(chunk)
+            if let text = String(data: chunk, encoding: .utf8) {
+                AfterRayLog.appendRaw(text, source: "afterrayd")
+            }
         }
         return pipe
     }

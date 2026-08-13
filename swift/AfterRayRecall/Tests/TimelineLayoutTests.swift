@@ -201,6 +201,32 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertLessThan(idleVisualShare, 0.85, "hour-long lock must not dominate the timeline")
     }
 
+    func testScrubAndClickSkipIdleGaps() {
+        let moments = [
+            moment(id: "s1", at: 0, app: "Safari", bundle: "safari"),
+            moment(id: "x1", at: 3_600_000, app: "Xcode", bundle: "xcode"),
+        ]
+        let layout = TimelineLayout(moments: moments, viewportWidth: 1_000, density: 0.12)
+        XCTAssertEqual(layout.snapToRecordedMs(60_000, preferring: -1), 0)
+        XCTAssertEqual(layout.snapToRecordedMs(60_000, preferring: 1), 3_600_000)
+
+        let forward = RecallPlayhead.move(
+            playheadMs: 0,
+            isLive: false,
+            deltaX: -400,
+            layout: layout
+        )
+        XCTAssertEqual(forward.playheadMs, 3_600_000)
+
+        let backward = RecallPlayhead.move(
+            playheadMs: 3_600_000,
+            isLive: false,
+            deltaX: 400,
+            layout: layout
+        )
+        XCTAssertEqual(backward.playheadMs, 0)
+    }
+
     func testResolveIsNilInsideIdleGap() {
         let moments = [
             moment(id: "s1", at: 0, app: "Safari", bundle: "safari"),

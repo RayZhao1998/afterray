@@ -162,6 +162,21 @@ public struct TimelineLayout: Equatable, Sendable {
         min(max(playheadMs, startMs), endMs)
     }
 
+    /// `direction` < 0 prefers the recorded moment before an idle gap,
+    /// > 0 prefers the moment after, 0 picks the nearer edge.
+    public func snapToRecordedMs(_ playheadMs: Int64, preferring direction: Int = 0) -> Int64 {
+        guard let run = run(containingMs: playheadMs), run.isIdle else {
+            return playheadMs
+        }
+        let previous = moments[run.startIndex].capturedAtMs
+        let nextIndex = run.startIndex + 1
+        guard nextIndex < moments.count else { return previous }
+        let next = moments[nextIndex].capturedAtMs
+        if direction < 0 { return previous }
+        if direction > 0 { return next }
+        return abs(playheadMs - previous) <= abs(next - playheadMs) ? previous : next
+    }
+
     private struct RawRun {
         let id: Int
         let identity: AppUsageIdentity
@@ -280,7 +295,8 @@ public enum RecallPlayhead {
         if ms >= layout.endMs {
             return (layout.moments[layout.moments.count - 1].capturedAtMs, true)
         }
-        return (ms, false)
+        let recorded = layout.snapToRecordedMs(ms, preferring: deltaX > 0 ? -1 : 1)
+        return (recorded, false)
     }
 
     public static func stepMoment(
