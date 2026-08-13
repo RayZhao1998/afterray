@@ -59,6 +59,12 @@ pub enum Request {
         query: String,
         limit: usize,
     },
+    ActivitySpans {
+        from_ms: i64,
+        to_ms: i64,
+        #[serde(default = "default_activity_spans_limit")]
+        limit: usize,
+    },
     ModelsStatus,
     JobsList,
     JobRetry {
@@ -191,6 +197,12 @@ pub struct Moment {
     pub application_name: Option<String>,
     pub bundle_identifier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gop: Option<GopRef>,
     #[serde(default = "default_still_origin")]
     pub still_origin: String,
@@ -198,6 +210,30 @@ pub struct Moment {
 
 fn default_still_origin() -> String {
     "capture".to_owned()
+}
+
+fn default_activity_spans_limit() -> usize {
+    100
+}
+
+/// Consecutive moments that share an app identity and the same URL, document,
+/// or window title. Derived at query time; not a persisted table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivitySpan {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub duration_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    pub moment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -463,6 +499,30 @@ mod tests {
     }
 
     #[test]
+    fn activity_spans_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::ActivitySpans {
+            from_ms: 10,
+            to_ms: 20,
+            limit: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"activity_spans","from_ms":10,"to_ms":20,"limit":5}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"activity_spans","from_ms":1,"to_ms":2}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::ActivitySpans {
+                from_ms: 1,
+                to_ms: 2,
+                limit: 100
+            }
+        ));
+    }
+
+    #[test]
     fn ask_answer_defaults_missing_model_flag() {
         let parsed: AskAnswer = serde_json::from_str(r#"{"answer":"ok","citations":[]}"#).unwrap();
         assert_eq!(parsed.answer, "ok");
@@ -482,6 +542,40 @@ mod tests {
             "day span should be ~24h, got {span}ms"
         );
         assert_eq!(local_calendar_day_bounds_ms(now), (start, end));
+    }
+
+    #[test]
+    fn moment_new_activity_fields_default_when_omitted() {
+        let moment: Moment = serde_json::from_str(
+            r#"{"id":"m1","session_id":"s1","captured_at_ms":1,"is_favorite":false}"#,
+        )
+        .unwrap();
+        assert!(moment.window_title.is_none());
+        assert!(moment.url.is_none());
+        assert!(moment.document.is_none());
+        let encoded = serde_json::to_value(&moment).unwrap();
+        assert!(encoded.get("window_title").is_none());
+        assert!(encoded.get("url").is_none());
+        assert!(encoded.get("document").is_none());
+    }
+
+    #[test]
+    fn activity_span_round_trip_preserves_duration() {
+        let span = ActivitySpan {
+            start_ms: 0,
+            end_ms: 1_560_000,
+            duration_ms: 1_560_000,
+            application_name: Some("Safari".into()),
+            bundle_identifier: Some("com.apple.Safari".into()),
+            window_title: Some("Example Domain".into()),
+            url: Some("https://example.com/".into()),
+            document: None,
+            moment_ids: vec!["m1".into(), "m2".into()],
+        };
+        let json = serde_json::to_string(&span).unwrap();
+        let decoded: ActivitySpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, span);
+        assert!(!json.contains("document"));
     }
 
     #[test]

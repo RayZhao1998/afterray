@@ -70,6 +70,17 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.accessibilityArtifactId, "ax1")
         XCTAssertEqual(moment.applicationName, "Xcode")
         XCTAssertEqual(moment.bundleIdentifier, "com.apple.dt.Xcode")
+        XCTAssertNil(moment.windowTitle)
+        XCTAssertNil(moment.url)
+        XCTAssertNil(moment.document)
+    }
+
+    func testMomentDecodesActivityContextFields() throws {
+        let json = #"{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false,"application_name":"Safari","bundle_identifier":"com.apple.Safari","window_title":"Example Domain","url":"https://example.com/","document":"file:///tmp/Notes.txt"}"#
+        let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))
+        XCTAssertEqual(moment.windowTitle, "Example Domain")
+        XCTAssertEqual(moment.url, "https://example.com/")
+        XCTAssertEqual(moment.document, "file:///tmp/Notes.txt")
     }
 
     func testMomentDecodesGopAndNullableStill() throws {

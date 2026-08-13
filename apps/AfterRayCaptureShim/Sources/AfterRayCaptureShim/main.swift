@@ -209,13 +209,30 @@ private struct AccessibilityNode: Encodable {
     let identifier: String?
     let value: String?
     let valueRedacted: Bool
+    let url: String?
+    let document: String?
     let frame: AccessibilityFrame?
     let children: [AccessibilityNode]
 
     enum CodingKeys: String, CodingKey {
-        case role, subrole, title, identifier, value, frame, children
+        case role, subrole, title, identifier, value, url, document, frame, children
         case nodeDescription = "description"
         case valueRedacted = "value_redacted"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(role, forKey: .role)
+        try container.encodeIfPresent(subrole, forKey: .subrole)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(nodeDescription, forKey: .nodeDescription)
+        try container.encodeIfPresent(identifier, forKey: .identifier)
+        try container.encodeIfPresent(value, forKey: .value)
+        try container.encode(valueRedacted, forKey: .valueRedacted)
+        try container.encodeIfPresent(url, forKey: .url)
+        try container.encodeIfPresent(document, forKey: .document)
+        try container.encodeIfPresent(frame, forKey: .frame)
+        try container.encode(children, forKey: .children)
     }
 }
 
@@ -224,6 +241,9 @@ private struct AccessibilitySnapshot: Encodable {
     let processId: Int32
     let bundleIdentifier: String?
     let applicationName: String?
+    let windowTitle: String?
+    let url: String?
+    let document: String?
     let truncated: Bool
     let root: AccessibilityNode
 
@@ -232,7 +252,8 @@ private struct AccessibilitySnapshot: Encodable {
         case processId = "process_id"
         case bundleIdentifier = "bundle_identifier"
         case applicationName = "application_name"
-        case truncated, root
+        case windowTitle = "window_title"
+        case url, document, truncated, root
     }
 }
 
@@ -241,6 +262,10 @@ private final class AccessibilityTreeEncoder {
     private var nodeCount = 0
     private var visited = Set<CFHashCode>()
     private(set) var truncated = false
+    private(set) var url: String?
+    private(set) var document: String?
+    private(set) var windowTitle: String?
+    private var foundWebURL = false
 
     func encode(_ element: AXUIElement) -> AccessibilityNode {
         nodeCount += 1
@@ -255,23 +280,32 @@ private final class AccessibilityTreeEncoder {
                 identifier: nil,
                 value: nil,
                 valueRedacted: false,
+                url: nil,
+                document: nil,
                 frame: nil,
                 children: []
             )
         }
 
+        let role = string(element, kAXRoleAttribute)
         let subrole = string(element, kAXSubroleAttribute)
         let secure = subrole == "AXSecureTextField"
+        let title = string(element, kAXTitleAttribute)
+        let nodeURL = secure ? nil : firstLocation(element, Self.urlAttributeNames)
+        let nodeDocument = secure ? nil : normalizedDocument(firstLocation(element, Self.documentAttributeNames))
+        considerActivityContext(role: role, title: title, url: nodeURL, document: nodeDocument)
         let children = (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [])
             .map(encode)
         return AccessibilityNode(
-            role: string(element, kAXRoleAttribute),
+            role: role,
             subrole: subrole,
-            title: string(element, kAXTitleAttribute),
+            title: title,
             nodeDescription: string(element, kAXDescriptionAttribute),
             identifier: string(element, kAXIdentifierAttribute),
             value: secure ? nil : scalarString(attribute(element, kAXValueAttribute)),
             valueRedacted: secure,
+            url: nodeURL.flatMap(classifiedURL),
+            document: nodeDocument,
             frame: frame(element),
             children: children
         )
@@ -293,6 +327,68 @@ private final class AccessibilityTreeEncoder {
         if let string = value as? String { return string }
         if let number = value as? NSNumber { return number.stringValue }
         return nil
+    }
+
+    private static let urlAttributeNames = [
+        kAXURLAttribute as String,
+        "AXURL",
+        "URL",
+        "AXAddress",
+    ]
+    private static let documentAttributeNames = [
+        kAXDocumentAttribute as String,
+        "AXDocument",
+        "Document",
+    ]
+
+    private func considerActivityContext(role: String?, title: String?, url: String?, document: String?) {
+        if windowTitle == nil, isWindowRole(role), let title, !title.isEmpty {
+            windowTitle = title
+        }
+        if let url {
+            if looksLikeFileLocation(url) {
+                if self.document == nil {
+                    self.document = normalizedDocument(url)
+                }
+            } else if isDocumentLikeRole(role) {
+                if !foundWebURL {
+                    self.url = url
+                    foundWebURL = true
+                }
+            } else if self.url == nil {
+                self.url = url
+            }
+        }
+        if self.document == nil, let document {
+            self.document = document
+        }
+    }
+
+    private func firstLocation(_ element: AXUIElement, _ names: [String]) -> String? {
+        for name in names {
+            if let value = locationString(attribute(element, name)) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func locationString(_ value: AnyObject?) -> String? {
+        guard let value else { return nil }
+        if let url = value as? URL {
+            return nonempty(url.absoluteString)
+        }
+        if let url = value as? NSURL {
+            return nonempty(url.absoluteString)
+        }
+        if CFGetTypeID(value) == CFURLGetTypeID() {
+            return nonempty((value as! CFURL as URL).absoluteString)
+        }
+        return nonempty(scalarString(value))
+    }
+
+    private func classifiedURL(_ value: String) -> String? {
+        looksLikeFileLocation(value) ? nil : nonempty(value)
     }
 
     private func frame(_ element: AXUIElement) -> AccessibilityFrame? {
@@ -317,6 +413,34 @@ private final class AccessibilityTreeEncoder {
     }
 }
 
+private func isWindowRole(_ role: String?) -> Bool {
+    role == "AXWindow" || role == "AXStandardWindow"
+}
+
+private func isDocumentLikeRole(_ role: String?) -> Bool {
+    role == "AXWebArea" || role == "AXBrowser" || role == "AXWebDocument" || role == "AXDocument"
+}
+
+private func looksLikeFileLocation(_ value: String) -> Bool {
+    value.hasPrefix("file://") || (value.hasPrefix("/") && !value.hasPrefix("//"))
+}
+
+private func normalizedDocument(_ value: String?) -> String? {
+    guard let value = nonempty(value) else { return nil }
+    if value.hasPrefix("http://") || value.hasPrefix("https://") { return nil }
+    if value.hasPrefix("file://") { return value }
+    if value.hasPrefix("/") {
+        return URL(fileURLWithPath: value).absoluteString
+    }
+    return value
+}
+
+private func nonempty(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+}
+
 private func captureAccessibilityTree(
     requestId: String,
     capturedAtMs: Int64,
@@ -327,13 +451,21 @@ private func captureAccessibilityTree(
         events.send(.warning(code: "ax_no_frontmost_app", message: "No foreground application was available"))
         return
     }
+    let appElement = AXUIElementCreateApplication(application.processIdentifier)
     let encoder = AccessibilityTreeEncoder()
-    let root = encoder.encode(AXUIElementCreateApplication(application.processIdentifier))
+    let root = encoder.encode(appElement)
     let snapshot = AccessibilitySnapshot(
         capturedAtMs: capturedAtMs,
         processId: application.processIdentifier,
         bundleIdentifier: application.bundleIdentifier,
         applicationName: application.localizedName,
+        windowTitle: frontWindowTitle(
+            appElement: appElement,
+            processId: application.processIdentifier,
+            treeTitle: encoder.windowTitle
+        ),
+        url: encoder.url,
+        document: encoder.document,
         truncated: encoder.truncated,
         root: root
     )
@@ -372,6 +504,53 @@ private func capturedForegroundApplication() -> NSRunningApplication? {
             application.activationPolicy == .regular
         else { continue }
         return application
+    }
+    return nil
+}
+
+private func frontWindowTitle(appElement: AXUIElement, processId: pid_t, treeTitle: String?) -> String? {
+    if let focused = axElement(appElement, kAXFocusedWindowAttribute),
+       let title = nonempty(axString(focused, kAXTitleAttribute))
+    {
+        return title
+    }
+    if let main = axElement(appElement, kAXMainWindowAttribute),
+       let title = nonempty(axString(main, kAXTitleAttribute))
+    {
+        return title
+    }
+    if let treeTitle { return treeTitle }
+    return cgWindowName(for: processId)
+}
+
+private func axAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+        return nil
+    }
+    return value
+}
+
+private func axString(_ element: AXUIElement, _ name: String) -> String? {
+    axAttribute(element, name) as? String
+}
+
+private func axElement(_ element: AXUIElement, _ name: String) -> AXUIElement? {
+    axAttribute(element, name).map { $0 as! AXUIElement }
+}
+
+private func cgWindowName(for processId: pid_t) -> String? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+    for window in windows {
+        guard
+            (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processId,
+            (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+            let name = nonempty(window[kCGWindowName as String] as? String)
+        else { continue }
+        return name
     }
     return nil
 }

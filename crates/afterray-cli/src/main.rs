@@ -44,6 +44,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    Activity {
+        #[arg(long)]
+        from_ms: i64,
+        #[arg(long)]
+        to_ms: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     Favorite {
         #[command(subcommand)]
         command: FavoriteCommand,
@@ -172,6 +180,15 @@ async fn request_from_command(
             since_ms: Some(since_ms),
         } => Request::TimelineSince { since_ms },
         Command::Search { query, limit } => Request::Search { query, limit },
+        Command::Activity {
+            from_ms,
+            to_ms,
+            limit,
+        } => Request::ActivitySpans {
+            from_ms,
+            to_ms,
+            limit,
+        },
         Command::Favorite {
             command: FavoriteCommand::Add { moment_id },
         } => Request::FavoriteSet {
