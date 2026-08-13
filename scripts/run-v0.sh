@@ -267,6 +267,10 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_ASR_MODEL
     AFTERRAY_EMBEDDING_MODEL
     AFTERRAY_LLM_MODEL
+    AFTERRAY_GOP_ARCHIVE
+    AFTERRAY_GOP_KEEP_STILLS
+    AFTERRAY_GOP_KEYINT
+    AFTERRAY_GOP_REQUIRE_AC
     PATH
   )
   for variable_name in "${launch_environment[@]}"; do

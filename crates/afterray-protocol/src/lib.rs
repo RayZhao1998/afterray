@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +38,18 @@ pub enum Request {
     },
     ReadArtifact {
         artifact_id: String,
+    },
+    ReadGopSegment {
+        segment_id: String,
+    },
+    ReadGopFrame {
+        segment_id: String,
+        index: u16,
+        mode: GopReadMode,
+    },
+    PackStatus,
+    GopShow {
+        segment_id: String,
     },
     FavoriteSet {
         moment_id: String,
@@ -161,7 +173,8 @@ pub struct Moment {
     pub id: String,
     pub session_id: String,
     pub captured_at_ms: i64,
-    pub image_artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_artifact_id: Option<String>,
     pub is_favorite: bool,
     pub ocr_text: Option<String>,
     pub transcript_text: Option<String>,
@@ -170,6 +183,66 @@ pub struct Moment {
     pub accessibility_artifact_id: Option<String>,
     pub application_name: Option<String>,
     pub bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gop: Option<GopRef>,
+    #[serde(default = "default_still_origin")]
+    pub still_origin: String,
+}
+
+fn default_still_origin() -> String {
+    "capture".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GopRef {
+    pub segment_id: String,
+    pub index: u16,
+    pub keyframe_index: u16,
+    pub frame_count: u16,
+    pub codec: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GopReadMode {
+    Poster,
+    Exact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackStatus {
+    pub archive_enabled: bool,
+    pub keep_stills: bool,
+    pub keyint: u16,
+    pub encoder: String,
+    pub hot_window_seconds: u64,
+    pub running_jobs: u64,
+    pub done_jobs: u64,
+    pub failed_jobs: u64,
+    pub ready_segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GopSegmentView {
+    pub id: String,
+    pub artifact_id: String,
+    pub codec: String,
+    pub encoder: String,
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u16,
+    pub keyint: u16,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub status: String,
+    pub frames: Vec<GopFrameView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GopFrameView {
+    pub index: u16,
+    pub moment_id: String,
+    pub is_keyframe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +270,12 @@ pub struct ArtifactMeta {
     pub id: String,
     pub content_type: String,
     pub byte_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gop_index: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyframe_index: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +298,9 @@ impl ArtifactPayload {
             id: self.id.clone(),
             content_type: self.content_type.clone(),
             byte_length: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+            codec: None,
+            gop_index: None,
+            keyframe_index: None,
         }
     }
 

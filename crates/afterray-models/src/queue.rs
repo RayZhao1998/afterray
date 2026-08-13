@@ -156,6 +156,14 @@ impl ModelQueue {
         })
     }
 
+    #[must_use]
+    pub fn ocr_in_flight(&self) -> bool {
+        self.inner
+            .semaphores
+            .get(&ModelCapability::Ocr)
+            .is_some_and(|semaphore| semaphore.available_permits() == 0)
+    }
+
     /// Enqueues a typed inference job and starts processing it in the background.
     ///
     /// # Errors

@@ -1,0 +1,17 @@
+[package]
+name = "afterray-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Closed-GOP AV1 encoder (rav1e) emitting IVF for the AfterRay cold archive"
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+zune-jpeg = "0.4"
+# `asm` is allowed here even though workspace crates deny `unsafe_code`.
+rav1e = { version = "0.7.1", default-features = false, features = ["asm", "threading"] }
+
+[lints]
+workspace = true

@@ -22,8 +22,10 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let sessionId: String
     public let capturedAtMs: Int64
-    public let imageArtifactId: String
+    public let imageArtifactId: String?
     public var isFavorite: Bool
+    public let gop: RecallGopRef?
+    public let stillOrigin: String
     public let ocrText: String?
     public let transcriptText: String?
 
@@ -38,8 +40,10 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         id: String,
         sessionId: String,
         capturedAtMs: Int64,
-        imageArtifactId: String,
+        imageArtifactId: String? = nil,
         isFavorite: Bool = false,
+        gop: RecallGopRef? = nil,
+        stillOrigin: String = "capture",
         ocrText: String? = nil,
         transcriptText: String? = nil,
         audioArtifactId: String? = nil,
@@ -53,6 +57,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.capturedAtMs = capturedAtMs
         self.imageArtifactId = imageArtifactId
         self.isFavorite = isFavorite
+        self.gop = gop
+        self.stillOrigin = stillOrigin
         self.ocrText = ocrText
         self.transcriptText = transcriptText
         self.audioArtifactId = audioArtifactId
@@ -73,6 +79,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case capturedAtMs = "captured_at_ms"
         case imageArtifactId = "image_artifact_id"
         case isFavorite = "is_favorite"
+        case gop
+        case stillOrigin = "still_origin"
         case ocrText = "ocr_text"
         case transcriptText = "transcript_text"
         case audioArtifactId = "audio_artifact_id"
@@ -80,6 +88,60 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case accessibilityArtifactId = "accessibility_artifact_id"
         case applicationName = "application_name"
         case bundleIdentifier = "bundle_identifier"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        capturedAtMs = try container.decode(Int64.self, forKey: .capturedAtMs)
+        imageArtifactId = try container.decodeIfPresent(String.self, forKey: .imageArtifactId)
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+        gop = try container.decodeIfPresent(RecallGopRef.self, forKey: .gop)
+        stillOrigin = try container.decodeIfPresent(String.self, forKey: .stillOrigin) ?? "capture"
+        ocrText = try container.decodeIfPresent(String.self, forKey: .ocrText)
+        transcriptText = try container.decodeIfPresent(String.self, forKey: .transcriptText)
+        audioArtifactId = try container.decodeIfPresent(String.self, forKey: .audioArtifactId)
+        audioStartedAtMs = try container.decodeIfPresent(Int64.self, forKey: .audioStartedAtMs)
+        accessibilityArtifactId = try container.decodeIfPresent(String.self, forKey: .accessibilityArtifactId)
+        applicationName = try container.decodeIfPresent(String.self, forKey: .applicationName)
+        bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+    }
+
+    public var displayCacheKey: String {
+        if let imageArtifactId { return imageArtifactId }
+        if let gop { return "gop:\(gop.segmentId)#\(gop.index)" }
+        return id
+    }
+}
+
+public struct RecallGopRef: Codable, Equatable, Sendable {
+    public let segmentId: String
+    public let index: UInt16
+    public let keyframeIndex: UInt16
+    public let frameCount: UInt16
+    public let codec: String
+
+    public init(
+        segmentId: String,
+        index: UInt16,
+        keyframeIndex: UInt16 = 0,
+        frameCount: UInt16,
+        codec: String = "av01"
+    ) {
+        self.segmentId = segmentId
+        self.index = index
+        self.keyframeIndex = keyframeIndex
+        self.frameCount = frameCount
+        self.codec = codec
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case segmentId = "segment_id"
+        case index
+        case keyframeIndex = "keyframe_index"
+        case frameCount = "frame_count"
+        case codec
     }
 }
 

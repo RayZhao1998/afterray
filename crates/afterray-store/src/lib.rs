@@ -40,11 +40,16 @@ use std::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod gop;
 mod jpeg;
 
+pub use gop::{
+    GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
+    PackPolicy, fold_pack_runs,
+};
 pub use jpeg::jpeg_pixel_size;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -75,6 +80,10 @@ pub enum StoreError {
     KeyProvider(String),
     #[error("invalid embedding: {0}")]
     InvalidEmbedding(String),
+    #[error("gop segment not found: {0}")]
+    GopNotFound(String),
+    #[error("gop commit raced with retention")]
+    GopStale,
 }
 
 pub trait KeyProvider: Send + Sync {
@@ -340,7 +349,7 @@ impl Vault {
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
         set_database_file_permissions(&database_path)?;
-        Ok(Self {
+        let vault = Self {
             connection: Mutex::new(connection),
             artifacts_dir,
             artifact_wrap_key: Zeroizing::new(blake3::derive_key(
@@ -350,7 +359,9 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
             max_unstarred_moments: config.max_unstarred_moments,
-        })
+        };
+        let _ = vault.rollback_orphan_gops();
+        Ok(vault)
     }
 
     pub fn create_session_sync(&self, started_at_ms: i64) -> Result<Session, StoreError> {
@@ -438,7 +449,11 @@ impl Vault {
                       LIMIT 1),
                     m.accessibility_artifact_id,
                     m.application_name,
-                    m.bundle_identifier
+                    m.bundle_identifier,
+                    m.gop_segment_id,
+                    m.gop_index,
+                    m.still_origin,
+                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
              FROM moments m WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
         )?;
         let rows = statement.query_map([session_id], moment_from_row)?;
@@ -474,7 +489,11 @@ impl Vault {
                       LIMIT 1),
                     m.accessibility_artifact_id,
                     m.application_name,
-                    m.bundle_identifier
+                    m.bundle_identifier,
+                    m.gop_segment_id,
+                    m.gop_index,
+                    m.still_origin,
+                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
              FROM moments m ORDER BY m.captured_at_ms, m.id",
         )?;
         let rows = statement.query_map([], moment_from_row)?;
@@ -510,7 +529,11 @@ impl Vault {
                       LIMIT 1),
                     m.accessibility_artifact_id,
                     m.application_name,
-                    m.bundle_identifier
+                    m.bundle_identifier,
+                    m.gop_segment_id,
+                    m.gop_index,
+                    m.still_origin,
+                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
              FROM moments m
              WHERE m.captured_at_ms >= ?1
              ORDER BY m.captured_at_ms, m.id",
@@ -535,7 +558,7 @@ impl Vault {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.to_owned(),
             captured_at_ms,
-            image_artifact_id: artifact_id.clone(),
+            image_artifact_id: Some(artifact_id.clone()),
             is_favorite: false,
             ocr_text: None,
             transcript_text: None,
@@ -544,6 +567,8 @@ impl Vault {
             accessibility_artifact_id: None,
             application_name: None,
             bundle_identifier: None,
+            gop: None,
+            still_origin: "capture".to_owned(),
         };
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO moments
@@ -559,7 +584,7 @@ impl Vault {
             ],
         );
         if let Err(error) = result {
-            let _ = self.delete_artifact_record_and_file(&moment.image_artifact_id);
+            let _ = self.delete_artifact_record_and_file(&artifact_id);
             return Err(error.into());
         }
         self.enforce_retention()?;
@@ -707,7 +732,7 @@ impl Vault {
 
     pub fn delete_moment_and_artifacts(&self, moment_id: &str) -> Result<(), StoreError> {
         let connection = self.connection.lock().unwrap();
-        let artifacts: (String, Option<String>) = connection.query_row(
+        let artifacts: (Option<String>, Option<String>) = connection.query_row(
             "SELECT image_artifact_id, accessibility_artifact_id FROM moments WHERE id = ?1",
             [moment_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -719,7 +744,9 @@ impl Vault {
         )?;
         connection.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
         drop(connection);
-        self.delete_artifact_record_and_file(&artifacts.0)?;
+        if let Some(image) = artifacts.0 {
+            self.delete_artifact_record_and_file(&image)?;
+        }
         if let Some(accessibility) = artifacts.1 {
             self.delete_artifact_record_and_file(&accessibility)?;
         }
@@ -1129,6 +1156,7 @@ impl Vault {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
         let max = i64::try_from(self.max_unstarred_moments).unwrap_or(i64::MAX);
         let mut connection = self.connection.lock().unwrap();
@@ -1152,25 +1180,48 @@ impl Vault {
                 .query_map([excess], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let mut gop_artifact_ids = Vec::new();
         for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
             transaction.execute(
                 "DELETE FROM evidence_fts WHERE evidence_id IN
                  (SELECT id FROM text_evidence WHERE moment_id = ?1)",
                 [moment_id],
             )?;
+            transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
             transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            if let Some(artifact_id) = artifact_id {
+                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            }
             if let Some(accessibility_artifact_id) = accessibility_artifact_id {
                 transaction.execute(
                     "DELETE FROM artifacts WHERE id = ?1",
                     [accessibility_artifact_id],
                 )?;
+            }
+        }
+        let empty_segments: Vec<(String, Option<String>)> = {
+            let mut statement = transaction.prepare(
+                "SELECT id, artifact_id FROM gop_segments
+                  WHERE id NOT IN (
+                    SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
+                  )
+                  AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (segment_id, artifact_id) in &empty_segments {
+            transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+            if let Some(artifact_id) = artifact_id {
+                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                gop_artifact_ids.push(artifact_id.clone());
             }
         }
         let audio_candidates = {
@@ -1201,10 +1252,15 @@ impl Vault {
         transaction.commit()?;
         drop(connection);
         for (_, artifact_id, accessibility_artifact_id) in candidates {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            if let Some(artifact_id) = artifact_id {
+                let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            }
             if let Some(accessibility_artifact_id) = accessibility_artifact_id {
                 let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
             }
+        }
+        for artifact_id in gop_artifact_ids {
+            let _ = fs::remove_file(self.artifact_path(&artifact_id));
         }
         for (_, artifact_id) in audio_candidates {
             let _ = fs::remove_file(self.artifact_path(&artifact_id));
@@ -1420,6 +1476,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     )?;
     migrate_query_indexes(connection)?;
     migrate_schema_6(connection)?;
+    migrate_schema_7(connection)?;
     let has_accessibility_artifact = {
         let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
         statement
@@ -1577,6 +1634,59 @@ fn migrate_schema_6(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_schema_7(connection: &Connection) -> Result<(), StoreError> {
+    let not_null = {
+        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|(name, notnull)| name == "image_artifact_id" && notnull == 1)
+    };
+    if !not_null {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         CREATE TABLE moments_v7 (
+           id TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+           captured_at_ms INTEGER NOT NULL,
+           image_artifact_id TEXT REFERENCES artifacts(id),
+           is_favorite INTEGER NOT NULL DEFAULT 0,
+           accessibility_artifact_id TEXT REFERENCES artifacts(id),
+           application_name TEXT,
+           bundle_identifier TEXT,
+           gop_segment_id TEXT,
+           gop_index INTEGER,
+           still_origin TEXT NOT NULL DEFAULT 'capture',
+           width INTEGER,
+           height INTEGER
+         );
+         INSERT INTO moments_v7 (
+           id, session_id, captured_at_ms, image_artifact_id, is_favorite,
+           accessibility_artifact_id, application_name, bundle_identifier,
+           gop_segment_id, gop_index, still_origin, width, height
+         )
+         SELECT id, session_id, captured_at_ms, image_artifact_id, is_favorite,
+                accessibility_artifact_id, application_name, bundle_identifier,
+                gop_segment_id, gop_index,
+                COALESCE(still_origin, 'capture'), width, height
+           FROM moments;
+         DROP TABLE moments;
+         ALTER TABLE moments_v7 RENAME TO moments;
+         CREATE INDEX IF NOT EXISTS moments_session_time ON moments(session_id, captured_at_ms);
+         CREATE INDEX IF NOT EXISTS moments_gop ON moments(gop_segment_id, gop_index);
+         CREATE INDEX IF NOT EXISTS moments_hot_pack
+           ON moments(captured_at_ms, gop_segment_id, is_favorite);
+         CREATE INDEX IF NOT EXISTS moments_time_id ON moments(captured_at_ms, id);
+         PRAGMA foreign_keys = ON;",
+    )?;
+    Ok(())
+}
+
 fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS moments_time_id ON moments(captured_at_ms, id);
@@ -1604,6 +1714,22 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         accessibility_artifact_id: row.get(9)?,
         application_name: row.get(10)?,
         bundle_identifier: row.get(11)?,
+        gop: match (row.get::<_, Option<String>>(12)?, row.get::<_, Option<i64>>(13)?) {
+            (Some(segment_id), Some(index)) => Some(afterray_protocol::GopRef {
+                segment_id,
+                index: u16::try_from(index).unwrap_or(0),
+                keyframe_index: 0,
+                frame_count: row
+                    .get::<_, Option<i64>>(15)?
+                    .and_then(|count| u16::try_from(count).ok())
+                    .unwrap_or(0),
+                codec: "av01".to_owned(),
+            }),
+            _ => None,
+        },
+        still_origin: row
+            .get::<_, Option<String>>(14)?
+            .unwrap_or_else(|| "capture".to_owned()),
     })
 }
 
@@ -1964,7 +2090,7 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 2, "image/jpeg", b"private-screen-text")
             .unwrap();
-        let on_disk = fs::read(vault.artifact_path(&moment.image_artifact_id)).unwrap();
+        let on_disk = fs::read(vault.artifact_path(moment.image_artifact_id.as_deref().unwrap())).unwrap();
         assert_eq!(&on_disk[..4], ARTIFACT_MAGIC);
         assert!(
             !on_disk
@@ -1977,7 +2103,7 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT wrapped_key, wrapping_nonce FROM artifacts WHERE id = ?1",
-                [&moment.image_artifact_id],
+                [moment.image_artifact_id.as_deref().unwrap()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1988,7 +2114,7 @@ mod tests {
                 .windows(wrapped_key.len())
                 .any(|window| window == wrapped_key)
         );
-        let payload = vault.read_artifact(&moment.image_artifact_id).unwrap();
+        let payload = vault.read_artifact(moment.image_artifact_id.as_deref().unwrap()).unwrap();
         assert_eq!(payload.bytes, b"private-screen-text");
         drop(directory);
     }
@@ -2078,7 +2204,7 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 2, "image/jpeg", b"original")
             .unwrap();
-        let id = moment.image_artifact_id;
+        let id = moment.image_artifact_id.expect("still");
         let legacy = encrypt_legacy_for_test(&master_key, &id, "image/jpeg", b"legacy-secret");
         fs::remove_file(vault.artifact_path(&id)).unwrap();
         fs::write(vault.legacy_artifact_path(&id), legacy).unwrap();
@@ -2379,6 +2505,19 @@ mod tests {
             .unwrap();
         assert_eq!(has_idle, 1);
         assert_eq!(has_gop, 1);
+        let image_not_null: i64 = {
+            let mut statement = connection.prepare("PRAGMA table_info(moments)").unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|(name, _)| name == "image_artifact_id")
+                .map(|(_, notnull)| notnull)
+                .unwrap()
+        };
+        assert_eq!(image_not_null, 0);
     }
 
     #[test]
@@ -2421,6 +2560,118 @@ mod tests {
     }
 
     #[test]
+    fn commit_gop_then_retention_drops_a_live_index() {
+        let (_directory, vault) = test_vault(6);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let moment = vault
+                .insert_moment(&session.id, 10_000 * i64::from(index), "image/jpeg", &jpeg)
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    "text",
+                    10_000 * i64::from(index),
+                    None,
+                    "ocr",
+                )
+                .unwrap();
+            ids.push(moment.id);
+        }
+        let ivf = b"DKIF\0\0\0\0AV01fake-gop-bytes";
+        let frames: Vec<GopCommitFrame> = (0..6)
+            .map(|index| GopCommitFrame {
+                index,
+                is_keyframe: index == 0,
+                byte_offset: u32::from(index) * 10,
+                byte_length: 10,
+                content_hash: [index as u8; 32],
+            })
+            .collect();
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf,
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap();
+        let live = vault.live_gop_frames(&segment).unwrap();
+        assert_eq!(live.len(), 6);
+        vault
+            .insert_moment(&session.id, 80_000, "image/jpeg", &jpeg)
+            .unwrap();
+        let remaining = vault.live_gop_frames(&segment).unwrap();
+        assert_eq!(remaining.len(), 5);
+        assert!(remaining.iter().all(|frame| frame.moment_id != ids[0]));
+    }
+
+    #[test]
+    fn drop_unpinned_stills_nulls_jpeg_and_keeps_favorites() {
+        let (_directory, vault) = test_vault(20);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let moment = vault
+                .insert_moment(&session.id, 10_000 * i64::from(index), "image/jpeg", &jpeg)
+                .unwrap();
+            ids.push(moment.id);
+        }
+        vault.set_favorite(&ids[1], true).unwrap();
+        let frames: Vec<GopCommitFrame> = (0..3)
+            .map(|index| GopCommitFrame {
+                index,
+                is_keyframe: index == 0,
+                byte_offset: u32::from(index) * 8,
+                byte_length: 8,
+                content_hash: [index as u8; 32],
+            })
+            .collect();
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap();
+        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 2);
+        let moments = vault.moments_sync(&session.id).unwrap();
+        let by_id: std::collections::HashMap<_, _> = moments
+            .into_iter()
+            .map(|moment| (moment.id.clone(), moment))
+            .collect();
+        assert!(by_id[&ids[0]].image_artifact_id.is_none());
+        assert!(by_id[&ids[1]].image_artifact_id.is_some());
+        assert!(by_id[&ids[2]].image_artifact_id.is_none());
+        assert!(by_id[&ids[0]].gop.is_some());
+    }
+
+    #[test]
     fn loginwindow_accessibility_deletes_the_moment() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
@@ -2445,7 +2696,7 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM artifacts WHERE id = ?1",
-                [&moment.image_artifact_id],
+                [moment.image_artifact_id.as_deref().unwrap()],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap();

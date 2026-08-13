@@ -109,7 +109,7 @@ public struct RecallView: View {
         ZStack {
             if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
-                    artifactID: moment.imageArtifactId,
+                    artifactID: moment.displayCacheKey,
                     loader: imageLoader
                 )
             }
@@ -363,7 +363,7 @@ public struct RecallView: View {
         }
         let artifactIDs = offsets.compactMap { offset -> String? in
             let index = center + offset
-            return moments.indices.contains(index) ? moments[index].imageArtifactId : nil
+            return moments.indices.contains(index) ? moments[index].displayCacheKey : nil
         }
         RecallDecodedImageCache.shared.prefetch(
             artifactIDs: artifactIDs,

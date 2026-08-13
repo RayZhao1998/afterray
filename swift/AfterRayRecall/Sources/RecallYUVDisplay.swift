@@ -249,11 +249,18 @@ final class RecallDisplayFrame: NSObject {
 
 enum RecallFrameDecoder {
     static func decode(_ data: Data) -> RecallDisplayFrame? {
+        if isIVF(data), let buffer = RecallAV1Decoder.shared.decode(data) {
+            return RecallDisplayFrame(pixelBuffer: buffer)
+        }
         if isJPEG(data), let buffer = RecallJPEGDecoder.shared.decode(data) {
             return RecallDisplayFrame(pixelBuffer: buffer)
         }
         guard let image = decodeWithImageIO(data) else { return nil }
         return RecallDisplayFrame(fallbackImage: image)
+    }
+
+    static func isIVF(_ data: Data) -> Bool {
+        data.count >= 4 && data.starts(with: [0x44, 0x4B, 0x49, 0x46])
     }
 
     static func isJPEG(_ data: Data) -> Bool {
@@ -429,4 +436,233 @@ final class RecallJPEGDecoder: @unchecked Sendable {
         sessionWidth = 0
         sessionHeight = 0
     }
+}
+
+final class RecallAV1Decoder: @unchecked Sendable {
+    static let shared = RecallAV1Decoder()
+    private let lock = NSLock()
+    private var session: VTDecompressionSession?
+    private var format: CMVideoFormatDescription?
+
+    func decode(_ data: Data) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let ivf = parseIVF(data), ivf.width > 0, ivf.height > 0, !ivf.frames.isEmpty else {
+            return nil
+        }
+        guard prepare(ivf: ivf) else { return nil }
+        var decoded: CVPixelBuffer?
+        for frame in ivf.frames {
+            let sampleData = stripTemporalDelimiters(frame)
+            guard
+                let format,
+                let sample = makeSample(sampleData, format: format)
+            else { return decoded }
+            var imageBuffer: CVImageBuffer?
+            let status = VTDecompressionSessionDecodeFrame(
+                session!,
+                sampleBuffer: sample,
+                flags: [._EnableAsynchronousDecompression],
+                infoFlagsOut: nil
+            ) { decodeStatus, _, buffer, _, _ in
+                if decodeStatus == noErr { imageBuffer = buffer }
+            }
+            guard status == noErr else { return decoded }
+            _ = VTDecompressionSessionWaitForAsynchronousFrames(session!)
+            if let imageBuffer { decoded = imageBuffer }
+        }
+        return decoded
+    }
+
+    private func prepare(ivf: ParsedIVF) -> Bool {
+        guard let av1c = makeAv1C(from: ivf.frames[0]) else { return false }
+        let atoms: [String: Data] = ["av1C": av1c]
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms,
+        ]
+        var formatOut: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: 0x6176_3031,
+            width: Int32(ivf.width),
+            height: Int32(ivf.height),
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &formatOut
+        )
+        guard formatStatus == noErr, let formatOut else { return false }
+        if let session { VTDecompressionSessionInvalidate(session) }
+        session = nil
+        format = formatOut
+        let pixelFormats: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        ]
+        for pixelFormat in pixelFormats {
+            var created: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                formatDescription: formatOut,
+                decoderSpecification: [
+                    kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: kCFBooleanTrue as Any,
+                ] as CFDictionary,
+                imageBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                    kCVPixelBufferMetalCompatibilityKey: true,
+                    kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+                ] as CFDictionary,
+                outputCallback: nil,
+                decompressionSessionOut: &created
+            )
+            if status == noErr, let created {
+                session = created
+                return true
+            }
+        }
+        return false
+    }
+}
+
+private struct ParsedIVF {
+    let width: Int
+    let height: Int
+    let frames: [Data]
+}
+
+private func parseIVF(_ data: Data) -> ParsedIVF? {
+    guard data.count >= 32, data.starts(with: Data("DKIF".utf8)) else { return nil }
+    let width = Int(data[12]) | (Int(data[13]) << 8)
+    let height = Int(data[14]) | (Int(data[15]) << 8)
+    var frames: [Data] = []
+    var offset = 32
+    while offset + 12 <= data.count {
+        let size = Int(data[offset])
+            | (Int(data[offset + 1]) << 8)
+            | (Int(data[offset + 2]) << 16)
+            | (Int(data[offset + 3]) << 24)
+        let start = offset + 12
+        let end = start + size
+        guard end <= data.count else { return nil }
+        frames.append(data.subdata(in: start..<end))
+        offset = end
+    }
+    return ParsedIVF(width: width, height: height, frames: frames)
+}
+
+private func makeAv1C(from firstFrame: Data) -> Data? {
+    let obus = parseOBUs(firstFrame)
+    guard let seq = obus.first(where: { $0.type == 1 }) else { return nil }
+    let payload = [UInt8](seq.payload)
+    guard let first = payload.first else { return nil }
+    let profile = first >> 5
+    var av1c = Data()
+    av1c.append(0x81)
+    av1c.append((profile << 5) | 0x00)
+    av1c.append(0x0C)
+    av1c.append(0x00)
+    av1c.append(seq.raw)
+    return av1c
+}
+
+private func stripTemporalDelimiters(_ frame: Data) -> Data {
+    let obus = parseOBUs(frame)
+    if obus.isEmpty { return frame }
+    var out = Data()
+    for obu in obus where obu.type != 2 { out.append(obu.raw) }
+    return out.isEmpty ? frame : out
+}
+
+private struct ParsedOBU {
+    let type: UInt8
+    let raw: Data
+    let payload: Data
+}
+
+private func parseOBUs(_ data: Data) -> [ParsedOBU] {
+    var obus: [ParsedOBU] = []
+    var i = 0
+    let bytes = [UInt8](data)
+    while i < bytes.count {
+        let headerStart = i
+        let header = bytes[i]
+        i += 1
+        let type = (header >> 3) & 0x0F
+        if (header & 0x04) != 0 {
+            guard i < bytes.count else { break }
+            i += 1
+        }
+        let size: Int
+        if (header & 0x02) != 0 {
+            var value = 0
+            var shift = 0
+            var ok = false
+            while i < bytes.count {
+                let leb = bytes[i]
+                i += 1
+                value |= Int(leb & 0x7F) << shift
+                if leb & 0x80 == 0 {
+                    ok = true
+                    break
+                }
+                shift += 7
+                if shift > 28 { break }
+            }
+            guard ok else { break }
+            size = value
+        } else {
+            size = bytes.count - i
+        }
+        guard i + size <= bytes.count else { break }
+        obus.append(
+            ParsedOBU(
+                type: type,
+                raw: Data(bytes[headerStart..<(i + size)]),
+                payload: Data(bytes[i..<(i + size)])
+            )
+        )
+        i += size
+    }
+    return obus
+}
+
+private func makeSample(_ data: Data, format: CMFormatDescription) -> CMSampleBuffer? {
+    var block: CMBlockBuffer?
+    let create = CMBlockBufferCreateWithMemoryBlock(
+        allocator: kCFAllocatorDefault,
+        memoryBlock: nil,
+        blockLength: data.count,
+        blockAllocator: kCFAllocatorDefault,
+        customBlockSource: nil,
+        offsetToData: 0,
+        dataLength: data.count,
+        flags: 0,
+        blockBufferOut: &block
+    )
+    guard create == kCMBlockBufferNoErr, let block else { return nil }
+    _ = data.withUnsafeBytes { raw in
+        CMBlockBufferReplaceDataBytes(
+            with: raw.baseAddress!,
+            blockBuffer: block,
+            offsetIntoDestination: 0,
+            dataLength: data.count
+        )
+    }
+    var sample: CMSampleBuffer?
+    var timing = CMSampleTimingInfo(
+        duration: CMTime(value: 1, timescale: 1),
+        presentationTimeStamp: .zero,
+        decodeTimeStamp: .invalid
+    )
+    var size = data.count
+    let status = CMSampleBufferCreateReady(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: block,
+        formatDescription: format,
+        sampleCount: 1,
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &timing,
+        sampleSizeEntryCount: 1,
+        sampleSizeArray: &size,
+        sampleBufferOut: &sample
+    )
+    return status == noErr ? sample : nil
 }

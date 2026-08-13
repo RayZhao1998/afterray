@@ -6,11 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+afterray-codec = { path = "../afterray-codec" }
 afterray-models = { path = "../afterray-models" }
 afterray-platform-macos = { path = "../afterray-platform-macos" }
 afterray-protocol = { path = "../afterray-protocol" }
 afterray-store = { path = "../afterray-store" }
 anyhow.workspace = true
+blake3.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

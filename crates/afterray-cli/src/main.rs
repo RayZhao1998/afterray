@@ -62,6 +62,13 @@ enum Command {
     Summarize {
         session_id: String,
     },
+    Gop {
+        segment_id: String,
+    },
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +98,11 @@ enum FavoriteCommand {
 enum JobsCommand {
     List,
     Retry { job_id: String },
+}
+
+#[derive(Subcommand)]
+enum PackCommand {
+    Status,
 }
 
 #[tokio::main]
@@ -173,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
             command: JobsCommand::Retry { job_id },
         } => Request::JobRetry { job_id },
         Command::Summarize { session_id } => Request::Summarize { session_id },
+        Command::Gop { segment_id } => Request::GopShow { segment_id },
+        Command::Pack {
+            command: PackCommand::Status,
+        } => Request::PackStatus,
     };
     let response = send(&socket, &request).await?;
     if cli.json {

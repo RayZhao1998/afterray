@@ -192,7 +192,7 @@ public actor RecallImageRepository {
         let daemon = daemon
         let requestGeneration = generation
         let task = Task<Data, Error> {
-            try await daemon.artifact(id: artifactID).bytes
+            try await Self.fetch(daemon: daemon, artifactID: artifactID)
         }
         inFlight[artifactID] = task
         do {
@@ -230,6 +230,22 @@ public actor RecallImageRepository {
         }
         cachedArtifactIDs.removeAll()
         cache.removeAllObjects()
+    }
+
+    private static func fetch(daemon: any RecallDaemonServing, artifactID: String) async throws -> Data {
+        if artifactID.hasPrefix("gop:") {
+            let body = artifactID.dropFirst(4)
+            let parts = body.split(separator: "#", maxSplits: 1)
+            guard parts.count == 2, let index = UInt16(parts[1]) else {
+                throw DaemonClientError.invalidResponse
+            }
+            return try await daemon.gopFrame(
+                segmentID: String(parts[0]),
+                index: index,
+                mode: "exact"
+            ).bytes
+        }
+        return try await daemon.artifact(id: artifactID).bytes
     }
 }
 

@@ -24,6 +24,34 @@ final class RecallYUVDisplayTests: XCTestCase {
         XCTAssertNil(frame.fallbackImage)
     }
 
+    func testIVFHeaderDoesNotFallThroughToImageIO() {
+        let ivf = Data([0x44, 0x4B, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00])
+        XCTAssertTrue(RecallFrameDecoder.isIVF(ivf))
+        XCTAssertNil(RecallFrameDecoder.decode(ivf))
+    }
+
+    func testGoldenIVFDecodesThroughVideoToolbox() throws {
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("crates/afterray-codec/fixtures/closed-gop-64x64.ivf"),
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("crates/afterray-codec/fixtures/closed-gop-64x64.ivf"),
+        ]
+        guard let url = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            throw XCTSkip("golden IVF fixture not visible from the Swift test cwd")
+        }
+        let data = try Data(contentsOf: url)
+        XCTAssertTrue(RecallFrameDecoder.isIVF(data))
+        let frame = try XCTUnwrap(RecallFrameDecoder.decode(data))
+        let buffer = try XCTUnwrap(frame.pixelBuffer)
+        XCTAssertGreaterThan(CVPixelBufferGetWidth(buffer), 0)
+        XCTAssertGreaterThan(CVPixelBufferGetHeight(buffer), 0)
+    }
+
     func testNonJPEGFallsBackToImageIO() throws {
         let png = try encodePNG(width: 32, height: 24, color: .green)
         XCTAssertFalse(RecallFrameDecoder.isJPEG(png))

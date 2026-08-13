@@ -26,7 +26,19 @@ public protocol RecallDaemonServing: Sendable {
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func artifact(id: String) async throws -> ArtifactPayload
+    func gopSegment(id: String) async throws -> ArtifactPayload
+    func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload
     func setFavorite(momentID: String, favorite: Bool) async throws
+}
+
+public extension RecallDaemonServing {
+    func gopSegment(id _: String) async throws -> ArtifactPayload {
+        throw DaemonClientError.rejected("gop segment reads are not available")
+    }
+
+    func gopFrame(segmentID _: String, index _: UInt16, mode _: String) async throws -> ArtifactPayload {
+        throw DaemonClientError.rejected("gop frame reads are not available")
+    }
 }
 
 public protocol AfterRayDaemonServing: RecallDaemonServing {
@@ -43,7 +55,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 2
+    public static let protocolVersion = 3
     public let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -128,8 +140,22 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     }
 
     public func artifact(id: String) async throws -> ArtifactPayload {
+        try await framed(WireRequest(type: "read_artifact", artifactID: id))
+    }
+
+    public func gopSegment(id: String) async throws -> ArtifactPayload {
+        try await framed(WireRequest(type: "read_gop_segment", segmentID: id))
+    }
+
+    public func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload {
+        try await framed(
+            WireRequest(type: "read_gop_frame", segmentID: segmentID, gopIndex: index, gopMode: mode)
+        )
+    }
+
+    private func framed(_ request: WireRequest) async throws -> ArtifactPayload {
         let encoder = JSONEncoder()
-        var payload = try encoder.encode(WireRequest(type: "read_artifact", artifactID: id))
+        var payload = try encoder.encode(request)
         payload.append(0x0A)
         let path = socketPath
         return try await Task.detached(priority: .userInitiated) {
@@ -193,6 +219,9 @@ struct WireRequest: Encodable, Equatable {
     var recordAudio: Bool?
     var reason: String?
     var packID: String?
+    var segmentID: String?
+    var gopIndex: UInt16?
+    var gopMode: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -207,6 +236,9 @@ struct WireRequest: Encodable, Equatable {
         case recordAudio = "record_audio"
         case reason
         case packID = "pack_id"
+        case segmentID = "segment_id"
+        case gopIndex = "index"
+        case gopMode = "mode"
     }
 }
 

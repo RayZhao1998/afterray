@@ -1,17 +1,21 @@
+mod gop_packer;
+
 use afterray_models::{
     JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
     ProcessAdapterConfig, QueueConfig, download_packs, library, model_directory,
     specs_for_download,
 };
+use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, ModelDownloadProgress, PROTOCOL_VERSION, RecordingState, Request,
-    Response, SearchHit, Status,
+    AppSettings, ArtifactPayload, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus,
+    RecordingState, Request, Response, SearchHit, Status,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -101,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
+    let packer = Arc::new(gop_packer::GopPacker::new(gop_packer::GopPackerConfig::from_env()));
+    let capture_busy = Arc::new(AtomicBool::new(false));
     let state = Arc::new(AppState {
         store,
         capture,
@@ -115,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         ),
         data_dir,
         shutdown: shutdown_tx,
+        packer,
+        capture_busy,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -122,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
         Err(error) => eprintln!("background artifact maintenance paused: {error}"),
     });
+    spawn_gop_packer(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -214,6 +223,8 @@ struct AppState {
     capture_interval: Duration,
     data_dir: PathBuf,
     shutdown: tokio::sync::watch::Sender<bool>,
+    packer: Arc<gop_packer::GopPacker>,
+    capture_busy: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -245,8 +256,23 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
             Ok(Request::ReadArtifact { artifact_id }) => {
-                write_artifact_response(&mut write, state.store.read_artifact(&artifact_id))
+                write_artifact_response(&mut write, read_still_artifact(&state, &artifact_id))
                     .await?;
+            }
+            Ok(Request::ReadGopSegment { segment_id }) => {
+                write_artifact_response(&mut write, state.store.read_gop_artifact(&segment_id))
+                    .await?;
+            }
+            Ok(Request::ReadGopFrame {
+                segment_id,
+                index,
+                mode,
+            }) => {
+                write_artifact_response(
+                    &mut write,
+                    gop_packer::read_gop_frame(&state.store, &segment_id, index, mode),
+                )
+                .await?;
             }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
@@ -327,9 +353,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             }
             Err(error) => Response::failure(error.to_string()),
         },
-        Request::ReadArtifact { .. } => Response::failure(
-            "read_artifact is framed as a JSON header plus raw bytes and is handled separately",
+        Request::ReadArtifact { .. }
+        | Request::ReadGopSegment { .. }
+        | Request::ReadGopFrame { .. } => Response::failure(
+            "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
+        Request::PackStatus => pack_status(state),
+        Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet {
             moment_id,
             favorite,
@@ -443,12 +473,16 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
 
     let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
+    let capture_busy = Arc::clone(&state.capture_busy);
     let scheduler = tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         loop {
             timer.tick().await;
+            capture_busy.store(true, Ordering::SeqCst);
             let request_id = Uuid::now_v7().to_string();
-            if let Err(error) = capture.capture_screen(&request_id).await {
+            let result = capture.capture_screen(&request_id).await;
+            capture_busy.store(false, Ordering::SeqCst);
+            if let Err(error) = result {
                 eprintln!("capture request failed: {error}");
                 break;
             }
@@ -958,6 +992,72 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
     }
 }
 
+fn spawn_gop_packer(state: Arc<AppState>) {
+    if !state.packer.config.archive {
+        eprintln!("gop packer: AFTERRAY_GOP_ARCHIVE=0 (idle)");
+        return;
+    }
+    eprintln!(
+        "gop packer: enabled keyint={} keep_stills={} require_ac={}",
+        state.packer.config.policy.keyint,
+        state.packer.config.keep_stills,
+        state.packer.config.require_ac
+    );
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            timer.tick().await;
+            if state.capture_busy.load(Ordering::SeqCst)
+                || state.packer.encode_busy()
+                || state.models.ocr_in_flight()
+            {
+                continue;
+            }
+            let vault = Arc::clone(&state.store);
+            let packer = Arc::clone(&state.packer);
+            let now = now_ms();
+            let outcome = tokio::task::spawn_blocking(move || packer.pack_one(&vault, now)).await;
+            match outcome {
+                Ok(Ok(Some(segment_id))) => {
+                    eprintln!("gop packer: committed {segment_id}");
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => eprintln!("gop packer: {error:#}"),
+                Err(error) => eprintln!("gop packer: join failed: {error}"),
+            }
+        }
+    });
+}
+
+fn read_still_artifact(state: &AppState, artifact_id: &str) -> Result<ArtifactPayload, StoreError> {
+    let payload = state.store.read_artifact(artifact_id)?;
+    if payload.content_type.starts_with("video/") {
+        return Err(StoreError::GopNotFound(
+            "use read_gop_segment for IVF artifacts".into(),
+        ));
+    }
+    let _ = CONTENT_TYPE_IVF_AV01;
+    Ok(payload)
+}
+
+fn pack_status(state: &AppState) -> Response {
+    match state.store.pack_status_counts() {
+        Ok((running, done, failed, ready)) => Response::success(PackStatus {
+            archive_enabled: state.packer.config.archive,
+            keep_stills: state.packer.config.keep_stills,
+            keyint: state.packer.config.policy.keyint,
+            encoder: "rav1e".to_owned(),
+            hot_window_seconds: u64::try_from(state.packer.config.policy.hot_window_ms / 1000)
+                .unwrap_or(7200),
+            running_jobs: running,
+            done_jobs: done,
+            failed_jobs: failed,
+            ready_segments: ready,
+        }),
+        Err(error) => Response::failure(error.to_string()),
+    }
+}
+
 fn into_response<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Response {
     match result {
         Ok(data) => Response::success(data),
@@ -1146,5 +1246,131 @@ print(json.dumps({
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty());
+    }
+
+    fn load_e2e_jpegs() -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new("/tmp/afterray-gop-sim/frames/Lody");
+        if dir.is_dir() {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jpg"))
+                .collect();
+            files.sort();
+            let take = if std::env::var("AFTERRAY_GOP_E2E_FULL").is_ok() {
+                12
+            } else {
+                4
+            };
+            return files
+                .into_iter()
+                .take(take)
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for index in 0..4 {
+            let path = scratch.path().join(format!("{index}.jpg"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c=red:s=64x64:d=1,drawbox=c=white:t=fill:enable='gte(t\\,{index})'"),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                ])
+                .arg(&path)
+                .status();
+            if !status.map(|code| code.success()).unwrap_or(false) {
+                return Vec::new();
+            }
+            frames.push(std::fs::read(path).unwrap());
+        }
+        frames
+    }
+
+    #[test]
+    fn packer_encodes_closed_gop_and_serves_poster() {
+        let jpegs = load_e2e_jpegs();
+        if jpegs.len() < 2 {
+            eprintln!("skip packer e2e: no JPEG fixtures and ffmpeg unavailable");
+            return;
+        }
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let mut ids = Vec::new();
+        for (index, jpeg) in jpegs.iter().enumerate() {
+            let captured = 1_000 + i64::try_from(index).unwrap() * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, captured, "image/jpeg", jpeg)
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    "screen",
+                    captured,
+                    None,
+                    "ocr",
+                )
+                .unwrap();
+            ids.push(moment.id);
+        }
+        let jpeg_bytes: usize = jpegs.iter().map(Vec::len).sum();
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            keep_stills: true,
+            require_ac: false,
+            policy: afterray_store::PackPolicy {
+                hot_window_ms: 0,
+                hot_min_stills: 0,
+                ocr_grace_ms: 0,
+                keyint: if jpegs.len() >= 12 { 12 } else { 6 },
+            },
+        });
+        let segment = packer
+            .pack_one(&vault, 10_000_000)
+            .unwrap()
+            .expect("packer should emit a GOP");
+        let view = vault.gop_segment_view(&segment).unwrap();
+        assert_eq!(view.codec, "av01");
+        assert_eq!(view.encoder, "rav1e");
+        assert!(view.frames.len() >= 2);
+        let payload = vault.read_gop_artifact(&segment).unwrap();
+        assert!(payload.bytes.starts_with(b"DKIF"));
+        let parsed = afterray_codec::parse_ivf(&payload.bytes).unwrap();
+        assert_eq!(parsed.frames.len(), view.frames.len());
+        let _ = std::fs::write("/tmp/afterray-gop-e2e.ivf", &payload.bytes);
+        let ratio = payload.bytes.len() as f64 / jpeg_bytes as f64;
+        eprintln!(
+            "gop e2e: {} frames jpeg={} ivf={} ratio={:.4} ({:.1}x)",
+            view.frames.len(),
+            jpeg_bytes,
+            payload.bytes.len(),
+            ratio,
+            1.0 / ratio
+        );
+        assert!(
+            ratio < 0.20,
+            "GOP should beat 5x vs JPEG, got {:.1}%",
+            ratio * 100.0
+        );
+        let poster = gop_packer::read_gop_frame(
+            &vault,
+            &segment,
+            0,
+            afterray_protocol::GopReadMode::Poster,
+        )
+        .unwrap();
+        let poster_ivf = afterray_codec::parse_ivf(&poster.bytes).unwrap();
+        assert_eq!(poster_ivf.frames.len(), 1);
     }
 }

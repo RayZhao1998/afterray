@@ -4,6 +4,12 @@
 //! This crate owns its lifecycle and the bounded JSON-lines protocol. Capture
 //! policy remains in Rust: callers explicitly request each screen artifact.
 
+#![allow(unsafe_code)]
+
+mod power;
+
+pub use power::on_ac_power;
+
 use afterray_core::{CaptureBackend, CoreError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
