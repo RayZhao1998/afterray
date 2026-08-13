@@ -47,7 +47,7 @@ Default packs:
 | --- | --- | --- |
 | `asr` | `Qwen/Qwen3-ASR-1.7B` | Candle Metal via `qwen3-asr` |
 | `embedding` | nomic GGUF | `llama-cpp-2` Metal |
-| `llm` | Qwen2.5-3B Instruct GGUF (optional) | `llama-cpp-2` Metal |
+| `llm` | Qwen3.8 27B assistant (optional overlay Q&A). Download fallback is Qwen2.5-3B Instruct GGUF until the 27B file is published; retarget with `AFTERRAY_LLM_REPOSITORY` / `AFTERRAY_LLM_FILE`. Not Qwen3.8-Max. | `llama-cpp-2` Metal |
 
 ## Configuration
 
@@ -59,7 +59,9 @@ Default packs:
 | `AFTERRAY_ASR_MODEL` | `Qwen3-ASR-1.7B` | ASR snapshot directory |
 | `AFTERRAY_ASR_REPOSITORY` | `Qwen/Qwen3-ASR-1.7B` | Hugging Face repo |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | embedding weights |
-| `AFTERRAY_LLM_MODEL` | optional GGUF path | summary model |
+| `AFTERRAY_LLM_MODEL` | optional GGUF path | assistant weights |
+| `AFTERRAY_LLM_REPOSITORY` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | Hugging Face repo (flip to Qwen3.8-27B when published) |
+| `AFTERRAY_LLM_FILE` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename in that repo |
 
 If a binary, input file, or model is missing, the job ends as `failed` with an
 actionable error. No adapter returns placeholder inference data.

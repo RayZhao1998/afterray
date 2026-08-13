@@ -74,13 +74,13 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                 ),
                 ModelPack(
                     id: "llm",
-                    name: "Local LLM",
+                    name: "Qwen3.8 27B",
                     capability: "llm",
                     path: "\(modelDirectoryPath)/qwen2.5-3b-instruct-q4_k_m.gguf",
                     present: false,
                     bytes: 0,
                     required: false,
-                    note: "Qwen2.5-3B Instruct Q4 · optional",
+                    note: "Powers overlay Q&A · optional for capture. Qwen3.8-27B (~16 GB Q4) via AFTERRAY_LLM_REPOSITORY / AFTERRAY_LLM_FILE when the GGUF lands. Fallback download is Qwen2.5-3B Instruct Q4.",
                     expectedBytes: 2_000_000_000
                 ),
             ]
