@@ -40,7 +40,11 @@ use std::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const SCHEMA_VERSION: u32 = 5;
+mod jpeg;
+
+pub use jpeg::jpeg_pixel_size;
+
+pub const SCHEMA_VERSION: u32 = 6;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -523,6 +527,10 @@ impl Vault {
         image: &[u8],
     ) -> Result<Moment, StoreError> {
         let artifact_id = self.put_artifact(content_type, image)?;
+        let (width, height) = match jpeg_pixel_size(image) {
+            Some((width, height)) => (Some(width), Some(height)),
+            None => (None, None),
+        };
         let moment = Moment {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.to_owned(),
@@ -538,13 +546,16 @@ impl Vault {
             bundle_identifier: None,
         };
         let result = self.connection.lock().unwrap().execute(
-            "INSERT INTO moments (id, session_id, captured_at_ms, image_artifact_id, is_favorite)
-             VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO moments
+             (id, session_id, captured_at_ms, image_artifact_id, is_favorite, still_origin, width, height)
+             VALUES (?1, ?2, ?3, ?4, 0, 'capture', ?5, ?6)",
             params![
                 moment.id,
                 moment.session_id,
                 moment.captured_at_ms,
-                artifact_id
+                artifact_id,
+                width,
+                height
             ],
         );
         if let Err(error) = result {
@@ -648,7 +659,71 @@ impl Vault {
         if let Some(previous) = previous_artifact {
             self.delete_artifact_record_and_file(&previous)?;
         }
+        if is_lock_screen_identity(application_name, bundle_identifier) {
+            self.delete_moment_and_artifacts(&moment_id)?;
+            return Ok(None);
+        }
         Ok(Some(artifact_id))
+    }
+
+    pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let open: Option<String> = connection
+            .query_row(
+                "SELECT id FROM idle_spans WHERE ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = open {
+            return Ok(id);
+        }
+        let id = Uuid::now_v7().to_string();
+        connection.execute(
+            "INSERT INTO idle_spans (id, started_at_ms, reason) VALUES (?1, ?2, ?3)",
+            params![id, started_at_ms, reason],
+        )?;
+        Ok(id)
+    }
+
+    pub fn end_open_idle_spans(&self, ended_at_ms: i64) -> Result<usize, StoreError> {
+        let changed = self.connection.lock().unwrap().execute(
+            "UPDATE idle_spans SET ended_at_ms = ?1 WHERE ended_at_ms IS NULL",
+            [ended_at_ms],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn idle_spans_sync(&self) -> Result<Vec<(String, i64, Option<i64>, String)>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, started_at_ms, ended_at_ms, reason FROM idle_spans ORDER BY started_at_ms",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_moment_and_artifacts(&self, moment_id: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let artifacts: (String, Option<String>) = connection.query_row(
+            "SELECT image_artifact_id, accessibility_artifact_id FROM moments WHERE id = ?1",
+            [moment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        connection.execute(
+            "DELETE FROM evidence_fts WHERE evidence_id IN
+             (SELECT id FROM text_evidence WHERE moment_id = ?1)",
+            [moment_id],
+        )?;
+        connection.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+        drop(connection);
+        self.delete_artifact_record_and_file(&artifacts.0)?;
+        if let Some(accessibility) = artifacts.1 {
+            self.delete_artifact_record_and_file(&accessibility)?;
+        }
+        Ok(())
     }
 
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
@@ -1344,6 +1419,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          );",
     )?;
     migrate_query_indexes(connection)?;
+    migrate_schema_6(connection)?;
     let has_accessibility_artifact = {
         let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
         statement
@@ -1409,6 +1485,89 @@ fn migrate_artifact_columns(connection: &Connection) -> Result<(), StoreError> {
     {
         connection.execute("ALTER TABLE artifacts ADD COLUMN wrapping_nonce BLOB", [])?;
     }
+    Ok(())
+}
+
+fn is_lock_screen_identity(application_name: Option<&str>, bundle_identifier: Option<&str>) -> bool {
+    application_name.is_some_and(|name| name.eq_ignore_ascii_case("loginwindow"))
+        || bundle_identifier.is_some_and(|bundle| {
+            bundle.eq_ignore_ascii_case("com.apple.loginwindow") || bundle.contains("loginwindow")
+        })
+}
+
+fn migrate_schema_6(connection: &Connection) -> Result<(), StoreError> {
+    let moment_columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (column, sql) in [
+        (
+            "gop_segment_id",
+            "ALTER TABLE moments ADD COLUMN gop_segment_id TEXT",
+        ),
+        ("gop_index", "ALTER TABLE moments ADD COLUMN gop_index INTEGER"),
+        (
+            "still_origin",
+            "ALTER TABLE moments ADD COLUMN still_origin TEXT NOT NULL DEFAULT 'capture'",
+        ),
+        ("width", "ALTER TABLE moments ADD COLUMN width INTEGER"),
+        ("height", "ALTER TABLE moments ADD COLUMN height INTEGER"),
+    ] {
+        if !moment_columns.iter().any(|name| name == column) {
+            connection.execute(sql, [])?;
+        }
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS idle_spans (
+           id TEXT PRIMARY KEY,
+           started_at_ms INTEGER NOT NULL,
+           ended_at_ms INTEGER,
+           reason TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gop_segments (
+           id TEXT PRIMARY KEY,
+           artifact_id TEXT UNIQUE REFERENCES artifacts(id),
+           codec TEXT NOT NULL,
+           encoder TEXT NOT NULL,
+           encoder_version TEXT,
+           width INTEGER NOT NULL,
+           height INTEGER NOT NULL,
+           frame_count INTEGER NOT NULL,
+           keyint INTEGER NOT NULL,
+           started_at_ms INTEGER NOT NULL,
+           ended_at_ms INTEGER NOT NULL,
+           status TEXT NOT NULL,
+           content_hash TEXT
+         );
+         CREATE TABLE IF NOT EXISTS gop_frames (
+           segment_id TEXT NOT NULL REFERENCES gop_segments(id) ON DELETE CASCADE,
+           frame_index INTEGER NOT NULL,
+           moment_id TEXT NOT NULL UNIQUE REFERENCES moments(id) ON DELETE CASCADE,
+           is_keyframe INTEGER NOT NULL,
+           byte_offset INTEGER NOT NULL,
+           byte_length INTEGER NOT NULL,
+           content_hash TEXT NOT NULL,
+           PRIMARY KEY (segment_id, frame_index)
+         );
+         CREATE TABLE IF NOT EXISTS gop_pack_jobs (
+           id TEXT PRIMARY KEY,
+           segment_id TEXT REFERENCES gop_segments(id),
+           state TEXT NOT NULL,
+           attempts INTEGER NOT NULL DEFAULT 0,
+           created_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL,
+           heartbeat_at_ms INTEGER,
+           payload_json TEXT NOT NULL,
+           error TEXT
+         );
+         CREATE INDEX IF NOT EXISTS moments_gop ON moments(gop_segment_id, gop_index);
+         CREATE INDEX IF NOT EXISTS moments_hot_pack
+           ON moments(captured_at_ms, gop_segment_id, is_favorite);
+         CREATE INDEX IF NOT EXISTS gop_pack_jobs_state ON gop_pack_jobs(state, heartbeat_at_ms);
+         CREATE INDEX IF NOT EXISTS idle_spans_open ON idle_spans(ended_at_ms, started_at_ms);",
+    )?;
     Ok(())
 }
 
@@ -2188,5 +2347,102 @@ mod tests {
         // A is rank 1 in FTS while C is rank 2 in semantic search.
         assert_eq!(fused[1].moment_id, "a");
         assert_eq!(fused[2].moment_id, "c");
+    }
+
+    #[test]
+    fn schema_6_adds_gop_and_idle_tables() {
+        let (_directory, vault) = test_vault(10);
+        let connection = vault.connection.lock().unwrap();
+        let version: i64 = connection
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        let has_idle: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idle_spans'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let has_gop: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'gop_segments'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_idle, 1);
+        assert_eq!(has_gop, 1);
+    }
+
+    #[test]
+    fn insert_moment_stores_jpeg_dimensions() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let moment = vault
+            .insert_moment(&session.id, 2, "image/jpeg", &jpeg)
+            .unwrap();
+        let (width, height): (Option<i64>, Option<i64>) = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT width, height FROM moments WHERE id = ?1",
+                [&moment.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(width, Some(32));
+        assert_eq!(height, Some(16));
+    }
+
+    #[test]
+    fn idle_spans_open_once_and_close() {
+        let (_directory, vault) = test_vault(10);
+        let first = vault.begin_idle_span(100, "lock").unwrap();
+        let again = vault.begin_idle_span(200, "lock").unwrap();
+        assert_eq!(first, again);
+        assert_eq!(vault.end_open_idle_spans(300).unwrap(), 1);
+        let spans = vault.idle_spans_sync().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, Some(300));
+        let second = vault.begin_idle_span(400, "sleep").unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn loginwindow_accessibility_deletes_the_moment() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 10, "image/jpeg", b"screen")
+            .unwrap();
+        let attached = vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                10,
+                "application/json",
+                b"{}",
+                Some("loginwindow"),
+                Some("com.apple.loginwindow"),
+            )
+            .unwrap();
+        assert!(attached.is_none());
+        assert!(vault.moments_sync(&session.id).unwrap().is_empty());
+        let leftover = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE id = ?1",
+                [&moment.image_artifact_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }

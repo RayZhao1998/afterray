@@ -46,7 +46,6 @@ final class DaemonSupervisor {
     @discardableResult
     func startIfNeeded() async throws -> Bool {
         guard !isStopped else { return false }
-        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
         if let recoveryTask {
             return try await recoveryTask.value
         }
@@ -60,10 +59,8 @@ final class DaemonSupervisor {
 
     private func recoverIfNeeded() async throws -> Bool {
         guard !isStopped else { return false }
-        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
         if await daemonIsReachable() { return false }
         guard !isStopped else { return false }
-        guard !isSuspendedForSystemLock else { throw RuntimeError.daemonSuspended }
 
         if let process, process.isRunning {
             process.terminate()
@@ -125,12 +122,6 @@ final class DaemonSupervisor {
                 process = nil
                 processOutput = nil
                 return false
-            }
-            guard !isSuspendedForSystemLock else {
-                child.terminate()
-                process = nil
-                processOutput = nil
-                throw RuntimeError.daemonSuspended
             }
             if await daemonIsReachable() { return true }
             if !child.isRunning {
@@ -209,10 +200,11 @@ final class DaemonSupervisor {
         processOutput = nil
     }
 
+    var isCapturePausedForSystemLock: Bool { isSuspendedForSystemLock }
+
     func suspendForSystemLock() {
         guard !isSuspendedForSystemLock else { return }
         isSuspendedForSystemLock = true
-        stop()
     }
 
     func resumeAfterSystemUnlock() {

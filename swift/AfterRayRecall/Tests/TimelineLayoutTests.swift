@@ -186,6 +186,31 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertEqual(backToNow.playheadMs, moments[1].capturedAtMs)
     }
 
+    func testIdleGapSplitsDistantMomentsAndCapsWidth() {
+        let moments = [
+            moment(id: "s1", at: 0, app: "Safari", bundle: "safari"),
+            moment(id: "s2", at: 10_000, app: "Safari", bundle: "safari"),
+            moment(id: "x1", at: 3_610_000, app: "Xcode", bundle: "xcode"),
+        ]
+        let layout = TimelineLayout(moments: moments, viewportWidth: 1_000, density: 0.12)
+        XCTAssertEqual(layout.runs.map(\.isIdle), [false, true, false])
+        XCTAssertEqual(layout.runs.map(\.applicationName), ["Safari", "休眠", "Xcode"])
+        let idle = layout.runs[1]
+        XCTAssertLessThanOrEqual(idle.durationMs, 3_610_000)
+        let idleVisualShare = idle.width / layout.contentWidth
+        XCTAssertLessThan(idleVisualShare, 0.85, "hour-long lock must not dominate the timeline")
+    }
+
+    func testResolveIsNilInsideIdleGap() {
+        let moments = [
+            moment(id: "s1", at: 0, app: "Safari", bundle: "safari"),
+            moment(id: "x1", at: 3_600_000, app: "Xcode", bundle: "xcode"),
+        ]
+        XCTAssertEqual(RecallPlayhead.resolve(playheadMs: 0, moments: moments)?.id, "s1")
+        XCTAssertNil(RecallPlayhead.resolve(playheadMs: 60_000, moments: moments))
+        XCTAssertEqual(RecallPlayhead.resolve(playheadMs: 3_600_000, moments: moments)?.id, "x1")
+    }
+
     func testStepMomentUsesDiscreteSamples() {
         let moments = [
             moment(id: "a", at: 0, app: "Safari", bundle: "safari"),

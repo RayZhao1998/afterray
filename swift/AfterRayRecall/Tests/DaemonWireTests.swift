@@ -40,6 +40,28 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertNil(moment.audioArtifactId)
         XCTAssertNil(moment.audioStartedAtMs)
         XCTAssertNil(moment.accessibilityArtifactId)
+        XCTAssertFalse(moment.hasVisibleTranscript)
+    }
+
+    func testVisibleTranscriptIgnoresBlankAudioOnlyMoments() throws {
+        let blank = RecallMoment(
+            id: "m1",
+            sessionId: "s1",
+            capturedAtMs: 1,
+            imageArtifactId: "a1",
+            transcriptText: "   ",
+            audioArtifactId: "audio-1"
+        )
+        let spoken = RecallMoment(
+            id: "m2",
+            sessionId: "s1",
+            capturedAtMs: 2,
+            imageArtifactId: "a1",
+            transcriptText: "hello there",
+            audioArtifactId: "audio-2"
+        )
+        XCTAssertFalse(blank.hasVisibleTranscript)
+        XCTAssertTrue(spoken.hasVisibleTranscript)
     }
 
     func testMomentDecodesAccessibilityArtifact() throws {

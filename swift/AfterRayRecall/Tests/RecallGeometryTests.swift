@@ -7,6 +7,11 @@ final class RecallGeometryTests: XCTestCase {
         XCTAssertEqual(RecallGeometry.controlBarTopPadding(safeAreaTop: 32), 44)
     }
 
+    func testOverlaySettingsLeavesRoomForMomentActions() {
+        XCTAssertEqual(RecallGeometry.overlaySettingsReservedWidth(), 50)
+        XCTAssertEqual(RecallGeometry.detailsMenuTopPadding(chromeTopPadding: 44), 96)
+    }
+
     func testDragLeftMovesForwardAndClamps() {
         XCTAssertEqual(
             RecallGeometry.index(fromDragTranslation: -120, originIndex: 3, count: 10, pointsPerMoment: 50),

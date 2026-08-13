@@ -62,6 +62,11 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.bundleIdentifier = bundleIdentifier
     }
 
+    public var hasVisibleTranscript: Bool {
+        guard let transcriptText else { return false }
+        return !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case sessionId = "session_id"
@@ -341,12 +346,33 @@ public struct RecallVisualTuning: Equatable, Sendable {
 }
 
 public enum RecallGeometry {
+    public static let overlayChromeButtonSize: CGFloat = 40
+    public static let overlayChromeMargin: CGFloat = 26
+    /// Space between sibling buttons inside one chrome cluster.
+    public static let overlayChromeItemGap: CGFloat = 10
+
     public static func controlBarTopPadding(
         safeAreaTop: CGFloat,
         minimum: CGFloat = 22,
         clearance: CGFloat = 12
     ) -> CGFloat {
         max(minimum, safeAreaTop + clearance)
+    }
+
+    /// Extra trailing inset so moment actions sit clear of a separate overlay settings button.
+    public static func overlaySettingsReservedWidth(
+        buttonSize: CGFloat = overlayChromeButtonSize,
+        groupGap: CGFloat = overlayChromeItemGap
+    ) -> CGFloat {
+        buttonSize + groupGap
+    }
+
+    public static func detailsMenuTopPadding(
+        chromeTopPadding: CGFloat,
+        buttonSize: CGFloat = overlayChromeButtonSize,
+        gap: CGFloat = 12
+    ) -> CGFloat {
+        chromeTopPadding + buttonSize + gap
     }
 
     public static func clampedIndex(_ index: Int, count: Int) -> Int? {

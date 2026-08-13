@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let response = record_stop(&state).await;
+    let response = record_stop(&state, None).await;
     if !response.ok {
         eprintln!(
             "could not finish the active session during shutdown: {}",
@@ -308,7 +308,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
         }
         Request::RecordStart => record_start(state).await,
-        Request::RecordStop => record_stop(state).await,
+        Request::RecordStop { reason } => record_stop(state, reason.as_deref()).await,
         Request::SessionsList => into_response(state.store.sessions_sync()),
         Request::TimelineList => into_response(state.store.timeline_sync()),
         Request::TimelineSince { since_ms } => {
@@ -366,6 +366,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
 }
 
 async fn record_start(state: &Arc<AppState>) -> Response {
+    let _ = state.store.end_open_idle_spans(now_ms());
     let mut recording = state.recording.lock().await;
     if let Some(id) = &recording.active_session_id {
         return Response::success(serde_json::json!({"session_id": id, "already_recording": true}));
@@ -520,7 +521,10 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
     )
 }
 
-async fn record_stop(state: &Arc<AppState>) -> Response {
+async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
+    let _ = state
+        .store
+        .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
     let (session_id, scheduler, consumer) = {
         let mut recording = state.recording.lock().await;
         let Some(session_id) = recording.active_session_id.take() else {

@@ -19,6 +19,9 @@ public struct RecallView: View {
     public var isAudioBuffering: Bool
     public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
+    public var onOpenSettings: (() -> Void)?
+    public var chromeTopPadding: CGFloat
+    public var trailingChromeInset: CGFloat
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var movementDirection = -1
@@ -39,7 +42,10 @@ public struct RecallView: View {
         isAudioPlaying: Bool = false,
         isAudioBuffering: Bool = false,
         playingAudioArtifactID: String? = nil,
-        onReload: (() -> Void)? = nil
+        onReload: (() -> Void)? = nil,
+        onOpenSettings: (() -> Void)? = nil,
+        chromeTopPadding: CGFloat = 22,
+        trailingChromeInset: CGFloat = 0
     ) {
         self.moments = moments
         self._playheadMs = playheadMs
@@ -54,6 +60,9 @@ public struct RecallView: View {
         self.isAudioBuffering = isAudioBuffering
         self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
+        self.onOpenSettings = onOpenSettings
+        self.chromeTopPadding = chromeTopPadding
+        self.trailingChromeInset = trailingChromeInset
     }
 
     private var selectedAudioIsActive: Bool {
@@ -112,8 +121,9 @@ public struct RecallView: View {
             VStack(spacing: 0) {
                 if !isLive {
                     momentHeader
-                        .padding(.horizontal, 26)
-                        .padding(.top, 22)
+                        .frame(height: RecallGeometry.overlayChromeButtonSize, alignment: .center)
+                        .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                        .padding(.top, chromeTopPadding)
                 }
 
                 Spacer(minLength: 100)
@@ -121,7 +131,8 @@ public struct RecallView: View {
                 if !isLive {
                     TranscriptCaption(
                         text: selectedMoment?.transcriptText,
-                        canPlay: selectedMoment?.audioArtifactId != nil,
+                        canPlay: selectedMoment?.audioArtifactId != nil
+                            && (selectedMoment?.hasVisibleTranscript ?? false),
                         isPlaying: isAudioPlaying && selectedAudioIsActive,
                         isBuffering: isAudioBuffering && selectedAudioIsActive,
                         onToggleAudio: {
@@ -130,7 +141,7 @@ public struct RecallView: View {
                             }
                         }
                     )
-                    .padding(.horizontal, 48)
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                     .padding(.bottom, 12)
                 }
 
@@ -143,7 +154,7 @@ public struct RecallView: View {
                     onSelectMs: { selectPlayhead(playheadMs: $0) },
                     onViewportWidthChange: { timelineViewportWidth = $0 }
                 )
-                .padding(.horizontal, 26)
+                .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                 .padding(.bottom, 18)
             }
 
@@ -159,8 +170,8 @@ public struct RecallView: View {
                     playingAudioArtifactID: playingAudioArtifactID,
                     onClose: { showsDetails = false }
                 )
-                .padding(.top, 76)
-                .padding(.trailing, 24)
+                .padding(.top, RecallGeometry.detailsMenuTopPadding(chromeTopPadding: chromeTopPadding))
+                .padding(.trailing, RecallGeometry.overlayChromeMargin)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
@@ -172,7 +183,7 @@ public struct RecallView: View {
         .simultaneousGesture(recallDrag)
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
-            guard !isLive, let moment = selectedMoment, moment.audioArtifactId != nil else {
+            guard !isLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
                 return .ignored
             }
             onToggleAudio?(moment)
@@ -211,7 +222,7 @@ public struct RecallView: View {
     }
 
     private var momentHeader: some View {
-        HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .center, spacing: RecallGeometry.overlayChromeItemGap) {
             AppIdentity(moment: selectedMoment)
 
             Spacer(minLength: 24)
@@ -219,52 +230,45 @@ public struct RecallView: View {
             if isProcessing {
                 Label("Understanding", systemImage: "sparkles")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.white.opacity(0.72))
-                    .padding(.horizontal, 11)
-                    .frame(height: 34)
-                    .background(.black.opacity(0.34), in: Capsule())
+                    .foregroundStyle(.white.opacity(0.86))
+                    .padding(.horizontal, 12)
+                    .frame(height: RecallGeometry.overlayChromeButtonSize)
+                    .recallGlass(in: .capsule)
             }
 
-            chromeButton(
-                symbol: selectedMoment?.isFavorite == true ? "star.fill" : "star",
-                help: selectedMoment?.isFavorite == true ? "Remove favorite" : "Keep this moment",
-                tint: selectedMoment?.isFavorite == true ? RecallPalette.ray : .white,
-                action: { onToggleFavorite?() }
-            )
-            .disabled(selectedMoment == nil || onToggleFavorite == nil)
+            RecallGlassCluster {
+                HStack(spacing: RecallGeometry.overlayChromeItemGap) {
+                    RecallChromeIconButton(
+                        symbol: selectedMoment?.isFavorite == true ? "star.fill" : "star",
+                        help: selectedMoment?.isFavorite == true ? "Remove favorite" : "Keep this moment",
+                        tint: selectedMoment?.isFavorite == true ? RecallPalette.ray : .white,
+                        action: { onToggleFavorite?() }
+                    )
+                    .disabled(selectedMoment == nil || onToggleFavorite == nil)
 
-            chromeButton(
-                symbol: showsDetails ? "sidebar.right" : "info.circle",
-                help: showsDetails ? "Hide captured context" : "Show captured context",
-                tint: .white,
-                action: {
-                    if showsDetails {
-                        showsDetails = false
-                    } else {
-                        detailsPage = .root
-                        showsDetails = true
+                    RecallChromeIconButton(
+                        symbol: showsDetails ? "sidebar.right" : "info.circle",
+                        help: showsDetails ? "Hide captured context" : "Show captured context",
+                        action: {
+                            if showsDetails {
+                                showsDetails = false
+                            } else {
+                                detailsPage = .root
+                                showsDetails = true
+                            }
+                        }
+                    )
+
+                    if let onOpenSettings {
+                        RecallChromeIconButton(
+                            symbol: "gearshape",
+                            help: "Settings",
+                            action: onOpenSettings
+                        )
                     }
                 }
-            )
+            }
         }
-    }
-
-    private func chromeButton(
-        symbol: String,
-        help: String,
-        tint: Color,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 38, height: 38)
-                .background(.black.opacity(0.36), in: Circle())
-                .overlay { Circle().stroke(.white.opacity(0.13), lineWidth: 1) }
-        }
-        .buttonStyle(RecallPressButtonStyle())
-        .help(help)
     }
 
     private var recallDrag: some Gesture {
@@ -504,9 +508,9 @@ private struct AppIdentity: View {
 
     var body: some View {
         HStack(spacing: 11) {
-            ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 30)
+            ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 26)
             VStack(alignment: .leading, spacing: 1) {
-                Text(moment?.applicationName ?? "Unknown app")
+                Text(moment?.applicationName ?? "休眠")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                 Text("AFTER RAY")
@@ -517,10 +521,8 @@ private struct AppIdentity: View {
         }
         .padding(.leading, 6)
         .padding(.trailing, 14)
-        .frame(height: 44)
-        .background(.black.opacity(0.38), in: Capsule())
-        .overlay { Capsule().stroke(.white.opacity(0.12), lineWidth: 1) }
-        .shadow(color: .black.opacity(0.25), radius: 14, y: 5)
+        .frame(height: RecallGeometry.overlayChromeButtonSize)
+        .recallGlass(in: .capsule)
     }
 }
 
@@ -584,8 +586,7 @@ private struct AppUsageTimeline: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
-        .background(.black.opacity(0.46), in: Capsule())
-        .overlay { Capsule().stroke(.white.opacity(0.12), lineWidth: 1) }
+        .recallGlass(in: .capsule)
         .overlay(alignment: .bottom) {
             Circle()
                 .fill(RecallPalette.ray)
@@ -614,7 +615,11 @@ private struct AppUsageTimeline: View {
                         height: tuning.timelineSegmentHeight
                     )
                     .frame(width: run.width, alignment: .leading)
-                    .help("\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))")
+                    .help(
+                        run.isIdle
+                            ? "休眠 · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                            : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                    )
                 }
             }
             .frame(width: layout.contentWidth, alignment: .leading)
@@ -654,7 +659,8 @@ private struct AppUsageSegmentView: View {
     let height: Double
 
     private var color: Color {
-        RecallPalette.appColor(seed: run.bundleIdentifier ?? run.applicationName)
+        if run.isIdle { return Color.white.opacity(0.08) }
+        return RecallPalette.appColor(seed: run.bundleIdentifier ?? run.applicationName)
     }
 
     var body: some View {
@@ -662,7 +668,9 @@ private struct AppUsageSegmentView: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(
                     LinearGradient(
-                        colors: [color.opacity(0.92), color.opacity(0.62)],
+                        colors: run.isIdle
+                            ? [Color.white.opacity(0.10), Color.white.opacity(0.04)]
+                            : [color.opacity(0.92), color.opacity(0.62)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -672,7 +680,7 @@ private struct AppUsageSegmentView: View {
                         .stroke(.white.opacity(0.15), lineWidth: 1)
                 }
 
-            if width >= 42 {
+            if width >= 42, !run.isIdle {
                 HStack(spacing: 7) {
                     ApplicationIcon(bundleIdentifier: run.bundleIdentifier, size: 22)
                     if width >= 92 {
@@ -861,7 +869,7 @@ private struct TranscriptCaption: View {
     }
 
     var body: some View {
-        if transcript != nil || canPlay {
+        if let transcript {
             HStack(alignment: .center, spacing: 12) {
                 if canPlay {
                     Button(action: onToggleAudio) {
@@ -882,30 +890,19 @@ private struct TranscriptCaption: View {
                     .buttonStyle(.plain)
                     .help(playHelp)
                 }
-                if let transcript {
-                    Text(transcript)
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.9))
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Text(isBuffering ? "Starting…" : "Play the audio captured around this moment")
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.62))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                Text(transcript)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.leading, 8)
             .padding(.trailing, 16)
             .padding(.vertical, 8)
             .frame(maxWidth: 720)
-            .background(.black.opacity(0.38), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(.white.opacity(0.12), lineWidth: 1)
-            }
+            .recallGlass(in: .rounded(18))
             .frame(maxWidth: .infinity)
         }
     }
@@ -954,8 +951,7 @@ private struct RecallDetailsMenu: View {
             .frame(maxHeight: 320, alignment: .top)
         }
         .frame(width: 340)
-        .recallOverlayPanel(cornerRadius: 18)
-        .shadow(color: .black.opacity(0.5), radius: 28, y: 12)
+        .recallGlass(in: .rounded(18))
         .onChange(of: moment.id) { _, _ in
             page = .root
         }
@@ -1028,7 +1024,7 @@ private struct RecallDetailsMenu: View {
                 ) {
                     page = .accessibility
                 }
-                if moment.audioArtifactId != nil {
+                if moment.hasVisibleTranscript, moment.audioArtifactId != nil {
                     let isThis = moment.audioArtifactId == playingAudioArtifactID
                     Button {
                         onToggleAudio?(moment)
@@ -1274,7 +1270,7 @@ private struct FailureView: View {
 private struct RecallPressButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .opacity(configuration.isPressed ? 0.76 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
@@ -1318,10 +1314,6 @@ public enum RecallPalette {
 
 public extension View {
     func recallOverlayPanel(cornerRadius: CGFloat) -> some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        return self
-            .background(.ultraThinMaterial, in: shape)
-            .background(RecallPalette.panelDim, in: shape)
-            .overlay { shape.stroke(RecallPalette.panelStroke, lineWidth: 1) }
+        recallGlass(in: .rounded(cornerRadius))
     }
 }

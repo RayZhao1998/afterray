@@ -82,7 +82,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
         return RecordStartResult(sessionId: "s1")
     }
 
-    func recordStop() async throws -> RecordStopResult {
+    func recordStop(reason _: String?) async throws -> RecordStopResult {
         recordCommands.append("stop")
         recordingState = .idle
         return RecordStopResult(sessionId: "s1")

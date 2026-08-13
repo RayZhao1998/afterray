@@ -19,7 +19,10 @@ pub enum Request {
     Ping,
     Status,
     RecordStart,
-    RecordStop,
+    RecordStop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     SessionsList,
     TimelineList,
     TimelineSince {
@@ -235,6 +238,16 @@ mod tests {
         assert_eq!(json, r#"{"type":"record_start"}"#);
         let decoded: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Request::RecordStart));
+        let stop: Request = serde_json::from_str(r#"{"type":"record_stop"}"#).unwrap();
+        assert!(matches!(stop, Request::RecordStop { reason: None }));
+        let locked: Request =
+            serde_json::from_str(r#"{"type":"record_stop","reason":"lock"}"#).unwrap();
+        assert!(matches!(
+            locked,
+            Request::RecordStop {
+                reason: Some(ref value)
+            } if value == "lock"
+        ));
     }
 
     #[test]

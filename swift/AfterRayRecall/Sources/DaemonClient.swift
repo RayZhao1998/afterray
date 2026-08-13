@@ -32,7 +32,7 @@ public protocol RecallDaemonServing: Sendable {
 public protocol AfterRayDaemonServing: RecallDaemonServing {
     func status() async throws -> DaemonStatus
     func recordStart() async throws -> RecordStartResult
-    func recordStop() async throws -> RecordStopResult
+    func recordStop(reason: String?) async throws -> RecordStopResult
     func search(query: String, limit: Int) async throws -> [RecallSearchHit]
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
@@ -73,8 +73,8 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         try await request(WireRequest(type: "record_start"), as: RecordStartResult.self)
     }
 
-    public func recordStop() async throws -> RecordStopResult {
-        try await request(WireRequest(type: "record_stop"), as: RecordStopResult.self)
+    public func recordStop(reason: String? = nil) async throws -> RecordStopResult {
+        try await request(WireRequest(type: "record_stop", reason: reason), as: RecordStopResult.self)
     }
 
     public func shutdown() async throws -> DaemonShutdownResult {
@@ -178,6 +178,7 @@ struct WireRequest: Encodable, Equatable {
     var query: String?
     var sinceMs: Int64?
     var recordAudio: Bool?
+    var reason: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -190,6 +191,7 @@ struct WireRequest: Encodable, Equatable {
         case query
         case sinceMs = "since_ms"
         case recordAudio = "record_audio"
+        case reason
     }
 }
 

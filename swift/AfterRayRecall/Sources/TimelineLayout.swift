@@ -27,9 +27,10 @@ public struct AppUsageRun: Equatable, Identifiable, Sendable {
     public let endIndex: Int
     public let startX: CGFloat
     public let width: CGFloat
+    public let isIdle: Bool
 
-    public var applicationName: String { identity.name }
-    public var bundleIdentifier: String? { identity.bundleIdentifier }
+    public var applicationName: String { isIdle ? "休眠" : identity.name }
+    public var bundleIdentifier: String? { isIdle ? nil : identity.bundleIdentifier }
     public var durationMs: Int64 { max(endMs - startMs, 1) }
     public var endX: CGFloat { startX + width }
 
@@ -56,6 +57,9 @@ public struct TimelineLayout: Equatable, Sendable {
     public let contentWidth: CGFloat
 
     public static let minimumSegmentWidth: CGFloat = 5
+    public static let idleGapThresholdMs: Int64 = 30_000
+    public static let captureIntervalMs: Int64 = 10_000
+    public static let maximumIdleVisualDurationMs: Int64 = 120_000
 
     public init(
         moments: [RecallMoment],
@@ -69,15 +73,15 @@ public struct TimelineLayout: Equatable, Sendable {
         endMs = bounds.endMs
 
         let rawRuns = Self.makeRuns(moments: moments, endMs: bounds.endMs)
-        let totalDuration = max(bounds.endMs - bounds.startMs, 1)
-        let seconds = CGFloat(totalDuration) / 1_000
+        let visualTotal = max(rawRuns.reduce(Int64(0)) { $0 + $1.visualDurationMs }, 1)
+        let seconds = CGFloat(visualTotal) / 1_000
         let baseWidth = max(max(viewportWidth, 1) * 1.18, min(seconds * CGFloat(density), 9_000))
 
         var cursor: CGFloat = 0
         var placed: [AppUsageRun] = []
         placed.reserveCapacity(rawRuns.count)
         for raw in rawRuns {
-            let natural = baseWidth * CGFloat(raw.durationMs) / CGFloat(totalDuration)
+            let natural = baseWidth * CGFloat(raw.visualDurationMs) / CGFloat(visualTotal)
             let width = max(natural, minimumSegmentWidth)
             placed.append(
                 AppUsageRun(
@@ -88,7 +92,8 @@ public struct TimelineLayout: Equatable, Sendable {
                     startIndex: raw.startIndex,
                     endIndex: raw.endIndex,
                     startX: cursor,
-                    width: width
+                    width: width,
+                    isIdle: raw.isIdle
                 )
             )
             cursor += width
@@ -164,7 +169,14 @@ public struct TimelineLayout: Equatable, Sendable {
         let endMs: Int64
         let startIndex: Int
         let endIndex: Int
+        let isIdle: Bool
         var durationMs: Int64 { max(endMs - startMs, 1) }
+        var visualDurationMs: Int64 {
+            if isIdle {
+                return min(durationMs, TimelineLayout.maximumIdleVisualDurationMs)
+            }
+            return durationMs
+        }
     }
 
     private static func makeRuns(moments: [RecallMoment], endMs: Int64) -> [RawRun] {
@@ -172,20 +184,46 @@ public struct TimelineLayout: Equatable, Sendable {
         var collected: [RawRun] = []
         var runStart = 0
         for index in 1...moments.count {
-            let endsRun = index == moments.count
-                || AppUsageIdentity.of(moments[index]) != AppUsageIdentity.of(moments[runStart])
-            guard endsRun else { continue }
-            let runEndMs = index < moments.count ? moments[index].capturedAtMs : endMs
+            let atEnd = index == moments.count
+            let nextGap = atEnd ? 0 : moments[index].capturedAtMs - moments[index - 1].capturedAtMs
+            let identityChanged = !atEnd
+                && AppUsageIdentity.of(moments[index]) != AppUsageIdentity.of(moments[runStart])
+            let idleAhead = !atEnd && nextGap > idleGapThresholdMs
+            guard atEnd || identityChanged || idleAhead else { continue }
+
+            let lastMoment = moments[index - 1]
+            let appEndMs: Int64
+            if atEnd {
+                appEndMs = endMs
+            } else if idleAhead {
+                appEndMs = min(lastMoment.capturedAtMs + captureIntervalMs, moments[index].capturedAtMs)
+            } else {
+                appEndMs = moments[index].capturedAtMs
+            }
             collected.append(
                 RawRun(
                     id: collected.count,
                     identity: .of(moments[runStart]),
                     startMs: moments[runStart].capturedAtMs,
-                    endMs: runEndMs,
+                    endMs: appEndMs,
                     startIndex: runStart,
-                    endIndex: index - 1
+                    endIndex: index - 1,
+                    isIdle: false
                 )
             )
+            if idleAhead {
+                collected.append(
+                    RawRun(
+                        id: collected.count,
+                        identity: AppUsageIdentity(name: "休眠", bundleIdentifier: nil),
+                        startMs: appEndMs,
+                        endMs: moments[index].capturedAtMs,
+                        startIndex: index - 1,
+                        endIndex: index - 1,
+                        isIdle: true
+                    )
+                )
+            }
             runStart = index
         }
         return collected
@@ -193,10 +231,19 @@ public struct TimelineLayout: Equatable, Sendable {
 }
 
 public enum RecallPlayhead {
-    /// Last captured frame at or before `playheadMs`. Empty timelines resolve to nil.
+    /// Last captured frame at or before `playheadMs`. Idle gaps resolve to nil.
     public static func resolve(playheadMs: Int64, moments: [RecallMoment]) -> RecallMoment? {
         guard let index = resolveIndex(playheadMs: playheadMs, moments: moments) else { return nil }
-        return moments[index]
+        let moment = moments[index]
+        if index + 1 < moments.count {
+            let gap = moments[index + 1].capturedAtMs - moment.capturedAtMs
+            if gap > TimelineLayout.idleGapThresholdMs,
+               playheadMs > moment.capturedAtMs + TimelineLayout.captureIntervalMs
+            {
+                return nil
+            }
+        }
+        return moment
     }
 
     public static func resolveIndex(playheadMs: Int64, moments: [RecallMoment]) -> Int? {

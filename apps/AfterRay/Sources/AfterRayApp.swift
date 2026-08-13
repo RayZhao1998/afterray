@@ -56,8 +56,12 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_: Notification) {
-        let center = NSWorkspace.shared.notificationCenter
-        workspaceObservers.forEach(center.removeObserver)
+        let workspace = NSWorkspace.shared.notificationCenter
+        let distributed = DistributedNotificationCenter.default()
+        workspaceObservers.forEach { observer in
+            workspace.removeObserver(observer)
+            distributed.removeObserver(observer)
+        }
         workspaceObservers.removeAll()
         AfterRayMenuBar.shared.remove()
         RecallOverlayController.shared.stop()
@@ -98,38 +102,68 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
 
     private func observeSystemSessionSecurityEvents() {
         let center = NSWorkspace.shared.notificationCenter
-        let suspendNotifications: [Notification.Name] = [
-            NSWorkspace.sessionDidResignActiveNotification,
-            NSWorkspace.screensDidSleepNotification,
-            NSWorkspace.willSleepNotification,
+        let suspendNotifications: [(Notification.Name, String)] = [
+            (NSWorkspace.sessionDidResignActiveNotification, "lock"),
+            (NSWorkspace.screensDidSleepNotification, "sleep"),
+            (NSWorkspace.willSleepNotification, "sleep"),
         ]
         let resumeNotifications: [Notification.Name] = [
             NSWorkspace.sessionDidBecomeActiveNotification,
             NSWorkspace.screensDidWakeNotification,
             NSWorkspace.didWakeNotification,
         ]
-        workspaceObservers += suspendNotifications.map { name in
+        workspaceObservers += suspendNotifications.map { name, reason in
             center.addObserver(forName: name, object: nil, queue: .main) { _ in
                 Task { @MainActor in
-                    NotificationCenter.default.post(
-                        name: .afterRaySystemSessionWillSuspend,
-                        object: nil
-                    )
-                    DaemonSupervisor.shared.suspendForSystemLock()
+                    await AfterRayAppDelegate.pauseCapture(reason: reason)
                 }
             }
         }
         workspaceObservers += resumeNotifications.map { name in
             center.addObserver(forName: name, object: nil, queue: .main) { _ in
                 Task { @MainActor in
-                    DaemonSupervisor.shared.resumeAfterSystemUnlock()
-                    NotificationCenter.default.post(
-                        name: .afterRaySystemSessionDidResume,
-                        object: nil
-                    )
+                    AfterRayAppDelegate.resumeCapture()
                 }
             }
         }
+
+        let distributed = DistributedNotificationCenter.default()
+        workspaceObservers.append(
+            distributed.addObserver(
+                forName: Notification.Name("com.apple.screenIsLocked"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    await AfterRayAppDelegate.pauseCapture(reason: "lock")
+                }
+            }
+        )
+        workspaceObservers.append(
+            distributed.addObserver(
+                forName: Notification.Name("com.apple.screenIsUnlocked"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    AfterRayAppDelegate.resumeCapture()
+                }
+            }
+        )
+    }
+
+    @MainActor
+    fileprivate static func pauseCapture(reason: String) async {
+        NotificationCenter.default.post(name: .afterRaySystemSessionWillSuspend, object: nil)
+        DaemonSupervisor.shared.suspendForSystemLock()
+        let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+        _ = try? await client.recordStop(reason: reason)
+    }
+
+    @MainActor
+    fileprivate static func resumeCapture() {
+        DaemonSupervisor.shared.resumeAfterSystemUnlock()
+        NotificationCenter.default.post(name: .afterRaySystemSessionDidResume, object: nil)
     }
 }
 
@@ -295,7 +329,6 @@ final class RecallOverlayController {
         panel.collectionBehavior = [
             .canJoinAllSpaces,
             .fullScreenAuxiliary,
-            .transient,
             .ignoresCycle,
         ]
         self.panel = panel
@@ -305,7 +338,7 @@ final class RecallOverlayController {
             queue: .main
         ) { _ in
             Task { @MainActor in
-                if AfterRaySettingsController.shared.isVisible { return }
+                if AfterRaySettingsController.shared.isPresented { return }
                 RecallOverlayController.shared.hide(returnFocus: false)
             }
         }
@@ -315,6 +348,10 @@ final class RecallOverlayController {
     }
 
     var isVisible: Bool { panel?.isVisible == true }
+
+    var currentScreen: NSScreen? {
+        panel?.screen ?? targetScreen
+    }
 
     func makeKeyIfVisible() {
         guard let panel, panel.isVisible else { return }
@@ -739,7 +776,9 @@ private struct AfterRayRootView: View {
             isAudioPlaying: audioPlayer.isPlaying,
             isAudioBuffering: audioPlayer.isBuffering,
             playingAudioArtifactID: audioPlayer.playingArtifactID,
-            onReload: reload
+            onReload: reload,
+            onOpenSettings: { AfterRaySettingsController.shared.show() },
+            chromeTopPadding: controlBarTopPadding
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(permissions.allGranted ? 1 : 0)
@@ -748,21 +787,6 @@ private struct AfterRayRootView: View {
                 ? Color.clear
                 : Color(red: 0.025, green: 0.022, blue: 0.026)
         )
-        .overlay(alignment: .topTrailing) {
-            Button(action: { AfterRaySettingsController.shared.show() }) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.84))
-                    .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .background(.black.opacity(0.28), in: Circle())
-                    .overlay { Circle().stroke(.white.opacity(0.13), lineWidth: 1) }
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
-            .padding(.top, controlBarTopPadding)
-            .padding(.trailing, 22)
-        }
         .overlay(alignment: .top) {
             ImmersiveControlBar(
                 model: control,
@@ -773,6 +797,13 @@ private struct AfterRayRootView: View {
             .padding(.top, controlBarTopPadding)
         }
         .overlay(alignment: .topTrailing) {
+            if isLive {
+                OverlaySettingsButton(action: { AfterRaySettingsController.shared.show() })
+                    .padding(.top, controlBarTopPadding)
+                    .padding(.trailing, RecallGeometry.overlayChromeMargin)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
             if !control.searchHits.isEmpty {
                 SearchResultsPanel(
                     hits: control.searchHits,
@@ -780,8 +811,8 @@ private struct AfterRayRootView: View {
                     onDismiss: control.dismissSearch
                 )
                 .frame(width: 390)
-                .padding(.top, controlBarTopPadding + 52)
-                .padding(.trailing, 24)
+                .padding(.top, RecallGeometry.detailsMenuTopPadding(chromeTopPadding: controlBarTopPadding))
+                .padding(.trailing, RecallGeometry.overlayChromeMargin)
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
         }
@@ -839,14 +870,14 @@ private struct AfterRayRootView: View {
             audioPlayer.stop()
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallToggleAudio)) { _ in
-            guard !isLive, let moment = store.selectedMoment, moment.audioArtifactId != nil else { return }
+            guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else { return }
             audioPlayer.toggle(moment: moment)
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
             Task {
                 guard await startDaemonOrReportFailure() != nil else { return }
                 permissions.refresh()
-                if permissions.allGranted {
+                if permissions.allGranted, !DaemonSupervisor.shared.isCapturePausedForSystemLock {
                     _ = await control.ensureRecording()
                 }
                 await store.refreshTimeline(preservingSelection: !isLive)
@@ -866,7 +897,7 @@ private struct AfterRayRootView: View {
     }
 
     private var audioPrefetchKey: String {
-        guard !isLive, let artifactID = store.selectedMoment?.audioArtifactId else { return "" }
+        guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, let artifactID = moment.audioArtifactId else { return "" }
         return artifactID
     }
 
@@ -901,7 +932,7 @@ private struct AfterRayRootView: View {
         while !Task.isCancelled {
             if let restarted = await startDaemonOrReportFailure(), restarted {
                 permissions.refresh()
-                if permissions.allGranted {
+                if permissions.allGranted, !DaemonSupervisor.shared.isCapturePausedForSystemLock {
                     _ = await control.ensureRecording()
                 } else {
                     await control.refreshStatus()
@@ -1038,6 +1069,18 @@ private struct PermissionPanel: View {
     }
 }
 
+private struct OverlaySettingsButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        RecallChromeIconButton(
+            symbol: "gearshape",
+            help: "Settings",
+            action: action
+        )
+    }
+}
+
 private struct ImmersiveControlBar: View {
     @ObservedObject var model: AfterRayControlModel
     let onToggleRecording: () -> Void
@@ -1100,11 +1143,8 @@ private struct ImmersiveControlBar: View {
             .help("Close AfterRay")
         }
         .padding(.horizontal, 14)
-        .frame(height: 40)
-        .background(.ultraThinMaterial, in: Capsule())
-        .background(.black.opacity(0.28), in: Capsule())
-        .overlay { Capsule().stroke(.white.opacity(0.13), lineWidth: 1) }
-        .shadow(color: .black.opacity(0.34), radius: 18, y: 6)
+        .frame(height: RecallGeometry.overlayChromeButtonSize)
+        .recallGlass(in: .capsule)
     }
 
     private var statusLabel: String {
@@ -1168,12 +1208,7 @@ private struct SearchResultsPanel: View {
             }
             .frame(maxHeight: 390)
         }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 12)
+        .recallGlass(in: .rounded(16))
     }
 
     private func sourceIcon(_ source: String) -> String {

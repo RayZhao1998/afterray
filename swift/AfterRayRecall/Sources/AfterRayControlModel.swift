@@ -56,7 +56,7 @@ public final class AfterRayControlModel: ObservableObject {
         defer { isChangingRecording = false }
         do {
             if isRecording {
-                _ = try await daemon.recordStop()
+                _ = try await daemon.recordStop(reason: "pause")
             } else {
                 _ = try await daemon.recordStart()
             }

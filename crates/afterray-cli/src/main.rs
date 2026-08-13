@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         } => Request::RecordStart,
         Command::Record {
             command: RecordCommand::Stop,
-        } => Request::RecordStop,
+        } => Request::RecordStop { reason: None },
         Command::Sessions {
             command: SessionsCommand::List,
         } => Request::SessionsList,
