@@ -150,6 +150,9 @@ impl ModelAdapter for ProcessAdapter {
             result = &mut wait => result?,
         };
 
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AdapterError::Process(truncate(&stderr, 4_096)));

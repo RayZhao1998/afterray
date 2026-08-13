@@ -703,20 +703,15 @@ private struct AppIdentity: View {
     let moment: RecallMoment?
 
     var body: some View {
-        HStack(spacing: 11) {
-            ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 26)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(moment?.applicationName ?? "休眠")
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .lineLimit(1)
-                Text("AFTER RAY")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .tracking(1.6)
-                    .foregroundStyle(RecallPalette.ray)
-            }
+        HStack(spacing: 9) {
+            ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
+            Text(moment?.applicationName ?? "Idle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(1)
         }
-        .padding(.leading, 6)
-        .padding(.trailing, 14)
+        .padding(.leading, 7)
+        .padding(.trailing, 12)
         .frame(height: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
     }
@@ -814,6 +809,7 @@ private struct AppUsageTimeline: View {
                         width: drawnWidth,
                         height: run.isIdle ? 7 : tuning.timelineSegmentHeight
                     )
+                    .frame(width: drawnWidth, height: run.isIdle ? 7 : tuning.timelineSegmentHeight)
                     .frame(
                         width: run.width,
                         height: tuning.timelineSegmentHeight,
@@ -859,9 +855,13 @@ private struct AppUsageSegmentView: View {
         )
     }
 
+    private var cornerRadius: CGFloat {
+        min(run.isIdle ? 3 : 9, width / 2, height / 2)
+    }
+
     var body: some View {
         ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: run.isIdle ? 3 : 9, style: .continuous)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: run.isIdle
@@ -872,8 +872,8 @@ private struct AppUsageSegmentView: View {
                     )
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: run.isIdle ? 3 : 9, style: .continuous)
-                        .stroke(.white.opacity(run.isIdle ? 0.20 : 0.15), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(.white.opacity(run.isIdle ? 0.20 : 0.15), lineWidth: 1)
                 }
 
             if width >= 42, !run.isIdle {
@@ -919,6 +919,10 @@ private struct ApplicationIcon: View {
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size * 0.24, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+        }
     }
 
     private var icon: NSImage? {
@@ -1135,25 +1139,30 @@ private struct TranscriptCaption: View {
                                     .foregroundStyle(.white)
                             }
                         }
-                        .frame(width: 32, height: 32)
-                        .background(RecallPalette.ray.opacity(0.9), in: Circle())
+                        .frame(width: 30, height: 30)
+                        .background(RecallPalette.ray.opacity(0.92), in: Circle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(RecallPressButtonStyle())
                     .help(playHelp)
                 }
                 Text(transcript)
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.white.opacity(0.9))
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.leading, 8)
-            .padding(.trailing, 16)
-            .padding(.vertical, 8)
-            .frame(maxWidth: 720)
-            .recallGlass(in: .rounded(18))
+            .padding(.leading, 10)
+            .padding(.trailing, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 760)
+            .background(.black.opacity(0.64), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(.white.opacity(0.10), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.28), radius: 12, y: 5)
             .frame(maxWidth: .infinity)
         }
     }
@@ -1202,7 +1211,7 @@ private struct RecallDetailsMenu: View {
             .frame(maxHeight: 320, alignment: .top)
         }
         .frame(width: 340)
-        .recallGlass(in: .rounded(18))
+        .recallGlass(in: .rounded(12))
         .onChange(of: moment.id) { _, _ in
             page = .root
         }
@@ -1462,24 +1471,30 @@ private struct EmptyRecallView: View {
     let isProcessing: Bool
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: isProcessing ? "sparkles.rectangle.stack" : "rectangle.stack")
-                .font(.system(size: 36, weight: .light))
-                .foregroundStyle(RecallPalette.ray)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 9) {
+                Rectangle()
+                    .fill(RecallPalette.ray)
+                    .frame(width: 18, height: 2)
+                Text(isProcessing ? "PREPARING FIRST MOMENT" : "CAPTURE IS READY")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(1.1)
+                    .foregroundStyle(RecallPalette.ray)
+            }
             Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
-                .font(.title2.weight(.medium))
+                .font(.system(size: 24, weight: .semibold))
             Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: 420, alignment: .leading)
         }
-        .multilineTextAlignment(.center)
-        .padding(40)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(28)
+        .background(.black.opacity(0.58), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(.white.opacity(0.13), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.42), radius: 30, y: 14)
+        .shadow(color: .black.opacity(0.36), radius: 24, y: 10)
     }
 }
 
@@ -1488,12 +1503,17 @@ private struct FailureView: View {
     let onReload: (() -> Void)?
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(RecallPalette.ray)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 9) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("LOCAL SERVICE UNAVAILABLE")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(1.0)
+            }
+            .foregroundStyle(RecallPalette.ray)
             Text("Couldn’t open your memory")
-                .font(.title3.weight(.medium))
+                .font(.system(size: 24, weight: .semibold))
             Text("The local AfterRay daemon failed to start.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -1504,17 +1524,20 @@ private struct FailureView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: 460, alignment: .leading)
             if let onReload {
-                Button("Try Again", action: onReload)
-                    .buttonStyle(RecallCapsuleButtonStyle())
+                HStack {
+                    Spacer()
+                    Button("Try Again", action: onReload)
+                        .buttonStyle(RecallCapsuleButtonStyle())
+                }
             }
         }
-        .padding(40)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(28)
+        .background(.black.opacity(0.66), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(.white.opacity(0.13), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.42), radius: 28, y: 12)
+        .shadow(color: .black.opacity(0.38), radius: 24, y: 10)
     }
 }
 

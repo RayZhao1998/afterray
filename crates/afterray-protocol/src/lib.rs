@@ -60,6 +60,10 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
     },
+    DownloadModels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack_id: Option<String>,
+    },
     Shutdown,
 }
 
@@ -67,6 +71,18 @@ pub enum Request {
 pub struct ModelLibrary {
     pub directory: String,
     pub packs: Vec<ModelPack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<ModelDownloadProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDownloadProgress {
+    pub pack_id: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_bytes: Option<u64>,
+    pub completed_files: u64,
+    pub total_files: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,6 +290,34 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
+        );
+    }
+
+    #[test]
+    fn download_models_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::DownloadModels { pack_id: None }).unwrap(),
+            r#"{"type":"download_models"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::DownloadModels {
+                pack_id: Some("asr".into())
+            })
+            .unwrap(),
+            r#"{"type":"download_models","pack_id":"asr"}"#
+        );
+    }
+
+    #[test]
+    fn model_library_omits_idle_download() {
+        let library = ModelLibrary {
+            directory: "/tmp/models".into(),
+            packs: Vec::new(),
+            download: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&library).unwrap(),
+            r#"{"directory":"/tmp/models","packs":[]}"#
         );
     }
 

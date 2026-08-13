@@ -167,14 +167,97 @@ public struct RecordStartResult: Codable, Equatable, Sendable {
 public struct ModelLibrary: Codable, Equatable, Sendable {
     public let directory: String
     public let packs: [ModelPack]
+    public let download: ModelDownloadProgress?
 
-    public init(directory: String, packs: [ModelPack]) {
+    public init(directory: String, packs: [ModelPack], download: ModelDownloadProgress? = nil) {
         self.directory = directory
         self.packs = packs
+        self.download = download
     }
 
     public var installedBytes: UInt64 {
         packs.reduce(0) { $0 + $1.bytes }
+    }
+}
+
+public struct ModelJob: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let capability: String
+    public let adapter: String
+    public let state: String
+    public let attempts: UInt32
+    public let createdAtMs: Int64
+    public let updatedAtMs: Int64
+    public let lastError: String?
+
+    public init(
+        id: String,
+        capability: String,
+        adapter: String,
+        state: String,
+        attempts: UInt32 = 1,
+        createdAtMs: Int64 = 0,
+        updatedAtMs: Int64 = 0,
+        lastError: String? = nil
+    ) {
+        self.id = id
+        self.capability = capability
+        self.adapter = adapter
+        self.state = state
+        self.attempts = attempts
+        self.createdAtMs = createdAtMs
+        self.updatedAtMs = updatedAtMs
+        self.lastError = lastError
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case capability
+        case adapter
+        case state
+        case attempts
+        case createdAtMs = "created_at_ms"
+        case updatedAtMs = "updated_at_ms"
+        case lastError = "last_error"
+    }
+}
+
+public struct ModelDownloadProgress: Codable, Equatable, Sendable {
+    public let packId: String
+    public let bytes: UInt64
+    public let expectedBytes: UInt64?
+    public let completedFiles: UInt64
+    public let totalFiles: UInt64
+
+    public init(
+        packId: String,
+        bytes: UInt64,
+        expectedBytes: UInt64? = nil,
+        completedFiles: UInt64 = 0,
+        totalFiles: UInt64 = 0
+    ) {
+        self.packId = packId
+        self.bytes = bytes
+        self.expectedBytes = expectedBytes
+        self.completedFiles = completedFiles
+        self.totalFiles = totalFiles
+    }
+
+    public var fraction: Double? {
+        guard let expected = expectedBytes, expected > 0 else { return nil }
+        return min(Double(bytes) / Double(expected), 1)
+    }
+
+    public var percent: Int? {
+        fraction.map { Int(($0 * 100).rounded(.down)) }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case packId = "pack_id"
+        case bytes
+        case expectedBytes = "expected_bytes"
+        case completedFiles = "completed_files"
+        case totalFiles = "total_files"
     }
 }
 

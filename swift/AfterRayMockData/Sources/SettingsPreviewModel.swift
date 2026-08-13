@@ -25,6 +25,21 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadStatus: String?
     @Published public var isUpdatingAudio = false
     @Published public var recordAudio = true
+    @Published public var recentJobs: [ModelJob] = [
+        ModelJob(
+            id: "job-asr",
+            capability: "asr",
+            adapter: "qwen3-asr",
+            state: "failed",
+            lastError: "model asset is missing"
+        ),
+        ModelJob(
+            id: "job-ocr",
+            capability: "ocr",
+            adapter: "vision-ocr",
+            state: "done"
+        ),
+    ]
 
     public var dataDirectoryPath: String { settings?.dataDir ?? "/tmp/afterray-data" }
     public var modelDirectoryPath: String { settings?.modelDir ?? "/tmp/afterray-models" }
@@ -39,23 +54,12 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                     id: "asr",
                     name: "Qwen3 ASR",
                     capability: "asr",
-                    path: "\(modelDirectoryPath)/Qwen3-ASR-1.7B-8bit",
+                    path: "\(modelDirectoryPath)/Qwen3-ASR-1.7B",
                     present: !missingASR,
-                    bytes: missingASR ? 0 : 2_460_000_000,
+                    bytes: missingASR ? 0 : 4_200_000_000,
                     required: true,
-                    note: "mlx-community/Qwen3-ASR-1.7B-8bit",
-                    expectedBytes: 2_460_000_000
-                ),
-                ModelPack(
-                    id: "asr-whisper",
-                    name: "Whisper ASR (fallback)",
-                    capability: "asr",
-                    path: "\(modelDirectoryPath)/ggml-large-v3-turbo-q5_0.bin",
-                    present: true,
-                    bytes: 547_000_000,
-                    required: false,
-                    note: "optional whisper.cpp fallback",
-                    expectedBytes: 547_000_000
+                    note: "Qwen/Qwen3-ASR-1.7B · Rust/Candle",
+                    expectedBytes: 4_200_000_000
                 ),
                 ModelPack(
                     id: "embedding",
@@ -63,20 +67,21 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                     capability: "embedding",
                     path: "\(modelDirectoryPath)/nomic-embed-text-v1.5.Q4_K_M.gguf",
                     present: true,
-                    bytes: 274_000_000,
+                    bytes: 84_000_000,
                     required: true,
+                    note: "nomic-embed-text v1.5 Q4 · llama.cpp",
                     expectedBytes: 84_000_000
                 ),
                 ModelPack(
                     id: "llm",
                     name: "Local LLM",
                     capability: "llm",
-                    path: "\(modelDirectoryPath)/gemma-4-26b-a4b-it-4bit",
+                    path: "\(modelDirectoryPath)/qwen2.5-3b-instruct-q4_k_m.gguf",
                     present: false,
                     bytes: 0,
                     required: false,
-                    note: "Gemma 4 4bit · about 15 GB",
-                    expectedBytes: 15_000_000_000
+                    note: "Qwen2.5-3B Instruct Q4 · optional",
+                    expectedBytes: 2_000_000_000
                 ),
             ]
         )
@@ -100,9 +105,10 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     public func download(packID: String?) async {
         downloadingID = packID ?? "all"
-        downloadStatus = "Preview download of \(packID ?? "missing models")…"
+        downloadStatus = "Downloading \(packID ?? "models") · 15%"
         downloadProgress = 0.15
         try? await Task.sleep(for: .milliseconds(400))
+        downloadStatus = "Downloading \(packID ?? "models") · 70%"
         downloadProgress = 0.7
         try? await Task.sleep(for: .milliseconds(400))
         if let packID, let current = library {

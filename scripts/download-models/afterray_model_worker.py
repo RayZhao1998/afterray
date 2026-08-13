@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""AfterRay-managed local model worker.
+"""Legacy Python worker. Unused.
 
-Reads one WorkerRequest JSON object from stdin and writes one WorkerResponse to
-stdout. OCR is handled by the native Swift worker. This process runs ASR with
-mlx-audio (Qwen3-ASR by default, whisper.cpp fallback), embeddings with
-llama.cpp, and Gemma 4 with MLX directly. It never contacts an Ollama service.
+AfterRay now ships `afterray-model-worker` (Rust). This script is kept only
+as a historical reference and is not launched by the daemon.
 """
 
 from __future__ import annotations

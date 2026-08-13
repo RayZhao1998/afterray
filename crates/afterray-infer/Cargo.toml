@@ -1,0 +1,24 @@
+[package]
+name = "afterray-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "afterray-model-worker"
+path = "src/bin/afterray-model-worker.rs"
+
+[dependencies]
+afterray-models = { path = "../afterray-models" }
+anyhow.workspace = true
+encoding_rs = "0.8"
+llama-cpp-2 = { version = "0.1.123", default-features = false, features = ["metal"] }
+qwen3-asr = { version = "0.2.2", default-features = false, features = ["metal"] }
+rubato = "0.16"
+serde_json.workspace = true
+symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3", "pcm"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

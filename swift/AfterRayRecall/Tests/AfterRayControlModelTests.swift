@@ -114,6 +114,14 @@ private actor ControlDaemon: AfterRayDaemonServing {
         )
     }
 
+    func downloadModels(packID: String?) async throws -> ModelLibrary {
+        ModelLibrary(directory: "/tmp/afterray-models", packs: [])
+    }
+
+    func jobs() async throws -> [ModelJob] {
+        []
+    }
+
     func search(query: String, limit: Int) async throws -> [RecallSearchHit] {
         lastSearchQuery = query
         return [

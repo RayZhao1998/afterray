@@ -1488,7 +1488,10 @@ fn migrate_artifact_columns(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn is_lock_screen_identity(application_name: Option<&str>, bundle_identifier: Option<&str>) -> bool {
+fn is_lock_screen_identity(
+    application_name: Option<&str>,
+    bundle_identifier: Option<&str>,
+) -> bool {
     application_name.is_some_and(|name| name.eq_ignore_ascii_case("loginwindow"))
         || bundle_identifier.is_some_and(|bundle| {
             bundle.eq_ignore_ascii_case("com.apple.loginwindow") || bundle.contains("loginwindow")
@@ -1507,7 +1510,10 @@ fn migrate_schema_6(connection: &Connection) -> Result<(), StoreError> {
             "gop_segment_id",
             "ALTER TABLE moments ADD COLUMN gop_segment_id TEXT",
         ),
-        ("gop_index", "ALTER TABLE moments ADD COLUMN gop_index INTEGER"),
+        (
+            "gop_index",
+            "ALTER TABLE moments ADD COLUMN gop_index INTEGER",
+        ),
         (
             "still_origin",
             "ALTER TABLE moments ADD COLUMN still_origin TEXT NOT NULL DEFAULT 'capture'",

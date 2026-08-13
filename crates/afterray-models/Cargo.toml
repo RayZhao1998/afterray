@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 afterray-protocol = { path = "../afterray-protocol" }
 async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

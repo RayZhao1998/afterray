@@ -1,13 +1,14 @@
 use afterray_models::{
     JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
-    ProcessAdapterConfig, QueueConfig,
+    ProcessAdapterConfig, QueueConfig, download_packs, library, model_directory,
+    specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, PROTOCOL_VERSION, RecordingState, Request, Response, SearchHit,
-    Status,
+    AppSettings, ArtifactPayload, ModelDownloadProgress, PROTOCOL_VERSION, RecordingState, Request,
+    Response, SearchHit, Status,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
@@ -86,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let capture = MacOsCaptureBackend::new(capture_config);
 
     let worker_path = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
-        || PathBuf::from("scripts/download-models/afterray_model_worker.py"),
+        || PathBuf::from("target/release/afterray-model-worker"),
         PathBuf::from,
     );
     let native_worker_path = std::env::var_os("AFTERRAY_NATIVE_MODEL_WORKER").map_or_else(
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         capture,
         models,
         recording: Mutex::new(RecordingRuntime::default()),
+        download: std::sync::Mutex::new(None),
         capture_interval: Duration::from_secs(
             std::env::var("AFTERRAY_CAPTURE_INTERVAL_SECONDS")
                 .ok()
@@ -186,17 +188,13 @@ fn local_model_adapters(
 ) -> Vec<Arc<dyn ModelAdapter>> {
     [
         (ModelCapability::Ocr, native_worker, "vision-ocr"),
-        (
-            ModelCapability::Asr,
-            general_worker.clone(),
-            "mlx-qwen3-asr",
-        ),
+        (ModelCapability::Asr, general_worker.clone(), "qwen3-asr"),
         (
             ModelCapability::Embedding,
             general_worker.clone(),
-            "llama-cpp-embedding",
+            "llama-embedding",
         ),
-        (ModelCapability::Llm, general_worker, "mlx-vlm"),
+        (ModelCapability::Llm, general_worker, "llama-llm"),
     ]
     .into_iter()
     .map(|(capability, program, name)| {
@@ -212,6 +210,7 @@ struct AppState {
     capture: Arc<MacOsCaptureBackend>,
     models: ModelQueue,
     recording: Mutex<RecordingRuntime>,
+    download: std::sync::Mutex<Option<ModelDownloadProgress>>,
     capture_interval: Duration,
     data_dir: PathBuf,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -346,7 +345,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 Err(error) => Response::failure(error.to_string()),
             }
         }
-        Request::ModelsStatus => Response::success(model_library()),
+        Request::ModelsStatus => Response::success(model_library(state)),
         Request::JobsList => Response::success(state.models.list().await),
         Request::JobRetry { job_id } => match state.models.retry(&job_id).await {
             Ok(snapshot) => Response::success(snapshot),
@@ -355,6 +354,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::Summarize { session_id } => summarize(state, &session_id).await,
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings { record_audio } => update_settings(state, record_audio).await,
+        Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
             Response::success(serde_json::json!({
@@ -495,7 +495,7 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
 fn current_settings(state: &AppState) -> AppSettings {
     AppSettings {
         data_dir: state.data_dir.display().to_string(),
-        model_dir: default_model_dir().display().to_string(),
+        model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
     }
@@ -709,21 +709,43 @@ async fn import_artifact(
             let model_state = Arc::clone(state);
             let path = path.to_path_buf();
             tokio::spawn(async move {
-                let snapshot = model_state.models.wait(&job).await;
-                if let Ok(snapshot) = snapshot
-                    && let Some(ModelOutput::Asr { text, .. }) = snapshot.output
-                    && let Ok(evidence_id) = model_state.store.insert_text_evidence(
-                        &segment.session_id,
-                        None,
-                        Some(&segment.id),
-                        "transcript",
-                        &text,
-                        segment.started_at_ms,
-                        Some(segment.ended_at_ms),
-                        &snapshot.adapter,
-                    )
-                {
-                    submit_embedding(&model_state, evidence_id, text).await;
+                match model_state.models.wait(&job).await {
+                    Ok(snapshot) => match snapshot.output {
+                        Some(ModelOutput::Asr { text, language }) => {
+                            if text.trim().is_empty() {
+                                eprintln!(
+                                    "asr produced no visible text for {} ({})",
+                                    segment.id,
+                                    language.as_deref().unwrap_or("auto")
+                                );
+                            } else if let Ok(evidence_id) = model_state.store.insert_text_evidence(
+                                &segment.session_id,
+                                None,
+                                Some(&segment.id),
+                                "transcript",
+                                &text,
+                                segment.started_at_ms,
+                                Some(segment.ended_at_ms),
+                                &snapshot.adapter,
+                            ) {
+                                submit_embedding(&model_state, evidence_id, text).await;
+                            }
+                        }
+                        None => eprintln!(
+                            "asr job {} ended {:?}{}",
+                            snapshot.id,
+                            snapshot.state,
+                            snapshot
+                                .last_error
+                                .as_deref()
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        ),
+                        Some(_) => {
+                            eprintln!("asr job {} returned a non-transcript output", snapshot.id)
+                        }
+                    },
+                    Err(error) => eprintln!("asr job {job} did not finish: {error}"),
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
@@ -886,138 +908,54 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     }
 }
 
-fn model_library() -> afterray_protocol::ModelLibrary {
-    let directory = default_model_dir();
-    afterray_protocol::ModelLibrary {
-        directory: directory.display().to_string(),
-        packs: vec![
-            inspect_pack(
-                "asr",
-                "Qwen3 ASR",
-                "asr",
-                env_or_join("AFTERRAY_ASR_MODEL", &directory, "Qwen3-ASR-1.7B-8bit"),
-                true,
-                Some("mlx-community/Qwen3-ASR-1.7B-8bit · ~2.5 GB · ZH/EN/JA"),
-                Some(2_460_000_000),
-            ),
-            inspect_pack(
-                "asr-whisper",
-                "Whisper ASR (fallback)",
-                "asr",
-                env_or_join(
-                    "AFTERRAY_WHISPER_MODEL",
-                    &directory,
-                    "ggml-large-v3-turbo-q5_0.bin",
-                ),
-                false,
-                Some("optional whisper.cpp large-v3-turbo q5 · AFTERRAY_ASR_BACKEND=whisper"),
-                Some(547_000_000),
-            ),
-            inspect_pack(
-                "embedding",
-                "Text embeddings",
-                "embedding",
-                env_or_join(
-                    "AFTERRAY_EMBEDDING_MODEL",
-                    &directory,
-                    "nomic-embed-text-v1.5.Q4_K_M.gguf",
-                ),
-                true,
-                Some("nomic-embed-text v1.5 Q4"),
-                Some(84_000_000),
-            ),
-            inspect_pack(
-                "llm",
-                "Local LLM",
-                "llm",
-                env_or_join("AFTERRAY_LLM_MODEL", &directory, "gemma-4-26b-a4b-it-4bit"),
-                false,
-                Some("Gemma 4 26B-A4B 4bit · about 15 GB"),
-                Some(15_000_000_000),
-            ),
-        ],
-    }
+fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
+    let mut library = library();
+    library.download = state
+        .download
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    library
 }
 
-fn default_model_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("AFTERRAY_MODEL_DIR") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = std::env::var_os("AFTERRAY_ASR_MODEL") {
-        if let Some(parent) = Path::new(&path).parent() {
-            return parent.to_path_buf();
-        }
-    }
-    if let Some(path) = std::env::var_os("AFTERRAY_WHISPER_MODEL") {
-        if let Some(parent) = Path::new(&path).parent() {
-            return parent.to_path_buf();
-        }
-    }
-    if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
-        let data = PathBuf::from(path);
-        if let Some(parent) = data.parent() {
-            return parent.join("models");
-        }
-    }
-    PathBuf::from(".afterray/models")
-}
-
-fn env_or_join(key: &str, directory: &Path, file_name: &str) -> PathBuf {
-    std::env::var_os(key)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| directory.join(file_name))
-}
-
-fn inspect_pack(
-    id: &str,
-    name: &str,
-    capability: &str,
-    path: PathBuf,
-    required: bool,
-    note: Option<&str>,
-    expected_bytes: Option<u64>,
-) -> afterray_protocol::ModelPack {
-    let (present, bytes) = inspect_model_path(&path);
-    afterray_protocol::ModelPack {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        capability: capability.to_owned(),
-        path: path.display().to_string(),
-        present,
-        bytes,
-        required,
-        note: note.map(ToOwned::to_owned),
-        expected_bytes,
-    }
-}
-
-fn inspect_model_path(path: &Path) -> (bool, u64) {
-    if path.is_file() {
-        return (
-            true,
-            std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-        );
-    }
-    if path.is_dir() {
-        return (true, directory_size(path));
-    }
-    (false, 0)
-}
-
-fn directory_size(path: &Path) -> u64 {
-    let mut total = 0;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
+async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Response {
+    let packs = match specs_for_download(pack_id) {
+        Ok(packs) => packs,
+        Err(error) => return Response::failure(error),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            total += directory_size(&path);
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
-        }
+    if packs.is_empty() {
+        return Response::success(model_library(state));
     }
-    total
+    let result = download_packs(&packs, |spec, progress| {
+        let snapshot = ModelDownloadProgress {
+            pack_id: spec.id.clone(),
+            bytes: progress.bytes,
+            expected_bytes: progress.expected_bytes,
+            completed_files: u64::try_from(progress.completed_files).unwrap_or(0),
+            total_files: u64::try_from(progress.total_files).unwrap_or(0),
+        };
+        if let Some(percent) = progress.percent() {
+            eprintln!("Downloading {} · {percent}%", spec.name);
+        } else {
+            eprintln!(
+                "Downloading {} ({}/{} files)",
+                spec.name, progress.completed_files, progress.total_files
+            );
+        }
+        *state
+            .download
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    })
+    .await;
+    *state
+        .download
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    match result {
+        Ok(()) => Response::success(model_library(state)),
+        Err(error) => Response::failure(error.to_string()),
+    }
 }
 
 fn into_response<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Response {

@@ -5,6 +5,7 @@ members = [
   "crates/afterray-core",
   "crates/afterray-store",
   "crates/afterray-models",
+  "crates/afterray-infer",
   "crates/afterray-platform-macos",
   "crates/afterrayd",
   "crates/afterray-cli",
@@ -25,7 +26,9 @@ chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6.0"
+futures-util = "0.3"
 rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.38", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

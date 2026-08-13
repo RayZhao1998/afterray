@@ -38,6 +38,8 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
     func updateSettings(recordAudio: Bool) async throws -> AppSettings
+    func downloadModels(packID: String?) async throws -> ModelLibrary
+    func jobs() async throws -> [ModelJob]
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
@@ -94,6 +96,17 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
             WireRequest(type: "update_settings", recordAudio: recordAudio),
             as: AppSettings.self
         )
+    }
+
+    public func downloadModels(packID: String?) async throws -> ModelLibrary {
+        try await request(
+            WireRequest(type: "download_models", packID: packID),
+            as: ModelLibrary.self
+        )
+    }
+
+    public func jobs() async throws -> [ModelJob] {
+        try await request(WireRequest(type: "jobs_list"), as: [ModelJob].self)
     }
 
     public func search(query: String, limit: Int = 30) async throws -> [RecallSearchHit] {
@@ -179,6 +192,7 @@ struct WireRequest: Encodable, Equatable {
     var sinceMs: Int64?
     var recordAudio: Bool?
     var reason: String?
+    var packID: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -192,6 +206,7 @@ struct WireRequest: Encodable, Equatable {
         case sinceMs = "since_ms"
         case recordAudio = "record_audio"
         case reason
+        case packID = "pack_id"
     }
 }
 

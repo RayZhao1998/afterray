@@ -404,20 +404,41 @@ async fn set_pending_error(inner: &QueueInner, id: &str, generation: u64, error:
 }
 
 async fn finish_done(inner: &QueueInner, id: &str, generation: u64, output: ModelOutput) {
-    update_job(inner, id, generation, |snapshot| {
+    let summary = output_summary(&output);
+    let logged = update_job(inner, id, generation, |snapshot| {
         snapshot.state = JobState::Done;
         snapshot.output = Some(output);
         snapshot.last_error = None;
     })
     .await;
+    if logged {
+        eprintln!("model job {id} done ({summary})");
+    }
 }
 
 async fn finish_failed(inner: &QueueInner, id: &str, generation: u64, error: String) {
-    update_job(inner, id, generation, |snapshot| {
+    let logged = update_job(inner, id, generation, |snapshot| {
         snapshot.state = JobState::Failed;
-        snapshot.last_error = Some(error);
+        snapshot.last_error = Some(error.clone());
     })
     .await;
+    if logged {
+        eprintln!("model job {id} failed: {error}");
+    }
+}
+
+fn output_summary(output: &ModelOutput) -> String {
+    match output {
+        ModelOutput::Ocr { text } => format!("ocr, {} chars", text.chars().count()),
+        ModelOutput::Asr { text, language } => match language {
+            Some(language) if !language.is_empty() => {
+                format!("asr/{language}, {} chars", text.chars().count())
+            }
+            _ => format!("asr, {} chars", text.chars().count()),
+        },
+        ModelOutput::Embedding { vector } => format!("embedding, {} dims", vector.len()),
+        ModelOutput::Llm { text } => format!("llm, {} chars", text.chars().count()),
+    }
 }
 
 async fn update_job(

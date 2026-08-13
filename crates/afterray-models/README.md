@@ -1,8 +1,9 @@
 # afterray-models
 
-`afterray-models` owns the V0 model queue and the boundary between `afterrayd`
-and local inference runtimes. It does not write results to SQLite; the daemon
-reads completed typed outputs and commits them through the store.
+`afterray-models` owns the V0 model queue, the model catalog, and the
+boundary between `afterrayd` and local inference runtimes. It does not write
+results to SQLite; the daemon reads completed typed outputs and commits them
+through the store.
 
 ## Queue
 
@@ -24,60 +25,41 @@ startup can resubmit its unfinished rows without changing the adapter contract.
 JSON object to stdin and expects exactly one JSON object on stdout. Logs must go
 to stderr.
 
-Example request:
+The shipped worker is the Rust `afterray-model-worker` binary. OCR stays on
+`afterray-native-model-worker` (macOS Vision).
 
-```json
-{
-  "protocol_version": 1,
-  "job_id": "019...",
-  "capability": "embedding",
-  "input": { "type": "embedding", "text": "local memory" }
-}
-```
+## Catalog and download
 
-Example response:
+`catalog` describes the packs the Settings page shows. Repositories and local
+paths can be overridden with `AFTERRAY_*` environment variables.
 
-```json
-{
-  "protocol_version": 1,
-  "output": { "type": "embedding", "vector": [0.1, 0.2] },
-  "retryable": false
-}
-```
-
-On failure, omit `output` and return `error` plus `retryable`. A timeout or
-cancellation drops and kills the worker process.
-
-## Local workers
-
-The repository includes two real workers:
-
-- `afterray-native-model-worker` performs screenshot OCR through macOS Vision;
-- `afterray_model_worker.py` invokes AfterRay-managed MLX (Qwen3-ASR + Gemma),
-  llama.cpp embeddings, and an optional whisper.cpp fallback.
-
-Install native development dependencies and download model assets:
+`afterray download` (and the daemon `download_models` request) fetch weights
+with Rust/`reqwest`. There is no Python, pip, or Hugging Face client runtime.
 
 ```sh
-brew install ffmpeg llama.cpp
-scripts/download-models/download.sh
+cargo run -p afterray-cli --release -- download
+cargo run -p afterray-cli --release -- download --pack asr
 ```
 
-Use `ProcessAdapterConfig` directly when different capabilities need different
-worker executables, environment variables, timeouts, or working directories.
+Default packs:
 
-Configuration variables:
+| id | Source | Runtime |
+| --- | --- | --- |
+| `asr` | `Qwen/Qwen3-ASR-1.7B` | Candle Metal via `qwen3-asr` |
+| `embedding` | nomic GGUF | `llama-cpp-2` Metal |
+| `llm` | Qwen2.5-3B Instruct GGUF (optional) | `llama-cpp-2` Metal |
+
+## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AFTERRAY_NATIVE_MODEL_WORKER` | bundled Swift worker | OCR executable |
-| `AFTERRAY_ASR_MODEL` | AfterRay model directory | Qwen3-ASR MLX weights |
-| `AFTERRAY_ASR_BACKEND` | `qwen3` | `qwen3` or `whisper` |
-| `AFTERRAY_EMBEDDING_MODEL` | AfterRay model directory | embedding weights |
-| `AFTERRAY_LLM_MODEL` | AfterRay model directory | MLX generation weights |
-| `AFTERRAY_FFMPEG_BIN` | `ffmpeg` | audio conversion executable |
-| `AFTERRAY_WHISPER_BIN` | `whisper-cli` | optional whisper.cpp executable |
-| `AFTERRAY_WHISPER_MODEL` | none | optional whisper.cpp GGML fallback |
+| `AFTERRAY_MODEL_WORKER` | bundled `afterray-model-worker` | ASR / embedding / LLM |
+| `AFTERRAY_MODEL_DIR` | AfterRay model directory | weight root |
+| `AFTERRAY_ASR_MODEL` | `Qwen3-ASR-1.7B` | ASR snapshot directory |
+| `AFTERRAY_ASR_REPOSITORY` | `Qwen/Qwen3-ASR-1.7B` | Hugging Face repo |
+| `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | embedding weights |
+| `AFTERRAY_LLM_MODEL` | optional GGUF path | summary model |
 
 If a binary, input file, or model is missing, the job ends as `failed` with an
 actionable error. No adapter returns placeholder inference data.
@@ -87,5 +69,4 @@ actionable error. No adapter returns placeholder inference data.
 ```sh
 rtk cargo test -p afterray-models
 rtk cargo clippy -p afterray-models --all-targets -- -D warnings
-python3 -m py_compile scripts/download-models/afterray_model_worker.py
 ```

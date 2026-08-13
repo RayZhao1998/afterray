@@ -54,6 +54,7 @@ capture_package="$repo_root/apps/AfterRayCaptureShim"
 capture_shim="$capture_package/.build/release/AfterRayCaptureShim"
 daemon_bin="$repo_root/target/release/afterrayd"
 cli_bin="$repo_root/target/release/afterray"
+model_worker="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/debug/afterray-app"
 native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
@@ -151,8 +152,7 @@ cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
 cp "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
-cp "$repo_root/scripts/download-models/afterray_model_worker.py" \
-  "$app_bundle/Contents/Helpers/afterray_model_worker.py"
+cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
 codesign_identity="$(resolve_codesign_identity)"
 if [[ "$codesign_identity" == '-' ]]; then
@@ -164,7 +164,7 @@ printf '==> Signing with: %s\n' "$codesign_identity"
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
-codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray_model_worker.py" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-model-worker" >/dev/null
 if [[ "$codesign_identity" == '-' ]]; then
   codesign \
     --force \
@@ -222,25 +222,17 @@ fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
 export AFTERRAY_NATIVE_MODEL_WORKER="$native_model_worker"
 mkdir -p "$AFTERRAY_DATA_DIR"
-default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B-8bit"
+default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B"
 if [[ -z "${AFTERRAY_ASR_MODEL:-}" && -d "$default_asr_model" ]]; then
   export AFTERRAY_ASR_MODEL="$default_asr_model"
-fi
-default_whisper_model="$repo_root/.afterray/models/ggml-large-v3-turbo-q5_0.bin"
-if [[ -z "${AFTERRAY_WHISPER_MODEL:-}" && -f "$default_whisper_model" ]]; then
-  export AFTERRAY_WHISPER_MODEL="$default_whisper_model"
 fi
 default_embedding_model="$repo_root/.afterray/models/nomic-embed-text-v1.5.Q4_K_M.gguf"
 if [[ -z "${AFTERRAY_EMBEDDING_MODEL:-}" && -f "$default_embedding_model" ]]; then
   export AFTERRAY_EMBEDDING_MODEL="$default_embedding_model"
 fi
-default_llm_model="$repo_root/.afterray/models/gemma-4-26b-a4b-it-4bit"
-if [[ -z "${AFTERRAY_LLM_MODEL:-}" && -d "$default_llm_model" ]]; then
+default_llm_model="$repo_root/.afterray/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+if [[ -z "${AFTERRAY_LLM_MODEL:-}" && -f "$default_llm_model" ]]; then
   export AFTERRAY_LLM_MODEL="$default_llm_model"
-fi
-mlx_runtime="$repo_root/.afterray/mlx-runtime"
-if [[ -x "$mlx_runtime/bin/python3" ]]; then
-  export PATH="$mlx_runtime/bin:$PATH"
 fi
 daemon_log="$run_dir/afterrayd.log"
 app_log="$run_dir/afterray-app.log"
@@ -255,7 +247,7 @@ if [[ "$mode" == 'app' ]]; then
   export AFTERRAY_DAEMON="$app_bundle/Contents/Helpers/afterrayd"
   export AFTERRAY_CAPTURE_SHIM="$app_bundle/Contents/Helpers/AfterRayCaptureShim"
   export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"
-  export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray_model_worker.py"
+  export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-model-worker"
   printf '%s\n' \
     '==> Opening AfterRay.app through LaunchServices' \
     'The app will request Screen Recording, Microphone, and Accessibility access.' \
@@ -273,8 +265,6 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_NATIVE_MODEL_WORKER
     AFTERRAY_MODEL_WORKER
     AFTERRAY_ASR_MODEL
-    AFTERRAY_ASR_BACKEND
-    AFTERRAY_WHISPER_MODEL
     AFTERRAY_EMBEDDING_MODEL
     AFTERRAY_LLM_MODEL
     PATH

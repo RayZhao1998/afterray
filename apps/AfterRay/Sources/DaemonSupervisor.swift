@@ -101,8 +101,8 @@ final class DaemonSupervisor {
         ).path
         environment["AFTERRAY_MODEL_WORKER"] = try resolveExecutable(
             environmentKey: "AFTERRAY_MODEL_WORKER",
-            bundledName: "afterray_model_worker.py",
-            developmentPath: "scripts/download-models/afterray_model_worker.py"
+            bundledName: "afterray-model-worker",
+            developmentPath: "target/release/afterray-model-worker"
         ).path
         environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
         applyModelDefaults(to: &environment)
@@ -225,27 +225,16 @@ final class DaemonSupervisor {
     private func applyModelDefaults(to environment: inout [String: String]) {
         let defaults = [
             "AFTERRAY_ASR_MODEL": defaultModelDirectory
-                .appendingPathComponent("Qwen3-ASR-1.7B-8bit"),
-            "AFTERRAY_WHISPER_MODEL": defaultModelDirectory
-                .appendingPathComponent("ggml-large-v3-turbo-q5_0.bin"),
+                .appendingPathComponent("Qwen3-ASR-1.7B"),
             "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
             "AFTERRAY_LLM_MODEL": defaultModelDirectory
-                .appendingPathComponent("gemma-4-26b-a4b-it-4bit"),
+                .appendingPathComponent("qwen2.5-3b-instruct-q4_k_m.gguf"),
         ]
         for (key, url) in defaults where environment[key] == nil {
             if FileManager.default.fileExists(atPath: url.path) {
                 environment[key] = url.path
             }
-        }
-
-        let mlxBin = defaultModelDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("mlx-runtime/bin", isDirectory: true)
-        if FileManager.default.fileExists(atPath: mlxBin.path) {
-            environment["PATH"] = [mlxBin.path, environment["PATH"]]
-                .compactMap { $0 }
-                .joined(separator: ":")
         }
     }
 

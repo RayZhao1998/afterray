@@ -111,7 +111,7 @@ final class DaemonWireTests: XCTestCase {
     }
 
     func testModelLibraryDecodesInstalledPack() throws {
-        let json = #"{"directory":"/tmp/models","packs":[{"id":"asr","name":"Qwen3 ASR","capability":"asr","path":"/tmp/models/Qwen3-ASR-1.7B-8bit","present":true,"bytes":1024,"required":true,"note":"qwen3"}]}"#
+        let json = #"{"directory":"/tmp/models","packs":[{"id":"asr","name":"Qwen3 ASR","capability":"asr","path":"/tmp/models/Qwen3-ASR-1.7B","present":true,"bytes":1024,"required":true,"note":"qwen3"}]}"#
         let library = try JSONDecoder().decode(ModelLibrary.self, from: Data(json.utf8))
         XCTAssertEqual(library.directory, "/tmp/models")
         XCTAssertEqual(library.packs.first?.id, "asr")
@@ -120,10 +120,25 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(library.installedBytes, 1024)
     }
 
+    func testModelLibraryDecodesDownloadProgress() throws {
+        let json = #"{"directory":"/tmp/models","packs":[],"download":{"pack_id":"asr","bytes":42,"expected_bytes":100,"completed_files":0,"total_files":1}}"#
+        let library = try JSONDecoder().decode(ModelLibrary.self, from: Data(json.utf8))
+        XCTAssertEqual(library.download?.packId, "asr")
+        XCTAssertEqual(library.download?.percent, 42)
+        XCTAssertEqual(library.download?.fraction, 0.42)
+    }
+
     func testModelPackDecodesExpectedBytes() throws {
         let json = #"{"id":"asr","name":"Qwen3 ASR","capability":"asr","path":"/tmp/qwen","present":false,"bytes":0,"required":true,"expected_bytes":2460000000}"#
         let pack = try JSONDecoder().decode(ModelPack.self, from: Data(json.utf8))
         XCTAssertEqual(pack.expectedBytes, 2_460_000_000)
+    }
+
+    func testDownloadModelsRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "download_models", packID: "asr"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "download_models")
+        XCTAssertEqual(json["pack_id"] as? String, "asr")
     }
 
     func testShutdownRequestMatchesRustShape() throws {

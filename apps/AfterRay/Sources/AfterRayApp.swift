@@ -174,8 +174,6 @@ private final class AfterRayMenuBar: NSObject {
     static let shared = AfterRayMenuBar()
 
     private var statusItem: NSStatusItem?
-    private var isRecording = true
-    private var isOverlayVisible = false
 
     private override init() {
         super.init()
@@ -232,17 +230,9 @@ private final class AfterRayMenuBar: NSObject {
         statusItem = nil
     }
 
-    func setRecording(_ isRecording: Bool) {
-        guard self.isRecording != isRecording else { return }
-        self.isRecording = isRecording
-        refresh()
-    }
+    func setRecording(_: Bool) {}
 
-    func setOverlayVisible(_ isVisible: Bool) {
-        guard isOverlayVisible != isVisible else { return }
-        isOverlayVisible = isVisible
-        refresh()
-    }
+    func setOverlayVisible(_: Bool) {}
 
     @objc private func openAfterRay() {
         RecallOverlayController.shared.show()
@@ -258,19 +248,26 @@ private final class AfterRayMenuBar: NSObject {
 
     private func refresh() {
         guard let button = statusItem?.button else { return }
-        let showPaused = !isOverlayVisible && !isRecording
         statusItem?.isVisible = true
-        button.image = Self.icon(paused: showPaused)
-        button.toolTip = showPaused ? "AfterRay · Paused" : "AfterRay"
+        button.image = Self.icon()
+        button.toolTip = "AfterRay"
     }
 
-    private static func icon(paused: Bool) -> NSImage {
-        let name = paused ? "pause.circle" : "clock.arrow.circlepath"
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "AfterRay")
+    private static func icon() -> NSImage {
+        let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "AfterRay")
             ?? NSImage(size: NSSize(width: 18, height: 18))
         image.size = NSSize(width: 18, height: 18)
         image.isTemplate = true
         return image
+    }
+}
+
+/// Transparent overlay pixels must still own the mouse. Otherwise trackpad
+/// scrolls over empty timeline chrome fall through to the app behind and
+/// AfterRay never sees them.
+private final class OverlayHostingView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) ?? self
     }
 }
 
@@ -315,7 +312,7 @@ final class RecallOverlayController {
             backing: .buffered,
             defer: false
         )
-        let hostingView = NSHostingView(rootView: AfterRayRootView())
+        let hostingView = OverlayHostingView(rootView: AfterRayRootView())
         hostingView.autoresizingMask = [.width, .height]
         panel.contentView = hostingView
         panel.backgroundColor = .clear
@@ -1004,12 +1001,17 @@ private struct PermissionPanel: View {
 
     var body: some View {
         ZStack {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("LET AFTERRAY REMEMBER")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                        .tracking(1.8)
-                        .foregroundStyle(.red)
+                    HStack(spacing: 9) {
+                        Rectangle()
+                            .fill(RecallPalette.ray)
+                            .frame(width: 18, height: 2)
+                        Text("LOCAL ONLY / AFTERRAY")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .tracking(1.1)
+                    }
+                    .foregroundStyle(RecallPalette.ray)
                     Text(coordinator.recordsAudio
                          ? "Three local permissions are required"
                          : "Two local permissions are required")
@@ -1042,19 +1044,22 @@ private struct PermissionPanel: View {
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Button("Check permissions") { coordinator.refresh() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
+                    HStack {
+                        Spacer()
+                        Button("Check permissions") { coordinator.refresh() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(RecallPalette.ray)
+                    }
                 }
             }
-            .padding(26)
-            .frame(width: 470)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .padding(28)
+            .frame(width: 500)
+            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(.white.opacity(0.12))
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(.white.opacity(0.13), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.6), radius: 36, y: 18)
+            .shadow(color: .black.opacity(0.5), radius: 28, y: 14)
         }
     }
 
@@ -1085,9 +1090,13 @@ private struct PermissionPanel: View {
                     .font(.caption.weight(.semibold))
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 46)
-        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 4)
+        .frame(height: 48)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(.white.opacity(0.08))
+                .frame(height: 1)
+        }
     }
 
     private func isGranted(_ permission: RequiredPermission) -> Bool {
@@ -1110,7 +1119,7 @@ private struct AfterRaySettingsOverlay: View {
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onClose)
             AfterRaySettingsView(model: model, onClose: onClose)
-                .recallGlass(in: .rounded(22))
+                .recallGlass(in: .rounded(14))
                 .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1231,7 +1240,7 @@ private struct CaptureFailureBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .frame(maxWidth: 520)
-        .recallGlass(in: .capsule)
+        .recallGlass(in: .rounded(8))
         .help(message)
     }
 }
@@ -1256,7 +1265,7 @@ private struct SearchResultsPanel: View {
             .padding(14)
 
             ScrollView {
-                LazyVStack(spacing: 6) {
+                LazyVStack(spacing: 2) {
                     ForEach(hits) { hit in
                         Button { onSelect(hit) } label: {
                             VStack(alignment: .leading, spacing: 7) {
@@ -1275,8 +1284,8 @@ private struct SearchResultsPanel: View {
                                     .lineLimit(3)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(12)
-                            .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 11)
                         }
                         .buttonStyle(SearchResultButtonStyle())
                     }
@@ -1286,7 +1295,7 @@ private struct SearchResultsPanel: View {
             }
             .frame(maxHeight: 390)
         }
-        .recallGlass(in: .rounded(16))
+        .recallGlass(in: .rounded(10))
     }
 
     private func sourceIcon(_ source: String) -> String {
@@ -1318,7 +1327,7 @@ private struct SearchResultButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .opacity(configuration.isPressed ? 0.72 : 1)
-            .scaleEffect(configuration.isPressed ? 0.99 : 1)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }

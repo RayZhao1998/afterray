@@ -17,6 +17,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var modelDirectoryPath: String { get }
     var logDirectoryPath: String { get }
     var logFilePath: String { get }
+    var recentJobs: [ModelJob] { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -48,6 +49,20 @@ public struct AfterRayStorageSnapshot: Equatable, Sendable {
     }
 
     public var afterrayBytes: UInt64 { vaultBytes + modelBytes + runtimeBytes }
+
+    public var otherBytes: UInt64 {
+        let used = volumeTotal > volumeFree ? volumeTotal - volumeFree : 0
+        return used > afterrayBytes ? used - afterrayBytes : 0
+    }
+
+    public var diskShareText: String {
+        guard volumeTotal > 0 else { return "Disk size is unavailable." }
+        let percent = Double(afterrayBytes) / Double(volumeTotal) * 100
+        let share = percent < 0.1
+            ? "less than 0.1%"
+            : String(format: "%.1f%%", percent)
+        return "AfterRay is \(share) of this \(Self.byteCount(volumeTotal)) disk."
+    }
 
     public var barSlices: (afterray: CGFloat, other: CGFloat, free: CGFloat) {
         let total = max(volumeTotal, afterrayBytes + volumeFree)
@@ -160,10 +175,15 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             sidebar
             pageContent
         }
-        .frame(width: 740, height: 560)
-        .background(Color(red: 0.07, green: 0.07, blue: 0.075))
+        .frame(width: 760, height: 570)
+        .background(Color(red: 0.052, green: 0.050, blue: 0.056))
         .preferredColorScheme(.dark)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(RecallPalette.ray.opacity(0.9))
+                .frame(height: 2)
+        }
         .task { await model.refresh() }
     }
 
@@ -177,8 +197,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .background(.white.opacity(0.08), in: Circle())
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(SettingsPressStyle())
                 .help("Close settings")
@@ -223,9 +242,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             .padding(.horizontal, 10)
             .frame(height: 32)
             .background(
-                selected ? Color.white.opacity(0.10) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                selected ? Color.white.opacity(0.075) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 5, style: .continuous)
             )
+            .overlay(alignment: .leading) {
+                if selected {
+                    Rectangle()
+                        .fill(RecallPalette.ray)
+                        .frame(width: 2, height: 18)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(SettingsPressStyle())
@@ -237,11 +263,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var pageContent: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(page.title)
-                .font(.system(size: 22, weight: .semibold))
-                .padding(.horizontal, 28)
-                .padding(.top, 22)
-                .padding(.bottom, 16)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("AFTERRAY / SETTINGS")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .tracking(1.2)
+                    .foregroundStyle(RecallPalette.ray)
+                Text(page.title)
+                    .font(.system(size: 23, weight: .semibold))
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 22)
+            .padding(.bottom, 16)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
@@ -289,56 +321,93 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var storageSection: some View {
-        SettingsGroup(title: "Storage") {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .firstTextBaseline) {
-                    storageStat("AfterRay", AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
-                    Spacer()
-                    storageStat("Disk free", AfterRayStorageSnapshot.byteCount(model.storage.volumeFree), align: .trailing)
-                }
-                GeometryReader { geometry in
-                    let slices = model.storage.barSlices
-                    HStack(spacing: 1) {
-                        Capsule().fill(Color.white.opacity(0.85))
-                            .frame(width: max(geometry.size.width * slices.afterray, slices.afterray > 0 ? 2 : 0))
-                        Capsule().fill(Color.white.opacity(0.18))
-                            .frame(width: max(geometry.size.width * slices.other, slices.other > 0 ? 2 : 0))
-                        Capsule().fill(Color.white.opacity(0.08))
+        VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(title: "This disk") {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .firstTextBaseline) {
+                        storageStat("AfterRay uses", AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
+                        Spacer()
+                        storageStat(
+                            "Still free",
+                            AfterRayStorageSnapshot.byteCount(model.storage.volumeFree),
+                            align: .trailing
+                        )
                     }
+                    StorageDiskBar(snapshot: model.storage)
+                    VStack(alignment: .leading, spacing: 7) {
+                        storageLegend("AfterRay", model.storage.afterrayBytes, StorageDiskBar.afterrayColor)
+                        storageLegend("Other files on this disk", model.storage.otherBytes, StorageDiskBar.otherColor)
+                        storageLegend("Free space", model.storage.volumeFree, StorageDiskBar.freeColor)
+                    }
+                    Text(model.storage.diskShareText)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
                 }
-                .frame(height: 6)
-                VStack(spacing: 6) {
+                .padding(16)
+            }
+
+            SettingsGroup(title: "Inside AfterRay") {
+                VStack(spacing: 0) {
                     storageLine("Memories", model.storage.vaultBytes)
+                    Divider().overlay(Color.white.opacity(0.06))
                     storageLine("Models", model.storage.modelBytes)
+                    Divider().overlay(Color.white.opacity(0.06))
                     storageLine("Runtime", model.storage.runtimeBytes)
                 }
-                HStack(spacing: 16) {
-                    Button("Show Vault") { model.reveal(model.dataDirectoryPath) }
-                    Button("Show Models") { model.reveal(model.modelDirectoryPath) }
-                    Spacer()
-                    Button("Refresh") { Task { await model.refresh() } }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.7))
             }
-            .padding(16)
+
+            HStack(spacing: 16) {
+                Button("Show Vault") { model.reveal(model.dataDirectoryPath) }
+                Button("Show Models") { model.reveal(model.modelDirectoryPath) }
+                Spacer()
+                Button("Refresh") { Task { await model.refresh() } }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.white.opacity(0.7))
         }
     }
 
     private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if let status = model.downloadStatus {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text(status)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                if let progress = model.downloadProgress {
-                    ProgressView(value: progress)
+            if model.downloadingID != nil, let status = model.downloadStatus {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(status)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        Spacer()
+                        if let percent = percentLabel(model.downloadProgress) {
+                            Text(percent)
+                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.82))
+                                .monospacedDigit()
+                        }
+                    }
+                    ProgressView(value: model.downloadProgress ?? 0)
                         .progressViewStyle(.linear)
+                }
+            }
+
+            if !model.recentJobs.isEmpty {
+                SettingsGroup(title: "Recent inference") {
+                    VStack(spacing: 0) {
+                        ForEach(Array(model.recentJobs.enumerated()), id: \.element.id) { index, job in
+                            if index > 0 {
+                                Divider().overlay(Color.white.opacity(0.06))
+                            }
+                            SettingsRow(
+                                title: jobTitle(job),
+                                subtitle: jobSubtitle(job)
+                            ) {
+                                Text(jobStateLabel(job.state))
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(job.state == "done" ? Color.secondary : Color.white.opacity(0.78))
+                            }
+                        }
+                    }
                 }
             }
 
@@ -366,7 +435,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     Task { await model.download(packID: nil) }
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.white.opacity(0.14))
+                .tint(RecallPalette.ray.opacity(0.88))
                 .controlSize(.small)
                 .disabled(model.downloadingID != nil || missingRequiredCount == 0)
             }
@@ -443,6 +512,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func modelPackRow(_ pack: ModelPack) -> some View {
         let downloading = model.downloadingID == pack.id
+            || model.library?.download?.packId == pack.id
         return SettingsRow(
             title: pack.name,
             subtitle: [capabilityLabel(pack.capability), pack.present ? AfterRayStorageSnapshot.byteCount(pack.bytes) : nil]
@@ -452,11 +522,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             HStack(spacing: 8) {
                 if downloading {
                     ProgressView().controlSize(.mini)
-                    Text("Downloading")
-                        .font(.system(size: 12))
+                    Text(percentLabel(model.downloadProgress) ?? "Downloading")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 } else {
-                    Text(pack.present ? "Ready" : pack.required ? "Needed" : "Optional")
+                    Text(packStatus(pack))
                         .font(.system(size: 12))
                         .foregroundStyle(pack.present ? Color.secondary : Color.white.opacity(0.7))
                 }
@@ -477,6 +548,45 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
+    private func packStatus(_ pack: ModelPack) -> String {
+        if pack.present { return "Ready" }
+        if pack.bytes > 0 { return "Incomplete" }
+        return pack.required ? "Needed" : "Optional"
+    }
+
+    private func jobTitle(_ job: ModelJob) -> String {
+        switch job.capability {
+        case "asr": "Qwen3 ASR"
+        case "ocr": "OCR"
+        case "embedding": "Embeddings"
+        case "llm": "Local LLM"
+        default: job.capability
+        }
+    }
+
+    private func jobSubtitle(_ job: ModelJob) -> String {
+        if let error = job.lastError, !error.isEmpty {
+            return error
+        }
+        return job.adapter
+    }
+
+    private func jobStateLabel(_ state: String) -> String {
+        switch state {
+        case "done": "OK"
+        case "failed": "Failed"
+        case "running": "Running"
+        case "pending": "Queued"
+        case "cancelled": "Cancelled"
+        default: state
+        }
+    }
+
+    private func percentLabel(_ progress: Double?) -> String? {
+        guard let progress else { return nil }
+        return "\(Int((progress * 100).rounded(.down)))%"
+    }
+
     private func storageStat(_ title: String, _ value: String, align: HorizontalAlignment = .leading) -> some View {
         VStack(alignment: align, spacing: 2) {
             Text(title)
@@ -489,6 +599,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func storageLine(_ title: String, _ bytes: UInt64) -> some View {
         HStack {
+            Text(title)
+            Spacer()
+            Text(AfterRayStorageSnapshot.byteCount(bytes))
+        }
+        .font(.system(size: 13))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+    }
+
+    private func storageLegend(_ title: String, _ bytes: UInt64, _ color: Color) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
             Text(title)
             Spacer()
             Text(AfterRayStorageSnapshot.byteCount(bytes))
@@ -523,6 +647,34 @@ private enum AfterRayCaptureSpeedPlaceholder: String, CaseIterable, Identifiable
     }
 }
 
+private struct StorageDiskBar: View {
+    let snapshot: AfterRayStorageSnapshot
+
+    static let afterrayColor = RecallPalette.ray
+    static let otherColor = Color.white.opacity(0.28)
+    static let freeColor = Color.white.opacity(0.10)
+
+    var body: some View {
+        let slices = snapshot.barSlices
+        GeometryReader { geometry in
+            HStack(spacing: 1) {
+                slice(width: geometry.size.width * slices.afterray, color: Self.afterrayColor, minimum: snapshot.afterrayBytes > 0)
+                slice(width: geometry.size.width * slices.other, color: Self.otherColor, minimum: snapshot.otherBytes > 0)
+                slice(width: geometry.size.width * slices.free, color: Self.freeColor, minimum: snapshot.volumeFree > 0)
+            }
+        }
+        .frame(height: 8)
+        .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
+        .accessibilityLabel(snapshot.diskShareText)
+    }
+
+    private func slice(width: CGFloat, color: Color, minimum: Bool) -> some View {
+        Rectangle()
+            .fill(color)
+            .frame(width: max(width, minimum ? 3 : 0), height: 8)
+    }
+}
+
 private struct SettingsPressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -539,16 +691,21 @@ private struct SettingsGroup<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let title {
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                Text(title.uppercased())
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .tracking(1.0)
+                    .foregroundStyle(.white.opacity(0.48))
                     .padding(.horizontal, 4)
             }
             content
                 .background(
-                    Color.white.opacity(0.045),
-                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    Color.white.opacity(0.035),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(.white.opacity(0.055), lineWidth: 1)
+                }
         }
     }
 }
@@ -574,6 +731,6 @@ private struct SettingsRow<Trailing: View>: View {
             trailing
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.vertical, 12)
     }
 }

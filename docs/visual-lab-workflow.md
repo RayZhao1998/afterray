@@ -18,7 +18,7 @@ make settings-lab        # Settings surface, AI Models page
 # or: swift run afterray-visual-lab -- --settings --models
 ```
 
-设置 Lab 使用 `SettingsPreviewModel`：Qwen3 默认缺失，点 Download 只是预览状态，不会真的拉模型。主 App 才走真实 `download.sh`。
+设置 Lab 使用 `SettingsPreviewModel`：Qwen3 默认缺失，点 Download 只是预览状态，不会真的拉模型。主 App 通过 daemon 的 `download_models` 走 Rust 下载。
 
 迭代设置页时只改 `AfterRaySettingsChrome.swift`，然后重新 `make settings-lab`。不需要 `make dev`，也不用反复打开 overlay。
 

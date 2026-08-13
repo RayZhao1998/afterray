@@ -35,20 +35,15 @@ stay local.
 
 - Apple Silicon Mac (M3 or newer recommended).
 - macOS 15 or newer.
-- Around 18 GB of free space for the default development model set, plus space
-  for recordings.
+- Around 8 GB of free space for the default development model set (Qwen3-ASR
+  + embeddings), plus space for recordings. The optional local LLM is another
+  2 GB.
 - Xcode and the Xcode Command Line Tools.
 - A current Rust toolchain.
-- `ffmpeg` and `llama.cpp` for the current developer build.
-
-Install the command-line dependencies with Homebrew:
-
-```sh
-brew install ffmpeg llama.cpp
-```
 
 Install Rust from [rustup.rs](https://rustup.rs/) if `cargo --version` is not
-already available.
+already available. Model download and inference are compiled into AfterRay;
+they do not use Python, Homebrew `ffmpeg`, or `llama.cpp` binaries.
 
 ## Quick start
 
@@ -56,6 +51,7 @@ Clone the repository and enter it, then let AfterRay download its own local
 runtime and model files. This is required once:
 
 ```sh
+cargo build -p afterray-cli --release
 ./scripts/download-models/download.sh
 ```
 
@@ -219,7 +215,7 @@ Repository layout:
 apps/                         Swift app, Visual Lab, capture shim
 crates/                       Rust daemon, CLI, store, protocol and adapters
 swift/                        Reusable Recall UI and mock data
-scripts/download-models/      Model worker and development downloads
+scripts/download-models/      Thin wrapper around `afterray download`
 docs/                         Product specification and implementation notes
 ```
 
@@ -231,9 +227,12 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_SOCKET` | Unix socket shared by clients and daemon | Runner-generated temporary path |
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
 | `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
-| `AFTERRAY_MODEL_WORKER` | Typed local model worker | Bundled AfterRay worker |
-| `AFTERRAY_ASR_MODEL` | Default Qwen3-ASR MLX weights | `.afterray/models/Qwen3-ASR-1.7B-8bit` |
-| `AFTERRAY_ASR_BACKEND` | ASR runtime | `qwen3` (`whisper` is the fallback) |
+| `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
+| `AFTERRAY_MODEL_DIR` | Weight directory | `.afterray/models` |
+| `AFTERRAY_ASR_MODEL` | Qwen3-ASR snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B` |
+| `AFTERRAY_ASR_REPOSITORY` | Hugging Face repo for ASR | `Qwen/Qwen3-ASR-1.7B` |
+| `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | `$AFTERRAY_MODEL_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf` |
+| `AFTERRAY_LLM_MODEL` | Optional instruct GGUF | `$AFTERRAY_MODEL_DIR/qwen2.5-3b-instruct-q4_k_m.gguf` |
 
 ## Troubleshooting
 
@@ -254,6 +253,7 @@ reopened before the permission becomes active.
 Resume the model setup script. Existing downloads are reused:
 
 ```sh
+cargo build -p afterray-cli --release
 ./scripts/download-models/download.sh
 ```
 

@@ -10,6 +10,7 @@ name = "afterray"
 path = "src/main.rs"
 
 [dependencies]
+afterray-models = { path = "../afterray-models" }
 afterray-protocol = { path = "../afterray-protocol" }
 anyhow.workspace = true
 clap.workspace = true

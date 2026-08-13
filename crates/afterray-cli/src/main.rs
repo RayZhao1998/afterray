@@ -1,3 +1,4 @@
+use afterray_models::{download_packs, library_in, model_directory, specs_for_download_in};
 use afterray_protocol::{Request, Response};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -48,6 +49,12 @@ enum Command {
         command: FavoriteCommand,
     },
     Models,
+    Download {
+        #[arg(long)]
+        pack: Option<String>,
+        #[arg(long, env = "AFTERRAY_MODEL_DIR")]
+        dir: Option<PathBuf>,
+    },
     Jobs {
         #[command(subcommand)]
         command: JobsCommand,
@@ -136,6 +143,28 @@ async fn main() -> anyhow::Result<()> {
             moment_id,
             favorite: false,
         },
+        Command::Download { pack, dir } => {
+            let directory = dir.unwrap_or_else(model_directory);
+            let packs =
+                specs_for_download_in(&directory, pack.as_deref()).map_err(anyhow::Error::msg)?;
+            if packs.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
+                return Ok(());
+            }
+            download_packs(&packs, |spec, progress| {
+                if let Some(percent) = progress.percent() {
+                    eprintln!("Downloading {} · {percent}%", spec.name);
+                } else {
+                    eprintln!(
+                        "Downloading {} ({}/{} files)",
+                        spec.name, progress.completed_files, progress.total_files
+                    );
+                }
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
+            return Ok(());
+        }
         Command::Models => Request::ModelsStatus,
         Command::Jobs {
             command: JobsCommand::List,

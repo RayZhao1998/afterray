@@ -29,34 +29,34 @@ recommended because the JavaScript is loaded as an ES module.
 - `styles.css` contains the presentation and responsive treatment.
 - `app.js` contains the WebGL 2 setup and both GLSL shaders.
 
-The renderer draws one full-screen triangle. The fragment shader performs an
-inverse point-lens mapping on a diagonal source ray, then composes a perfectly
-analytic photon ring, lensed disk arcs, a pure-black event-horizon shadow,
-procedural grain, and restrained star dust.
+The renderer draws one full-screen triangle. For every fragment, the shader
+constructs a perspective camera ray and bends it toward the black hole during
+68 adaptive integration steps. Along that curved three-dimensional path it
+integrates emission and opacity from a tilted, thick accretion volume, orbiting
+particles, partial light filaments, and a diffuse corona.
+The result has real perspective, front/back occlusion, and depth-dependent
+motion instead of composing polar effects in screen space.
 
 ## Controls
 
-- **Gravity** changes the Einstein-radius approximation used by the inverse
-  lens map.
+- **Gravity** changes the strength of the curved camera-ray integration.
 - **Corona** changes the width and energy of the glow around the photon ring.
 - **Drift** changes procedural disk motion; it does not rotate the entire mark.
-- **Particles** changes the visibility and density of the orbital dust, light
-  filaments, and the dim artistic "memory motes" inside the shadow.
+- **Particles** changes the visibility and density of the orbital dust and
+  light filaments outside the shadow.
 - **Pause** freezes time. Motion is paused by default when the operating system
   requests reduced motion.
 
 ## Scientific versus artistic layers
 
 The external motion follows a qualitative accretion-flow model: inner material
-orbits faster, the approaching side is weighted brighter, the disk is lensed
-above and below the shadow, and multiple increasingly faint light structures
-sit near the photon ring. The shader remains a real-time optical approximation,
-not a general-relativistic ray tracer.
+orbits faster, the approaching side is weighted brighter, curved rays can see
+the disk's far side above and below the shadow, and multiple increasingly faint
+light structures sit near the photon shell. This is a three-dimensional real-
+time optical approximation, not a solver for the full Kerr spacetime metric.
 
-The event horizon cannot emit visible particles to an outside observer. The dim
-particles drawn inside the shadow are therefore explicitly artistic: they
-represent memories spiraling inward for the AfterRay brand, rather than physical
-matter escaping a black hole.
+The event-horizon shadow remains unlit. Procedural particles are restricted to
+the accretion flow outside it.
 
 ## Integration
 

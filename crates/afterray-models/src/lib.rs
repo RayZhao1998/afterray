@@ -1,14 +1,22 @@
-//! Local model scheduling and process adapters for `AfterRay`.
+//! Local model scheduling, catalog, and process adapters for `AfterRay`.
 //!
 //! The daemon owns scheduling through [`ModelQueue`]. Inference workers are
-//! deliberately isolated behind [`ModelAdapter`], so a Python development
-//! worker, an MLX Swift executable, or another local runtime can implement the
-//! same JSON contract without changing the queue or store.
+//! isolated behind [`ModelAdapter`]. The shipped worker is the Rust
+//! `afterray-model-worker` binary; OCR stays on the native Swift helper.
 
+mod catalog;
+mod download;
 mod process;
 mod queue;
 
-pub use process::{ProcessAdapter, ProcessAdapterConfig, WorkerRequest, WorkerResponse};
+pub use catalog::{
+    PackSource, PackSpec, catalog_in, default_catalog, inspect_model_path, library, library_in,
+    model_directory, spec_by_id, specs_for_download, specs_for_download_in,
+};
+pub use download::{DownloadError, DownloadProgress, download_pack, download_packs};
+pub use process::{
+    ProcessAdapter, ProcessAdapterConfig, WORKER_PROTOCOL_VERSION, WorkerRequest, WorkerResponse,
+};
 pub use queue::{
     CapabilityConcurrency, JobId, JobSnapshot, JobState, ModelQueue, QueueConfig, QueueError,
 };
@@ -25,6 +33,18 @@ pub enum ModelCapability {
     Asr,
     Embedding,
     Llm,
+}
+
+impl ModelCapability {
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Ocr => "ocr",
+            Self::Asr => "asr",
+            Self::Embedding => "embedding",
+            Self::Llm => "llm",
+        }
+    }
 }
 
 /// Typed input accepted by model adapters.
@@ -174,8 +194,8 @@ pub trait ModelAdapter: Send + Sync {
 
 /// Builds adapters for all V0 capabilities from one compatible worker binary.
 ///
-/// The repository's `scripts/download-models/afterray_model_worker.py` is the
-/// reference implementation, but an MLX Swift worker can use the same contract.
+/// The shipped worker is `afterray-model-worker`. OCR uses the separate
+/// Swift Vision helper instead of this catch-all.
 #[must_use]
 pub fn worker_adapters(program: impl Into<PathBuf>) -> Vec<Arc<dyn ModelAdapter>> {
     let program = program.into();

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Download a Hugging Face snapshot using AfterRay's own Python runtime.
+
+This file is invoked by download.sh after that script has installed a
+standalone CPython under .afterray/python. It must not be run with the
+user's uv/Homebrew interpreter.
+"""
 from pathlib import Path
 import sys
 

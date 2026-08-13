@@ -25,6 +25,7 @@ if (!gl) {
 
 const vertexShader = `#version 300 es
 precision highp float;
+precision highp int;
 
 const vec2 POSITIONS[3] = vec2[3](
   vec2(-1.0, -1.0),
@@ -39,6 +40,7 @@ void main() {
 
 const fragmentShader = `#version 300 es
 precision highp float;
+precision highp int;
 
 out vec4 outColor;
 
@@ -51,6 +53,11 @@ uniform float uParticles;
 
 #define PI 3.141592653589793
 #define TAU 6.283185307179586
+#define MARCH_STEPS 68
+
+float saturate(float value) {
+  return clamp(value, 0.0, 1.0);
+}
 
 float hash12(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -58,244 +65,379 @@ float hash12(vec2 p) {
   return fract((p3.x + p3.y) * p3.z);
 }
 
-float noise(vec2 p) {
-  vec2 i = floor(p);
-  vec2 f = fract(p);
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise3(vec3 p) {
+  vec3 cell = floor(p);
+  vec3 f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(cell);
+  float n100 = hash13(cell + vec3(1.0, 0.0, 0.0));
+  float n010 = hash13(cell + vec3(0.0, 1.0, 0.0));
+  float n110 = hash13(cell + vec3(1.0, 1.0, 0.0));
+  float n001 = hash13(cell + vec3(0.0, 0.0, 1.0));
+  float n101 = hash13(cell + vec3(1.0, 0.0, 1.0));
+  float n011 = hash13(cell + vec3(0.0, 1.0, 1.0));
+  float n111 = hash13(cell + vec3(1.0));
   return mix(
-    mix(hash12(i), hash12(i + vec2(1.0, 0.0)), f.x),
-    mix(hash12(i + vec2(0.0, 1.0)), hash12(i + 1.0), f.x),
-    f.y
+    mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+    mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y),
+    f.z
   );
 }
 
-float fbm(vec2 p) {
+float fbm3(vec3 p) {
   float value = 0.0;
   float amplitude = 0.5;
   for (int i = 0; i < 4; i++) {
-    value += amplitude * noise(p);
-    p = mat2(1.72, 1.08, -1.08, 1.72) * p + 8.31;
+    value += amplitude * noise3(p);
+    p = p * 2.03 + vec3(7.1, 3.7, 5.9);
     amplitude *= 0.5;
   }
   return value;
 }
 
-float lineMask(float distanceToLine, float width) {
-  return exp(-pow(abs(distanceToLine) / max(width, 0.0001), 1.42));
+mat2 rotation(float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return mat2(c, -s, s, c);
+}
+
+vec3 worldToDisk(vec3 p) {
+  p.yz = rotation(-0.22) * p.yz;
+  p.xy = rotation(0.09) * p.xy;
+  return p;
+}
+
+vec3 diskToWorld(vec3 p) {
+  p.xy = rotation(-0.09) * p.xy;
+  p.yz = rotation(0.22) * p.yz;
+  return p;
 }
 
 float angleDelta(float a, float b) {
   return atan(sin(a - b), cos(a - b));
 }
 
-// Hundreds of apparent particles are synthesized from a handful of polar grids.
-// Inner orbits advance faster, approximating the velocity gradient in an accretion flow.
-vec2 orbitalParticles(vec2 p, float time, float density) {
-  float r = length(p);
-  float angle = atan(p.y, p.x);
-  float dust = 0.0;
-  float hot = 0.0;
+float annulus(float radius, float innerRadius, float outerRadius, float feather) {
+  return smoothstep(innerRadius, innerRadius + feather, radius) *
+    (1.0 - smoothstep(outerRadius - feather, outerRadius, radius));
+}
 
-  for (int i = 0; i < 7; i++) {
-    float fi = float(i);
-    float orbitRadius = 0.345 + fi * 0.052;
-    float count = 46.0 + fi * 11.0;
-    float omega = 0.22 / pow(orbitRadius, 1.35);
-    float movingGrid = (angle / TAU - time * omega) * count;
-    float cell = floor(movingGrid);
-    float seed = hash12(vec2(cell + fi * 47.0, fi * 19.7));
-    float center = 0.18 + 0.64 * hash12(vec2(cell * 1.37, fi + 8.2));
-    float tangent = (fract(movingGrid) - center) * TAU * orbitRadius / count;
-    float jitter = (hash12(vec2(cell + 91.3, fi * 7.4)) - 0.5) * (0.017 + fi * 0.002);
-    float radial = r - orbitRadius - jitter;
-    float size = mix(0.0018, 0.0042, hash12(vec2(cell * 2.1, fi * 31.0)));
-    float active = smoothstep(0.995 - min(density, 1.0) * 0.875, 1.0, seed);
-    active += max(density - 1.0, 0.0) * 0.65;
+float starLayer(vec3 direction, float scale, float threshold) {
+  vec3 grid = direction * scale;
+  vec3 cell = floor(grid);
+  vec3 local = fract(grid) - 0.5;
+  float seed = hash13(cell);
+  vec3 offset = vec3(
+    hash13(cell + 3.7),
+    hash13(cell + 17.1),
+    hash13(cell + 29.4)
+  ) - 0.5;
+  float point = exp(-dot(local - offset * 0.62, local - offset * 0.62) * 115.0);
+  float star = smoothstep(threshold, 1.0, seed) * point;
+  float twinkle = 0.72 + 0.28 * sin(uTime * (1.2 + seed * 2.0) + seed * 37.0);
+  return star * twinkle;
+}
 
-    float d = length(vec2(radial, tangent * 1.35)) / size;
-    float spark = exp(-d * d * 1.7) * active;
-    float shortTrail = exp(-abs(radial) / (size * 0.72));
-    shortTrail *= exp(-max(tangent, 0.0) / (size * 4.8));
-    shortTrail *= smoothstep(-size * 9.0, 0.0, tangent) * active * 0.10;
+vec3 backgroundSpace(vec3 direction) {
+  vec3 color = vec3(0.0022, 0.0020, 0.0042);
+  float stars = starLayer(direction, 210.0, 0.985);
+  stars += starLayer(direction.yzx, 410.0, 0.993) * 0.52;
+  color += vec3(0.56, 0.42, 0.38) * stars;
+  float nebula = fbm3(direction * 3.8 + vec3(1.0, 7.0, 3.0));
+  color += vec3(0.012, 0.0025, 0.0055) * pow(nebula, 3.0);
+  return color;
+}
 
-    dust += spark + shortTrail;
-    hot += spark * pow(seed, 5.0) * (1.25 - fi * 0.075);
+vec3 emissionRamp(float heat) {
+  vec3 deep = vec3(0.038, 0.0015, 0.0025);
+  vec3 red = vec3(0.62, 0.018, 0.007);
+  vec3 coral = vec3(1.04, 0.18, 0.052);
+  vec3 whiteHot = vec3(1.70, 1.05, 0.61);
+  vec3 color = mix(deep, red, smoothstep(0.02, 0.36, heat));
+  color = mix(color, coral, smoothstep(0.30, 0.82, heat));
+  return mix(color, whiteHot, smoothstep(0.82, 1.7, heat));
+}
+
+float particleField(vec3 diskPosition, float radius, float angle, float time) {
+  float orbitalSpeed = 0.42 / pow(max(radius, 0.48), 1.42);
+  float angularCount = mix(165.0, 76.0, saturate((radius - 0.50) / 1.18));
+  vec2 particleCoordinates = vec2(
+    (angle / TAU - time * orbitalSpeed) * angularCount,
+    (radius - 0.48) * 25.0
+  );
+  vec2 particleCell = floor(particleCoordinates);
+  vec2 particleLocal = fract(particleCoordinates) - 0.5;
+  float seed = hash12(particleCell + 17.3);
+  particleLocal.x -= (seed - 0.5) * 0.54;
+  particleLocal.y -= (hash12(particleCell + 41.7) - 0.5) * 0.48;
+  float activation = smoothstep(0.955 - min(uParticles, 1.0) * 0.055, 1.0, seed);
+  activation += max(uParticles - 1.0, 0.0) * 0.16;
+  float pointDistance = length(particleLocal * vec2(0.62, 1.0));
+  float verticalDistance = abs(diskPosition.y) / 0.024;
+  float point = exp(-pointDistance * pointDistance * 92.0 - verticalDistance * verticalDistance * 2.8);
+  float trail = exp(-abs(particleLocal.y) * 16.0 - max(particleLocal.x, 0.0) * 11.0);
+  trail *= smoothstep(-0.38, 0.0, particleLocal.x) * 0.055;
+  return (point + trail) * activation;
+}
+
+float filamentField(float radius, float angle, float time) {
+  float filament = 0.0;
+  float headOne = time * 0.63 + 0.4;
+  float headTwo = -time * 0.39 - 1.7;
+  float headThree = time * 0.24 + 2.6;
+
+  float radialOne = exp(-pow((radius - 0.67) / 0.026, 2.0));
+  float radialTwo = exp(-pow((radius - 0.96) / 0.032, 2.0));
+  float radialThree = exp(-pow((radius - 1.27) / 0.038, 2.0));
+  float gateOne = exp(-pow(abs(angleDelta(angle, headOne)) / 0.82, 4.0));
+  float gateTwo = exp(-pow(abs(angleDelta(angle, headTwo)) / 0.66, 4.0));
+  float gateThree = exp(-pow(abs(angleDelta(angle, headThree)) / 0.52, 4.0));
+
+  filament += radialOne * gateOne * 0.72;
+  filament += radialTwo * gateTwo * 0.43;
+  filament += radialThree * gateThree * 0.26;
+  return filament * uParticles;
+}
+
+vec2 diskVolume(vec3 worldPosition, vec3 rayDirection, float time) {
+  vec3 diskPosition = worldToDisk(worldPosition);
+  float radius = length(diskPosition.xz);
+  float radialMask = annulus(radius, 0.49, 1.72, 0.09);
+  float thickness = mix(0.038, 0.064, saturate((radius - 0.49) / 1.23));
+  float verticalMask = exp(-pow(abs(diskPosition.y) / thickness, 2.0));
+
+  // Keep the expensive procedural fields local to the visible disk volume.
+  if (radialMask * verticalMask < 0.001) {
+    return vec2(0.0);
   }
 
-  float orbitalEnvelope = smoothstep(0.31, 0.35, r) * (1.0 - smoothstep(0.70, 0.78, r));
-  return vec2(dust, hot) * orbitalEnvelope;
+  float angle = atan(diskPosition.z, diskPosition.x);
+  float spiralNoise = fbm3(vec3(
+    angle * 4.1 - time * 0.48 / pow(max(radius, 0.5), 1.15),
+    radius * 8.0,
+    diskPosition.y * 28.0
+  ));
+  float bands = 0.50 + 0.50 * sin(radius * 46.0 - angle * 3.0 + spiralNoise * 3.2);
+  bands = mix(0.78, 1.0, smoothstep(0.08, 0.92, bands));
+
+  vec3 tangentDisk = normalize(vec3(-diskPosition.z, 0.0, diskPosition.x));
+  vec3 tangentWorld = normalize(diskToWorld(tangentDisk));
+  float approach = dot(tangentWorld, -rayDirection);
+  float doppler = pow(max(0.82, 1.0 + approach * 0.14), 1.40);
+  float radialHeat = mix(1.12, 0.18, saturate((radius - 0.49) / 1.23));
+
+  float baseDensity = radialMask * verticalMask * bands;
+  float particles = particleField(diskPosition, radius, angle, time) * radialMask;
+  float filaments = filamentField(radius, angle, time) * verticalMask;
+  float density = baseDensity * 0.68 + particles * 0.58 + filaments * 0.52;
+  float heat = (baseDensity * radialHeat + particles * 0.64 + filaments * 0.68) * doppler;
+  return vec2(density, heat);
 }
 
-// Artistic memory motes inside the shadow. They are intentionally not presented
-// as matter escaping the event horizon; their dim spiral is a product metaphor.
-vec2 memoryParticles(vec2 p, float time, float density) {
-  float r = length(p);
-  float angle = atan(p.y, p.x);
-  float motes = 0.0;
-  float glints = 0.0;
-
-  for (int i = 0; i < 5; i++) {
-    float fi = float(i);
-    float orbitRadius = 0.055 + fi * 0.043;
-    float count = 16.0 + fi * 7.0;
-    float omega = 0.34 / pow(orbitRadius + 0.12, 1.18);
-    float spiral = time * 0.015 + 0.012 * sin(time * 0.7 + fi * 2.3);
-    float movingGrid = (angle / TAU - time * omega) * count;
-    float cell = floor(movingGrid);
-    float seed = hash12(vec2(cell + fi * 29.0, fi * 13.7));
-    float center = 0.2 + 0.6 * hash12(vec2(cell * 1.91, fi + 4.0));
-    float tangent = (fract(movingGrid) - center) * TAU * orbitRadius / count;
-    float radialJitter = (hash12(vec2(cell + 55.0, fi * 5.0)) - 0.5) * 0.019;
-    float radial = r - max(orbitRadius - spiral * (0.15 + fi * 0.04), 0.022) - radialJitter;
-    float size = mix(0.0014, 0.0034, seed);
-    float active = smoothstep(0.995 - min(density, 1.0) * 0.755, 1.0, seed);
-    active += max(density - 1.0, 0.0) * 0.40;
-    float d = length(vec2(radial, tangent * 1.25)) / size;
-    float mote = exp(-d * d * 1.8) * active;
-    motes += mote;
-    glints += mote * pow(seed, 7.0);
-  }
-
-  float inside = 1.0 - smoothstep(0.245, 0.275, r);
-  return vec2(motes, glints) * inside;
+float orbitalDustLayer(vec2 diskScreen, float time, float angularScale, float radialScale, float salt) {
+  vec2 diskPlane = vec2(diskScreen.x, diskScreen.y * 6.2);
+  float radius = length(diskPlane);
+  float angle = atan(diskPlane.y, diskPlane.x);
+  float orbitalSpeed = 0.17 / pow(max(radius, 0.30), 1.35);
+  vec2 coordinates = vec2(
+    angle / TAU * angularScale - time * orbitalSpeed * angularScale,
+    radius * radialScale
+  );
+  vec2 cell = floor(coordinates);
+  vec2 local = fract(coordinates) - 0.5;
+  float seed = hash12(cell + salt);
+  vec2 offset = vec2(hash12(cell + salt + 13.2), hash12(cell + salt + 47.8)) - 0.5;
+  local -= offset * vec2(0.72, 0.66);
+  float activation = smoothstep(0.974 - min(uParticles, 1.0) * 0.050, 1.0, seed);
+  activation += max(uParticles - 1.0, 0.0) * 0.11;
+  float point = exp(-dot(local * vec2(0.58, 1.0), local * vec2(0.58, 1.0)) * 145.0);
+  float trail = exp(-abs(local.y) * 28.0 - abs(local.x + 0.12) * 7.0) * 0.085;
+  float diskGate = annulus(radius, 0.31, 1.45, 0.10);
+  return (point + trail) * activation * diskGate;
 }
 
-float orbitingArc(
-  vec2 p,
-  float baseRadius,
-  float head,
-  float width,
-  float arcLength,
-  float phase
-) {
-  float r = length(p);
-  float angle = atan(p.y, p.x);
-  float warpedRadius = baseRadius + 0.014 * sin(angle * 3.0 + phase);
-  float radial = exp(-pow((r - warpedRadius) / width, 2.0));
-  float angular = exp(-pow(abs(angleDelta(angle, head)) / arcLength, 4.0));
-  float filament = 0.72 + 0.28 * sin(angle * 38.0 - phase * 3.0);
-  return radial * angular * filament;
+vec2 orbitalDust(vec2 diskScreen, float time) {
+  float fine = orbitalDustLayer(diskScreen, time, 143.0, 38.0, 11.0);
+  float near = orbitalDustLayer(diskScreen, time * 0.83, 91.0, 27.0, 73.0);
+  return vec2(fine + near * 0.72, near);
 }
 
-vec3 redRamp(float energy) {
-  vec3 ember = vec3(0.16, 0.004, 0.008);
-  vec3 scarlet = vec3(1.00, 0.055, 0.035);
-  vec3 hot = vec3(1.35, 0.72, 0.58);
-  vec3 c = mix(ember, scarlet, smoothstep(0.04, 0.58, energy));
-  return mix(c, hot, smoothstep(0.62, 1.15, energy));
+void cameraRay(vec2 uv, out vec3 rayOrigin, out vec3 rayDirection) {
+  vec2 pointer = (uPointer - 0.5) * vec2(0.26, 0.16);
+  rayOrigin = vec3(0.10 + pointer.x, 0.42 + pointer.y, 3.55);
+  vec3 target = vec3(0.08, 0.0, 0.0);
+  vec3 forward = normalize(target - rayOrigin);
+  vec3 cameraRight = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+  vec3 cameraUp = normalize(cross(cameraRight, forward));
+
+  float roll = -0.12;
+  vec3 rolledRight = cameraRight * cos(roll) + cameraUp * sin(roll);
+  vec3 rolledUp = -cameraRight * sin(roll) + cameraUp * cos(roll);
+  rayDirection = normalize(forward * 1.82 + uv.x * rolledRight + uv.y * rolledUp);
 }
 
 void main() {
-  vec2 frag = gl_FragCoord.xy;
-  vec2 p = (2.0 * frag - uResolution.xy) / min(uResolution.x, uResolution.y);
+  vec2 fragment = gl_FragCoord.xy;
+  vec2 uv = (2.0 * fragment - uResolution.xy) / uResolution.y;
 
-  // Optical centering leaves room for the title without making the mark feel off-axis.
-  p -= vec2(0.13, 0.015);
-  p -= (uPointer - 0.5) * vec2(0.025, 0.018);
+  vec3 rayOrigin;
+  vec3 initialDirection;
+  cameraRay(uv, rayOrigin, initialDirection);
 
-  float t = uTime;
-  float r = length(p);
-  float angle = atan(p.y, p.x);
+  vec3 rayPosition = rayOrigin;
+  vec3 rayDirection = initialDirection;
+  vec3 accumulated = vec3(0.0);
+  float transmittance = 1.0;
+  float minimumRadius = 99.0;
+  bool swallowed = false;
 
-  const float horizon = 0.285;
-  float photonRadius = horizon + 0.024;
+  const float eventHorizon = 0.405;
+  const float photonShell = 0.535;
 
-  // Inverse point-lens mapping. A straight source line becomes two curved images
-  // around the event horizon. The clamp keeps the singularity numerically stable.
-  float lensRadius = max(r, horizon * 0.72);
-  float einstein = mix(0.105, 0.19, uGravity);
-  vec2 source = p * (1.0 - (einstein * einstein) / (lensRadius * lensRadius));
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    float radius = length(rayPosition);
+    minimumRadius = min(minimumRadius, radius);
 
-  vec2 rayDirection = normalize(vec2(1.0, 0.72));
-  vec2 rayNormal = vec2(-rayDirection.y, rayDirection.x);
-  float alongRay = dot(source, rayDirection);
-  float acrossRay = dot(source, rayNormal) - 0.012;
+    if (radius < eventHorizon) {
+      swallowed = true;
+      break;
+    }
 
-  float travelling = 0.78 + 0.22 * sin(alongRay * 14.0 - t * 2.4);
-  float filamentNoise = 0.82 + 0.18 * fbm(vec2(alongRay * 7.0 - t * 0.24, acrossRay * 62.0));
-  float coreRay = lineMask(acrossRay, 0.0045) * travelling;
-  float rayGlow = lineMask(acrossRay, 0.032 + 0.010 * uGlow) * filamentNoise;
+    float proximity = 1.0 - smoothstep(0.48, 2.25, radius);
+    float stepLength = mix(0.085, 0.024, proximity);
 
-  // A tilted accretion sheet. Its far side is lifted above and below the shadow,
-  // producing the recognizable gravitationally-lensed "over the top" silhouette.
-  vec2 diskDirection = rayDirection;
-  vec2 diskNormal = rayNormal;
-  float diskX = dot(source, diskDirection);
-  float diskY = dot(source, diskNormal);
-  float diskSpan = 1.0 - smoothstep(0.23, 1.15, abs(diskX));
-  float diskTexture = 0.58 + 0.42 * fbm(vec2(diskX * 18.0 - t * 0.55, diskY * 90.0));
-  float diskCore = lineMask(diskY, 0.009) * diskSpan * diskTexture;
-  float diskHaze = lineMask(diskY, 0.058) * diskSpan * (0.55 + 0.45 * diskTexture);
+    vec2 volume = diskVolume(rayPosition, rayDirection, uTime);
+    float corona = 0.0;
+    if (radius < 1.48) {
+      float coronaNoise = noise3(rayPosition * 7.3 + vec3(0.0, -uTime * 0.11, uTime * 0.07));
+      float coronaEnvelope = exp(-pow((radius - 0.72) / 0.42, 2.0));
+      corona = coronaEnvelope * pow(coronaNoise, 3.4) * 0.11 * uGlow;
+    }
 
-  // The circular photon ring remains analytically circular and cannot develop a seam.
-  float ringDistance = abs(r - photonRadius);
-  float beaming = 0.58 + 0.42 * smoothstep(-0.9, 0.75, dot(normalize(p + 0.0001), rayDirection));
-  float ringCore = exp(-ringDistance * 390.0) * beaming;
-  float ringGlow = exp(-ringDistance * (52.0 - 18.0 * uGlow)) * beaming;
+    float localDensity = volume.x * 0.72 + corona;
+    float localHeat = volume.y + corona * 0.5;
+    float opacity = 1.0 - exp(-localDensity * stepLength * 4.6);
+    vec3 emission = emissionRamp(localHeat) * localHeat;
+    accumulated += transmittance * emission * opacity * 0.82;
+    transmittance *= 1.0 - opacity * 0.34;
 
-  // Extra lensed arcs make the far side of the disk appear over and under the hole.
-  float upperArc = exp(-pow((r - photonRadius - 0.040 - 0.018 * cos(angle * 2.0)) / 0.024, 2.0));
-  upperArc *= smoothstep(-0.42, 0.3, p.y) * (1.0 - smoothstep(0.25, 0.82, abs(angle - 1.18)));
-  float lowerArc = exp(-pow((r - photonRadius - 0.030) / 0.019, 2.0));
-  lowerArc *= (1.0 - smoothstep(-0.42, 0.06, p.y)) * (1.0 - smoothstep(0.05, 1.0, abs(angle + 1.92)));
+    float gravityStrength = mix(0.032, 0.082, uGravity);
+    vec3 acceleration = -rayPosition * gravityStrength / max(radius * radius * radius, 0.055);
+    rayDirection = normalize(rayDirection + acceleration * stepLength);
+    rayPosition += rayDirection * stepLength;
 
-  float turbulence = fbm(vec2(angle * 3.1 - t * 0.13, r * 16.0 + t * 0.08));
-  float corona = exp(-max(r - horizon, 0.0) * (9.2 - 2.4 * uGlow));
-  corona *= (0.23 + 0.22 * turbulence) * (1.0 - smoothstep(horizon, 0.88, r));
+    if (length(rayPosition) > 6.3 || transmittance < 0.018) {
+      break;
+    }
+  }
 
-  vec2 orbitDust = orbitalParticles(p, t, uParticles);
-  vec2 memoryDust = memoryParticles(p, t, uParticles);
+  vec3 color = accumulated;
 
-  // Three offset filaments orbit at different radii and angular velocities.
-  float arcOne = orbitingArc(p, 0.372, t * 0.72 + 0.35, 0.0048, 0.88, t * 0.22);
-  float arcTwo = orbitingArc(p, 0.438, -t * 0.43 - 1.5, 0.0034, 0.67, 2.2 - t * 0.17);
-  float arcThree = orbitingArc(p, 0.535, t * 0.27 + 2.65, 0.0027, 0.48, 4.7 + t * 0.11);
-  float orbitingLight = (arcOne * 0.48 + arcTwo * 0.31 + arcThree * 0.18) * uParticles;
+  if (!swallowed) {
+    vec3 bentBackground = backgroundSpace(rayDirection);
+    color += bentBackground * transmittance;
+  } else {
+    color += vec3(0.00022, 0.00018, 0.00038) * transmittance;
+  }
 
-  vec3 background = vec3(0.0045, 0.004, 0.007);
-  float vignette = 1.0 - smoothstep(0.32, 1.52, length(p * vec2(0.82, 1.0)));
-  background *= 0.52 + 0.48 * vignette;
-  background += vec3(0.020, 0.007, 0.011) * exp(-r * 1.8);
+  // Physically bent rays provide the base. This near-camera projection gives
+  // the lensed rear disk a clear silhouette at real-time sampling rates.
+  // Match the near-camera reconstruction to the actual rolled 3D disk.
+  // The previous sign was inverted, producing a false crossing band.
+  vec2 diskScreen = rotation(0.12) * uv;
+  float screenRadius = length(uv);
+  float screenHorizon = 1.0 - smoothstep(0.292, 0.314, screenRadius);
+  float frontSlice = exp(-pow(diskScreen.y / 0.052, 2.0));
+  frontSlice *= smoothstep(0.055, 0.27, screenRadius);
+  float shadow = screenHorizon * (1.0 - frontSlice * 0.88);
+  color *= 1.0 - shadow * 0.985;
 
-  float stars = step(0.9982, hash12(floor((p + 2.0) * 230.0)));
-  stars *= 0.12 + 0.22 * hash12(floor(p * 171.0));
-  background += stars * vec3(0.48, 0.38, 0.40) * smoothstep(0.36, 0.82, r);
+  float arcDomain = saturate(1.0 - pow(diskScreen.x / 0.34, 2.0));
+  float arcHeight = 0.305 * sqrt(arcDomain);
+  float arcGate = 1.0 - smoothstep(0.31, 0.355, abs(diskScreen.x));
+  float upperArc = exp(-pow((diskScreen.y - arcHeight) / 0.037, 2.0)) * arcGate;
+  float upperArcCore = exp(-pow((diskScreen.y - arcHeight) / 0.0085, 2.0)) * arcGate;
+  float lowerArc = exp(-pow((diskScreen.y + arcHeight) / 0.039, 2.0)) * arcGate;
+  float lowerArcCore = exp(-pow((diskScreen.y + arcHeight) / 0.010, 2.0)) * arcGate;
+  float arcNoise = noise3(vec3(
+    diskScreen.x * 24.0 - uTime * 0.20,
+    diskScreen.y * 18.0,
+    4.7
+  ));
+  float arcFlow = 0.48 + 0.52 * smoothstep(0.18, 0.90, arcNoise);
+  color += vec3(1.02, 0.24, 0.055) * upperArc * arcFlow * 0.40 * uGlow;
+  color += vec3(1.68, 0.94, 0.50) * upperArcCore * (0.72 + arcNoise * 0.28) * 0.22 * uGlow;
+  color += vec3(0.82, 0.105, 0.022) * lowerArc * arcFlow * 0.22 * uGlow;
+  color += vec3(1.24, 0.44, 0.12) * lowerArcCore * arcFlow * 0.10 * uGlow;
 
-  float energy =
-    diskCore * 0.92 +
-    diskHaze * 0.28 * uGlow +
-    coreRay * 0.62 +
-    rayGlow * 0.18 * uGlow +
-    ringCore * 1.35 +
-    ringGlow * 0.31 * uGlow +
-    upperArc * 0.24 +
-    lowerArc * 0.16 +
-    corona * uGlow +
-    orbitDust.x * 0.18 * uParticles +
-    orbitDust.y * 0.72 * uParticles +
-    orbitingLight;
+  float upperBloom = exp(-pow((diskScreen.y - arcHeight) / 0.070, 2.0)) * arcGate;
+  upperBloom *= smoothstep(-0.05, 0.16, diskScreen.y);
+  color += vec3(0.42, 0.026, 0.007) * upperBloom * 0.20 * uGlow;
 
-  vec3 color = background + redRamp(energy) * energy;
+  float lowerBloom = exp(-pow((diskScreen.y + arcHeight) / 0.078, 2.0)) * arcGate;
+  lowerBloom *= 1.0 - smoothstep(-0.16, 0.02, diskScreen.y);
+  color += vec3(0.22, 0.006, 0.004) * lowerBloom * 0.11 * uGlow;
 
-  // Slight warm/cool split in the deepest glow, while red remains the dominant hue.
-  color += vec3(0.025, 0.008, 0.015) * rayGlow;
-  color += vec3(0.002, 0.010, 0.017) * ringGlow * (1.0 - beaming) * 0.5;
+  float foregroundBand = exp(-pow(diskScreen.y / 0.048, 2.0));
+  foregroundBand *= 1.0 - smoothstep(1.16, 1.46, abs(diskScreen.x));
+  float foregroundTexture = 0.42 + 0.58 * noise3(vec3(
+    diskScreen.x * 6.0 - uTime * 0.22,
+    diskScreen.y * 31.0,
+    9.3
+  ));
+  float foregroundHeat = 1.0 - smoothstep(0.12, 1.15, abs(diskScreen.x));
+  color += mix(vec3(0.42, 0.007, 0.003), vec3(1.46, 0.64, 0.25), foregroundHeat) *
+    foregroundBand * foregroundTexture * 0.66;
 
-  // The shadow is applied last, so no noisy light leaks into the black-hole core.
-  float shadow = 1.0 - smoothstep(horizon - 0.0025, horizon + 0.0025, r);
-  color = mix(color, vec3(0.0003, 0.00025, 0.0005), shadow);
+  float foregroundCore = exp(-pow(diskScreen.y / 0.0075, 2.0));
+  foregroundCore *= 1.0 - smoothstep(0.92, 1.24, abs(diskScreen.x));
+  color += mix(vec3(0.54, 0.018, 0.006), vec3(1.72, 1.02, 0.58), foregroundHeat) *
+    foregroundCore * foregroundTexture * 0.15;
 
-  // Memory particles are added after the physical shadow pass by design. Their
-  // low red values keep the core perceptually black while making motion legible.
-  color += vec3(0.070, 0.006, 0.011) * memoryDust.x * uParticles;
-  color += vec3(0.48, 0.055, 0.045) * memoryDust.y * uParticles;
+  float outerDiskGate = smoothstep(0.27, 0.40, abs(diskScreen.x));
+  outerDiskGate *= 1.0 - smoothstep(1.15, 1.52, abs(diskScreen.x));
+  float directHalo = exp(-pow(diskScreen.y / 0.100, 2.0)) * outerDiskGate;
+  float haloTexture = 0.34 + 0.66 * noise3(vec3(
+    diskScreen.x * 7.0 - uTime * 0.08,
+    diskScreen.y * 20.0,
+    12.1
+  ));
+  color += vec3(0.30, 0.007, 0.003) * directHalo * haloTexture * 0.22;
 
-  // ACES-inspired compression keeps the white-hot regions from clipping flat.
+  vec2 dust = orbitalDust(diskScreen, uTime);
+  float dustVisibility = 1.0 - screenHorizon * (1.0 - frontSlice * 0.92);
+  float approachingSide = mix(0.72, 1.0, smoothstep(-0.75, 0.58, diskScreen.x));
+  color += mix(vec3(0.78, 0.035, 0.012), vec3(1.34, 0.58, 0.25), dust.y) *
+    dust.x * dustVisibility * approachingSide * 0.82;
+
+  // Rays grazing the photon shell generate several progressively finer images.
+  float photonDistance = abs(minimumRadius - photonShell);
+  float primaryRing = exp(-photonDistance * 78.0);
+  float secondaryRing = exp(-abs(minimumRadius - photonShell * 0.965) * 185.0) * 0.35;
+  float beaming = 0.62 + 0.38 * saturate(dot(rayDirection, normalize(vec3(0.82, 0.10, -0.38))));
+  float projectedPhoton = exp(-abs(screenRadius - 0.314) * 148.0);
+  float secondaryPhoton = exp(-abs(screenRadius - 0.302) * 265.0);
+  float tertiaryPhoton = exp(-abs(screenRadius - 0.296) * 440.0);
+  float photonGate = 0.05 + 0.95 * smoothstep(-0.14, 0.25, diskScreen.y);
+  color += emissionRamp(primaryRing) * (primaryRing * 0.038 + secondaryRing * 0.024) * beaming * uGlow;
+  color += vec3(1.48, 0.58, 0.20) * projectedPhoton * photonGate * 0.026 * uGlow;
+  color += vec3(1.64, 0.78, 0.34) * secondaryPhoton * photonGate * 0.011 * uGlow;
+  color += vec3(1.72, 0.98, 0.54) * tertiaryPhoton * photonGate * 0.004 * uGlow;
+
+  float vignette = 1.0 - smoothstep(0.42, 1.55, length(uv * vec2(0.82, 1.0)));
+  color *= 0.52 + 0.48 * vignette;
+
   color = color * (2.51 * color + 0.03) / (color * (2.43 * color + 0.59) + 0.14);
-  color = pow(max(color, 0.0), vec3(0.94));
+  color = pow(max(color, 0.0), vec3(0.93));
 
-  float pixelGrain = hash12(frag + fract(t) * 91.7) - 0.5;
-  color += pixelGrain * 0.012;
+  float grain = hash12(fragment + fract(uTime) * 97.3) - 0.5;
+  color += grain * 0.010;
   outColor = vec4(color, 1.0);
 }
 `;
@@ -392,7 +534,7 @@ function createProgram(vertexSource, fragmentSource) {
 }
 
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
   const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
   const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
   if (canvas.width !== width || canvas.height !== height) {

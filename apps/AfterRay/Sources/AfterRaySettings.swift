@@ -58,6 +58,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadProgress: Double?
     @Published var downloadStatus: String?
     @Published var isUpdatingAudio = false
+    @Published var recentJobs: [ModelJob] = []
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
     var dataDirectoryPath: String {
@@ -81,9 +82,11 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
             async let nextSettings = daemon.settings()
             async let nextLibrary = daemon.modelLibrary()
-            let loaded = try await (nextSettings, nextLibrary)
+            async let nextJobs = daemon.jobs()
+            let loaded = try await (nextSettings, nextLibrary, nextJobs)
             settings = loaded.0
             library = loaded.1
+            recentJobs = Array(loaded.2.suffix(8).reversed())
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
             storage = AfterRayStorageSnapshot.measure(
                 dataDirectory: URL(fileURLWithPath: loaded.0.dataDir, isDirectory: true),
@@ -124,13 +127,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func download(packID: String?) async {
-        guard let script = Self.downloadScript else {
-            message = "Download script is only available in the development checkout."
-            reveal(library?.directory ?? DaemonSupervisor.shared.modelDirectory.path)
-            return
-        }
         downloadingID = packID ?? "all"
-        downloadProgress = packID == nil ? nil : 0
+        downloadProgress = 0
         downloadStatus = packID == nil ? "Starting downloads…" : "Starting \(displayName(for: packID))…"
         message = nil
         defer {
@@ -139,68 +137,26 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             downloadStatus = nil
         }
 
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [script.path]
-        process.currentDirectoryURL = script
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = Self.downloadPATH(from: environment["PATH"])
-        environment["HOME"] = NSHomeDirectory()
-        environment["AFTERRAY_MODEL_DIR"] = library?.directory ?? DaemonSupervisor.shared.modelDirectory.path
-        environment["AFTERRAY_MLX_RUNTIME"] = DaemonSupervisor.shared.mlxRuntimeDirectory.path
-        environment["PYTHONUNBUFFERED"] = "1"
-        if let packID, let target = Self.downloadTarget(for: packID) {
-            environment["AFTERRAY_DOWNLOAD_ONLY"] = target
-        }
-        process.environment = environment
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
-        process.standardError = output
-
-        var log = ""
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in
-                log += chunk
-                self?.downloadStatus = Self.latestLogLine(from: log)
+        let socket = DaemonSupervisor.shared.socketPath
+        let progress = Task { @MainActor in
+            while !Task.isCancelled {
+                if let next = try? await UnixSocketDaemonClient(socketPath: socket).modelLibrary() {
+                    library = next
+                    applyDownloadProgress(next.download, fallbackPackID: packID)
+                }
+                try? await Task.sleep(for: .milliseconds(350))
             }
         }
 
         do {
-            try process.run()
-            while process.isRunning {
-                if let pack = library?.packs.first(where: { $0.id == packID }) {
-                    let current = AfterRayStorageSnapshot.itemBytes(at: URL(fileURLWithPath: pack.path))
-                    if let expected = pack.expectedBytes, expected > 0, current > 0 {
-                        downloadProgress = min(Double(current) / Double(expected), 0.99)
-                    }
-                }
-                try await Task.sleep(for: .milliseconds(400))
-            }
-            output.fileHandleForReading.readabilityHandler = nil
-            if let leftover = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) {
-                log += leftover
-            }
-            AfterRayLog.info(log, source: "download")
-            if process.terminationStatus == 0 {
-                message = packID == nil ? "Downloads finished." : "\(displayName(for: packID)) is ready."
-            } else {
-                let detail = Self.latestLogLine(from: log)
-                message = detail.isEmpty
-                    ? "Download failed (exit \(process.terminationStatus))."
-                    : "Download failed: \(detail)"
-                AfterRayLog.error(message ?? "download failed", source: "download")
-            }
+            library = try await UnixSocketDaemonClient(socketPath: socket).downloadModels(packID: packID)
+            AfterRayLog.info("downloaded \(packID ?? "missing models")", source: "download")
+            message = packID == nil ? "Downloads finished." : "\(displayName(for: packID)) is ready."
         } catch {
-            output.fileHandleForReading.readabilityHandler = nil
             message = error.localizedDescription
             AfterRayLog.error(error.localizedDescription, source: "download")
         }
+        progress.cancel()
         await refresh()
     }
 
@@ -218,49 +174,19 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         library?.packs.first(where: { $0.id == packID })?.name ?? "model"
     }
 
-    private static func downloadTarget(for packID: String) -> String? {
-        switch packID {
-        case "asr": "asr"
-        case "embedding": "embedding"
-        case "llm": "llm"
-        case "asr-whisper": "whisper"
-        default: nil
+    private func applyDownloadProgress(_ download: ModelDownloadProgress?, fallbackPackID: String?) {
+        guard let download else { return }
+        if let fraction = download.fraction {
+            downloadProgress = min(fraction, 0.99)
         }
-    }
-
-    private static func downloadPATH(from current: String?) -> String {
-        let extras = [
-            "/opt/homebrew/bin",
-            "/opt/homebrew/sbin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]
-        let existing = (current ?? "").split(separator: ":").map(String.init)
-        return (extras + existing).joined(separator: ":")
-    }
-
-    private static func latestLogLine(from log: String) -> String {
-        log.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { !$0.isEmpty }
-            .map { String($0) } ?? log.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static var downloadScript: URL? {
-        var candidates: [URL] = []
-        if let repo = DaemonSupervisor.shared.repositoryRoot {
-            candidates.append(repo.appendingPathComponent("scripts/download-models/download.sh"))
+        let name = displayName(for: download.packId.isEmpty ? fallbackPackID : download.packId)
+        if let percent = download.percent {
+            downloadStatus = "Downloading \(name) · \(percent)%"
+        } else if download.totalFiles > 0 {
+            downloadStatus = "Downloading \(name) · \(download.completedFiles)/\(download.totalFiles) files"
+        } else {
+            downloadStatus = "Downloading \(name)…"
         }
-        let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
-        candidates.append(
-            bundleParent.deletingLastPathComponent().appendingPathComponent("scripts/download-models/download.sh")
-        )
-        candidates.append(
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("scripts/download-models/download.sh")
-        )
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 }
 
