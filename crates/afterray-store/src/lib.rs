@@ -218,6 +218,7 @@ pub struct Vault {
     connection: Mutex<Connection>,
     artifacts_dir: PathBuf,
     artifact_wrap_key: Zeroizing<[u8; 32]>,
+    legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
     max_unstarred_moments: usize,
 }
@@ -247,19 +248,17 @@ impl Vault {
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
         set_database_file_permissions(&database_path)?;
-        let vault = Self {
+        Ok(Self {
             connection: Mutex::new(connection),
             artifacts_dir,
             artifact_wrap_key: Zeroizing::new(blake3::derive_key(
                 ARTIFACT_WRAP_KEY_CONTEXT,
                 &*master_key,
             )),
+            legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
             max_unstarred_moments: config.max_unstarred_moments,
-        };
-        vault.migrate_legacy_artifacts(&master_key)?;
-        vault.cleanup_orphaned_artifact_files()?;
-        Ok(vault)
+        })
     }
 
     pub fn create_session_sync(&self, started_at_ms: i64) -> Result<Session, StoreError> {
@@ -747,6 +746,7 @@ impl Vault {
     }
 
     pub fn read_artifact(&self, id: &str) -> Result<ArtifactPayload, StoreError> {
+        let _artifact_guard = self.artifact_io.lock().unwrap();
         let connection = self.connection.lock().unwrap();
         let metadata: Option<ArtifactRecordMetadata> = connection
             .query_row(
@@ -759,12 +759,27 @@ impl Vault {
         let (content_type, format_version, wrapped_key, wrapping_nonce) =
             metadata.ok_or_else(|| StoreError::ArtifactNotFound(id.to_owned()))?;
         drop(connection);
+        if format_version < ARTIFACT_FORMAT_VERSION {
+            let legacy_key = self
+                .legacy_artifact_key
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|key| Zeroizing::new(**key))
+                .ok_or(StoreError::Crypto)?;
+            let encrypted = fs::read(self.legacy_artifact_path(id))?;
+            let bytes = decrypt_legacy_artifact(&legacy_key, id, &content_type, &encrypted)?;
+            return Ok(ArtifactPayload {
+                id: id.to_owned(),
+                content_type,
+                bytes: bytes.to_vec(),
+            });
+        }
         if format_version != ARTIFACT_FORMAT_VERSION {
             return Err(StoreError::Crypto);
         }
         let wrapped_key = wrapped_key.ok_or(StoreError::Crypto)?;
         let wrapping_nonce = wrapping_nonce.ok_or(StoreError::Crypto)?;
-        let _artifact_guard = self.artifact_io.lock().unwrap();
         let encrypted = fs::read(self.artifact_path(id))?;
         let bytes = decrypt_artifact(
             &self.artifact_wrap_key,
@@ -807,7 +822,10 @@ impl Vault {
         Ok(id)
     }
 
-    fn migrate_legacy_artifacts(&self, legacy_key: &[u8; 32]) -> Result<(), StoreError> {
+    /// Re-encrypts legacy artifacts one at a time without blocking Vault startup.
+    ///
+    /// Callers may run this after the daemon has started accepting requests.
+    pub fn migrate_legacy_artifacts(&self) -> Result<usize, StoreError> {
         let artifacts = {
             let connection = self.connection.lock().unwrap();
             let mut statement = connection.prepare(
@@ -821,16 +839,25 @@ impl Vault {
                 .collect::<Result<Vec<_>, _>>()?
         };
         if artifacts.is_empty() {
-            return Ok(());
+            *self.legacy_artifact_key.lock().unwrap() = None;
+            return Ok(0);
         }
 
-        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let legacy_key = self
+            .legacy_artifact_key
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|key| Zeroizing::new(**key))
+            .ok_or(StoreError::Crypto)?;
+        let total = artifacts.len();
         for (id, content_type) in artifacts {
+            let _artifact_guard = self.artifact_io.lock().unwrap();
             let path = self.artifact_path(&id);
             let legacy_path = self.legacy_artifact_path(&id);
             let legacy_encrypted = fs::read(&legacy_path)?;
             let decrypted =
-                decrypt_legacy_artifact(legacy_key, &id, &content_type, &legacy_encrypted)?;
+                decrypt_legacy_artifact(&legacy_key, &id, &content_type, &legacy_encrypted)?;
             let replacement =
                 encrypt_artifact(&self.artifact_wrap_key, &id, &content_type, &decrypted)?;
             atomic_write_private(&path, &replacement.bytes)?;
@@ -847,7 +874,15 @@ impl Vault {
             )?;
             fs::remove_file(legacy_path)?;
         }
-        Ok(())
+        *self.legacy_artifact_key.lock().unwrap() = None;
+        Ok(total)
+    }
+
+    /// Completes file-level startup work after the daemon is already serving.
+    pub fn run_artifact_maintenance(&self) -> Result<usize, StoreError> {
+        let migrated = self.migrate_legacy_artifacts()?;
+        self.cleanup_orphaned_artifact_files()?;
+        Ok(migrated)
     }
 
     fn delete_artifact_record_and_file(&self, id: &str) -> Result<(), StoreError> {
@@ -1771,6 +1806,9 @@ mod tests {
         drop(vault);
 
         let migrated = Vault::open_with_key(config, master_key).unwrap();
+        let payload_before_migration = migrated.read_artifact(&id).unwrap();
+        assert_eq!(payload_before_migration.bytes, b"legacy-secret");
+        assert_eq!(migrated.migrate_legacy_artifacts().unwrap(), 1);
         assert!(!migrated.legacy_artifact_path(&id).exists());
         assert_eq!(
             &fs::read(migrated.artifact_path(&id)).unwrap()[..4],

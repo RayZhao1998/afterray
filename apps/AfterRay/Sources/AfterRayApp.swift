@@ -36,9 +36,11 @@ struct AfterRayApp: App {
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installStatusItem()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
     }
@@ -47,8 +49,50 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.forEach(center.removeObserver)
         workspaceObservers.removeAll()
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
+        statusItem = nil
         RecallOverlayController.shared.stop()
         DaemonSupervisor.shared.stop()
+    }
+
+    private func installStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = NSImage(
+                systemSymbolName: "clock.arrow.circlepath",
+                accessibilityDescription: "AfterRay"
+            )
+            button.toolTip = "AfterRay"
+        }
+
+        let menu = NSMenu()
+        let openItem = NSMenuItem(
+            title: "Open AfterRay",
+            action: #selector(openAfterRay),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        menu.addItem(openItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "Quit AfterRay",
+            action: #selector(quitAfterRay),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem.menu = menu
+        self.statusItem = statusItem
+    }
+
+    @objc private func openAfterRay() {
+        RecallOverlayController.shared.show()
+    }
+
+    @objc private func quitAfterRay() {
+        NSApp.terminate(nil)
     }
 
     private func observeSystemSessionSecurityEvents() {

@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         QueueConfig::default(),
     )?;
 
+    let migration_store = Arc::clone(&store);
     let state = Arc::new(AppState {
         store,
         capture,
@@ -104,6 +105,11 @@ async fn main() -> anyhow::Result<()> {
         ),
     });
     println!("afterrayd listening on {}", socket.display());
+    tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
+        Ok(0) => {}
+        Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
+        Err(error) => eprintln!("background artifact maintenance paused: {error}"),
+    });
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
