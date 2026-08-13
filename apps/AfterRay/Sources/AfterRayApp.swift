@@ -31,7 +31,12 @@ struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Settings { EmptyView() }
+        Settings {
+            AfterRaySettingsView(model: AfterRaySettingsController.shared.model) {
+                AfterRaySettingsController.shared.hide()
+            }
+            .background(SettingsWindowPromoter())
+        }
     }
 }
 
@@ -351,6 +356,10 @@ final class RecallOverlayController {
 
     var currentScreen: NSScreen? {
         panel?.screen ?? targetScreen
+    }
+
+    func isOverlayWindow(_ window: NSWindow) -> Bool {
+        panel === window
     }
 
     func makeKeyIfVisible() {

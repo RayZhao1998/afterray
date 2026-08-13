@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#060608" />
+    <title>AfterRay · Gravitational Light</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="stage">
+      <canvas id="shader" aria-label="Animated gravitational lensing around the AfterRay mark"></canvas>
+
+      <div class="grain" aria-hidden="true"></div>
+
+      <header class="brand">
+        <span class="brand__signal" aria-hidden="true"></span>
+        <span>AfterRay</span>
+      </header>
+
+      <section class="caption" aria-labelledby="title">
+        <p class="eyebrow">Gravitational light study · 01</p>
+        <h1 id="title">A ray,<br />after time.</h1>
+        <p class="lede">
+          Light remembers the path<br />space tried to erase.
+        </p>
+      </section>
+
+      <aside class="controls" aria-label="Shader controls">
+        <div class="controls__heading">
+          <span>Field controls</span>
+          <button id="toggle" type="button" aria-pressed="false">
+            <svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4.75 3.5v9M11.25 3.5v9" />
+            </svg>
+            <svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m5.5 3.75 7 4.25-7 4.25Z" />
+            </svg>
+            <span class="toggle-label">Pause</span>
+          </button>
+        </div>
+
+        <label>
+          <span>Gravity</span>
+          <output id="gravity-value">0.62</output>
+          <input id="gravity" type="range" min="0.35" max="0.9" value="0.62" step="0.01" />
+        </label>
+
+        <label>
+          <span>Corona</span>
+          <output id="glow-value">0.78</output>
+          <input id="glow" type="range" min="0.25" max="1.2" value="0.78" step="0.01" />
+        </label>
+
+        <label>
+          <span>Drift</span>
+          <output id="speed-value">0.34</output>
+          <input id="speed" type="range" min="0" max="1" value="0.34" step="0.01" />
+        </label>
+      </aside>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
