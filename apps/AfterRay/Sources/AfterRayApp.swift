@@ -31,12 +31,7 @@ struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Settings {
-            AfterRaySettingsView(model: AfterRaySettingsController.shared.model) {
-                AfterRaySettingsController.shared.hide()
-            }
-            .background(SettingsWindowPromoter())
-        }
+        Settings { EmptyView() }
     }
 }
 
@@ -466,6 +461,10 @@ final class RecallOverlayController {
     }
 
     fileprivate func closeFromKeyboard() {
+        if AfterRaySettingsController.shared.isPresented {
+            AfterRaySettingsController.shared.hide()
+            return
+        }
         if PermissionGuideController.shared.isVisible {
             PermissionGuideController.shared.hide()
             return
@@ -749,6 +748,7 @@ private struct AfterRayRootView: View {
     @StateObject private var audioPlayer: ArtifactAudioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
+    @ObservedObject private var settings = AfterRaySettingsController.shared
     @State private var isLive = true
     private let images: RecallImageRepository
 
@@ -832,6 +832,16 @@ private struct AfterRayRootView: View {
                     .transition(.opacity)
             }
         }
+        .overlay {
+            if settings.isPresented {
+                AfterRaySettingsOverlay(
+                    model: settings.model,
+                    onClose: { settings.hide() }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: settings.isPresented)
         .onExitCommand {
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
@@ -1075,6 +1085,24 @@ private struct PermissionPanel: View {
         case .microphone: coordinator.microphone
         case .accessibility: coordinator.accessibility
         }
+    }
+}
+
+private struct AfterRaySettingsOverlay: View {
+    @ObservedObject var model: AfterRaySettingsModel
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.42)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onClose)
+            AfterRaySettingsView(model: model, onClose: onClose)
+                .recallGlass(in: .rounded(22))
+                .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

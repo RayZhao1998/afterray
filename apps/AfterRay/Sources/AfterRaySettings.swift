@@ -22,164 +22,24 @@ enum AfterRayPreferences {
 }
 
 @MainActor
-final class AfterRaySettingsController {
+final class AfterRaySettingsController: ObservableObject {
     static let shared = AfterRaySettingsController()
-    static let windowLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)))
 
     let model = AfterRaySettingsModel()
+    @Published private(set) var isPresented = false
 
-    private let panelSize = NSSize(width: 540, height: 720)
-    private var panel: SettingsPanel?
-    private(set) var isPresented = false
-
-    var isVisible: Bool { isPresented && visibleSettingsWindow != nil }
+    var isVisible: Bool { isPresented }
 
     func show() {
         isPresented = true
-        NSApp.unhideWithoutActivation()
-        NSApp.activate(ignoringOtherApps: true)
-        _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        presentFallbackPanel()
-        promoteSettingsWindows()
-        DispatchQueue.main.async { [weak self] in
-            self?.promoteSettingsWindows()
+        if !RecallOverlayController.shared.isVisible {
+            RecallOverlayController.shared.show()
         }
         Task { await model.refresh() }
     }
 
     func hide() {
-        guard isPresented else { return }
         isPresented = false
-        panel?.orderOut(nil)
-        RecallOverlayController.shared.makeKeyIfVisible()
-    }
-
-    func promoteSettingsWindows() {
-        guard isPresented else { return }
-        for window in NSApp.windows where isSettingsWindow(window) {
-            configure(window)
-            window.orderFrontRegardless()
-        }
-        if let panel, panel.isVisible {
-            configure(panel)
-            panel.orderFrontRegardless()
-        }
-    }
-
-    private var visibleSettingsWindow: NSWindow? {
-        NSApp.windows.first { isSettingsWindow($0) && $0.isVisible } ?? panel
-    }
-
-    private func isSettingsWindow(_ window: NSWindow) -> Bool {
-        if window === panel { return true }
-        if RecallOverlayController.shared.isOverlayWindow(window) { return false }
-        let title = window.title
-        let identifier = window.identifier?.rawValue ?? ""
-        let className = String(describing: type(of: window))
-        return title.localizedCaseInsensitiveContains("setting")
-            || identifier.localizedCaseInsensitiveContains("setting")
-            || className.localizedCaseInsensitiveContains("Settings")
-    }
-
-    private func presentFallbackPanel() {
-        let panel = panel ?? makePanel()
-        let hostingView = NSHostingView(rootView: AfterRaySettingsView(model: model) { [weak self] in
-            self?.hide()
-        })
-        hostingView.frame = NSRect(origin: .zero, size: panelSize)
-        hostingView.autoresizingMask = [.width, .height]
-        panel.contentView = hostingView
-        panel.setFrame(NSRect(origin: origin(for: panelSize), size: panelSize), display: true)
-        configure(panel)
-        panel.orderFrontRegardless()
-    }
-
-    private func configure(_ window: NSWindow) {
-        window.level = Self.windowLevel
-        window.hidesOnDeactivate = false
-        window.collectionBehavior = [
-            .canJoinAllSpaces,
-            .fullScreenAuxiliary,
-            .moveToActiveSpace,
-            .ignoresCycle,
-        ]
-    }
-
-    private func makePanel() -> SettingsPanel {
-        let panel = SettingsPanel(
-            contentRect: NSRect(origin: .zero, size: panelSize),
-            styleMask: [.titled, .closable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        panel.title = "AfterRay Settings"
-        panel.isFloatingPanel = false
-        panel.hidesOnDeactivate = false
-        panel.becomesKeyOnlyIfNeeded = false
-        panel.hasShadow = true
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.isReleasedWhenClosed = false
-        panel.level = Self.windowLevel
-        panel.collectionBehavior = [
-            .canJoinAllSpaces,
-            .fullScreenAuxiliary,
-            .moveToActiveSpace,
-            .ignoresCycle,
-        ]
-        panel.delegate = SettingsWindowCloser.shared
-        self.panel = panel
-        return panel
-    }
-
-    private func origin(for size: NSSize) -> NSPoint {
-        let screen = RecallOverlayController.shared.currentScreen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? .zero
-        return NSPoint(
-            x: screen.midX - size.width / 2,
-            y: screen.midY - size.height / 2
-        )
-    }
-}
-
-private final class SettingsPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-@MainActor
-private final class SettingsWindowCloser: NSObject, NSWindowDelegate {
-    static let shared = SettingsWindowCloser()
-
-    func windowWillClose(_: Notification) {
-        AfterRaySettingsController.shared.hide()
-    }
-}
-
-struct SettingsWindowPromoter: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = SettingsWindowProbe()
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? SettingsWindowProbe)?.promote()
-    }
-}
-
-private final class SettingsWindowProbe: NSView {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        promote()
-    }
-
-    func promote() {
-        guard AfterRaySettingsController.shared.isPresented, let window else { return }
-        window.level = AfterRaySettingsController.windowLevel
-        window.hidesOnDeactivate = false
-        window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace])
-        window.orderFrontRegardless()
     }
 }
 
