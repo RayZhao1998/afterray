@@ -10,7 +10,8 @@ mod process;
 mod queue;
 
 pub use catalog::{
-    PackSource, PackSpec, catalog_in, default_catalog, inspect_model_path, library, library_in,
+    FALLBACK_LLM_FILE, FALLBACK_LLM_REPOSITORY, PackSource, PackSpec, QWEN38_27B_Q4_EXPECTED_BYTES,
+    catalog_in, default_catalog, inspect_model_path, library, library_in, llm_pack_from,
     model_directory, spec_by_id, specs_for_download, specs_for_download_in,
 };
 pub use download::{DownloadError, DownloadProgress, download_pack, download_packs};

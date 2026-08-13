@@ -370,6 +370,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
+            Text("The Qwen3.8 assistant pack powers overlay Q&A. Capture, OCR, and search still work if it is missing.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             if model.downloadingID != nil, let status = model.downloadStatus {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
@@ -515,8 +520,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             || model.library?.download?.packId == pack.id
         return SettingsRow(
             title: pack.name,
-            subtitle: [capabilityLabel(pack.capability), pack.present ? AfterRayStorageSnapshot.byteCount(pack.bytes) : nil]
+            subtitle: [
+                capabilityLabel(pack.capability),
+                pack.note,
+                pack.present ? AfterRayStorageSnapshot.byteCount(pack.bytes) : nil,
+            ]
                 .compactMap { $0 }
+                .filter { !$0.isEmpty }
                 .joined(separator: " · ")
         ) {
             HStack(spacing: 8) {
@@ -559,7 +569,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         case "asr": "Qwen3 ASR"
         case "ocr": "OCR"
         case "embedding": "Embeddings"
-        case "llm": "Local LLM"
+        case "llm": "Qwen3.8 27B"
         default: job.capability
         }
     }

@@ -36,8 +36,9 @@ stay local.
 - Apple Silicon Mac (M3 or newer recommended).
 - macOS 15 or newer.
 - Around 8 GB of free space for the default development model set (Qwen3-ASR
-  + embeddings), plus space for recordings. The optional local LLM is another
-  2 GB.
+  + embeddings), plus space for recordings. The optional local assistant is
+  another ~2 GB with the current Qwen2.5-3B Instruct fallback, or ~16 GB
+  once `AFTERRAY_LLM_*` points at Qwen3.8-27B Q4 (not Qwen3.8-Max).
 - Xcode and the Xcode Command Line Tools.
 - A current Rust toolchain.
 
@@ -100,6 +101,14 @@ AfterRay downloads model files into `.afterray/models` and owns the inference
 processes itself. No Ollama installation, server, account, or API is involved.
 Rust continues to own scheduling, concurrency, retries, cancellation, and
 result storage; native workers only execute typed local inference jobs.
+
+The optional `llm` pack is the on-device assistant for overlay Q&A. Capture,
+OCR, and search still work if it is missing. Settings labels this pack
+**Qwen3.8 27B**. Until that GGUF is published on Hugging Face, download uses a
+known-good Qwen2.5-3B Instruct Q4 file so setup still works today. Set
+`AFTERRAY_LLM_REPOSITORY` and `AFTERRAY_LLM_FILE` (and optionally
+`AFTERRAY_LLM_MODEL`) to fetch Qwen3.8-27B — no protocol change. Do not point
+this pack at Qwen3.8-Max 2.4T; it is not runnable on a Mac.
 
 ## Architecture
 
@@ -232,7 +241,11 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_ASR_MODEL` | Qwen3-ASR snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B` |
 | `AFTERRAY_ASR_REPOSITORY` | Hugging Face repo for ASR | `Qwen/Qwen3-ASR-1.7B` |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | `$AFTERRAY_MODEL_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf` |
-| `AFTERRAY_LLM_MODEL` | Optional instruct GGUF | `$AFTERRAY_MODEL_DIR/qwen2.5-3b-instruct-q4_k_m.gguf` |
+| `AFTERRAY_LLM_MODEL` | Optional instruct GGUF path | `$AFTERRAY_MODEL_DIR/<AFTERRAY_LLM_FILE>` |
+| `AFTERRAY_LLM_REPOSITORY` | Hugging Face repo for the assistant GGUF | `Qwen/Qwen2.5-3B-Instruct-GGUF` (fallback until Qwen3.8-27B lands) |
+| `AFTERRAY_LLM_FILE` | GGUF filename in that repo | `qwen2.5-3b-instruct-q4_k_m.gguf` (fallback) |
+| `AFTERRAY_LLM_N_CTX` | llama.cpp context length | `8192` |
+| `AFTERRAY_LLM_MAX_TOKENS` | Generation cap | `512` |
 
 ## Troubleshooting
 
