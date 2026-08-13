@@ -154,7 +154,6 @@ public struct RecallView: View {
                     onSelectMs: { selectPlayhead(playheadMs: $0) },
                     onViewportWidthChange: { timelineViewportWidth = $0 }
                 )
-                .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                 .padding(.bottom, 18)
             }
 
@@ -372,13 +371,15 @@ public struct RecallView: View {
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
+    @State private var tick = RecallImageTick()
     @State private var loadedArtifactID: String?
     @State private var frame: RecallDisplayFrame?
 
     var body: some View {
+        let targetID = tick.displayedArtifactID ?? artifactID
         let displayed = RecallDisplayedFrame.choose(
-            artifactID: artifactID,
-            cached: RecallDecodedImageCache.shared.cached(artifactID: artifactID),
+            artifactID: targetID,
+            cached: RecallDecodedImageCache.shared.cached(artifactID: targetID),
             loadedID: loadedArtifactID,
             loadedFrame: frame
         )
@@ -390,19 +391,43 @@ private struct ImmersiveArtifactImage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
-        .task(id: artifactID) {
-            if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
-                loadedArtifactID = artifactID
-                frame = cached
-                return
-            }
-            guard let loaded = await RecallDecodedImageCache.shared.frame(
-                artifactID: artifactID,
-                loader: loader
-            ), !Task.isCancelled else { return }
+        .onAppear { _ = tick.request(artifactID) }
+        .onChange(of: artifactID) { _, newID in
+            _ = tick.request(newID)
+        }
+        .task(id: tick.displayedArtifactID) {
+            await loadDisplayedImage()
+        }
+        .task(id: tick.generation) {
+            await waitForThrottleWindow()
+        }
+    }
+
+    private func loadDisplayedImage() async {
+        guard let artifactID = tick.displayedArtifactID else { return }
+        if let cached = RecallDecodedImageCache.shared.cached(artifactID: artifactID) {
+            loadedArtifactID = artifactID
+            frame = cached
+            _ = tick.updateFinished(for: artifactID)
+            return
+        }
+        let loaded = await RecallDecodedImageCache.shared.frame(
+            artifactID: artifactID,
+            loader: loader
+        )
+        guard !Task.isCancelled else { return }
+        if let loaded {
             loadedArtifactID = artifactID
             frame = loaded
         }
+        _ = tick.updateFinished(for: artifactID)
+    }
+
+    private func waitForThrottleWindow() async {
+        guard tick.isThrottling else { return }
+        try? await Task.sleep(for: RecallImageTick.interval)
+        guard !Task.isCancelled else { return }
+        _ = tick.throttleEnded()
     }
 }
 
@@ -546,8 +571,6 @@ private struct AppUsageTimeline: View {
                     timelineTrack
                         .offset(x: width / 2 - selectedX)
 
-                    edgeFade
-
                     Rectangle()
                         .fill(RecallPalette.ray)
                         .frame(width: 2, height: tuning.timelineSegmentHeight + 10)
@@ -643,17 +666,6 @@ private struct AppUsageTimeline: View {
         }
         .frame(width: layout.contentWidth, height: 56)
         .padding(.vertical, 6)
-    }
-
-    private var edgeFade: some View {
-        HStack(spacing: 0) {
-            LinearGradient(colors: [.black.opacity(0.72), .clear], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 42)
-            Spacer()
-            LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 42)
-        }
-        .allowsHitTesting(false)
     }
 }
 

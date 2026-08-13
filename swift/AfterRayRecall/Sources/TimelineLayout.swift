@@ -332,3 +332,65 @@ enum RecallDisplayedFrame {
         return loadedFrame
     }
 }
+
+/// Latest-wins throttle for the immersive still while the playhead scrubs.
+///
+/// At most one new image is started every `interval`. If a later position
+/// arrives during a load or the 16ms window, it overwrites
+/// `nextTickPosition`. When both the load and the window are clear, that
+/// pending position is taken and the next tick starts.
+struct RecallImageTick: Equatable {
+    static let interval: Duration = .milliseconds(16)
+
+    private(set) var displayedArtifactID: String?
+    private(set) var nextTickPosition: String?
+    private(set) var isUpdating = false
+    private(set) var isThrottling = false
+    /// Bumps each time a tick starts so the view can restart its 16ms sleep.
+    private(set) var generation: UInt64 = 0
+
+    enum Action: Equatable {
+        case none
+        case start(String)
+    }
+
+    mutating func request(_ artifactID: String) -> Action {
+        if artifactID == displayedArtifactID {
+            nextTickPosition = nil
+            return .none
+        }
+        if isUpdating || isThrottling {
+            nextTickPosition = artifactID
+            return .none
+        }
+        return begin(artifactID)
+    }
+
+    mutating func throttleEnded() -> Action {
+        isThrottling = false
+        return advance()
+    }
+
+    mutating func updateFinished(for artifactID: String) -> Action {
+        guard isUpdating, displayedArtifactID == artifactID else { return .none }
+        isUpdating = false
+        return advance()
+    }
+
+    private mutating func begin(_ artifactID: String) -> Action {
+        displayedArtifactID = artifactID
+        nextTickPosition = nil
+        isUpdating = true
+        isThrottling = true
+        generation &+= 1
+        return .start(artifactID)
+    }
+
+    private mutating func advance() -> Action {
+        guard !isUpdating, !isThrottling else { return .none }
+        guard let next = nextTickPosition else { return .none }
+        nextTickPosition = nil
+        if next == displayedArtifactID { return .none }
+        return begin(next)
+    }
+}
