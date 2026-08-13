@@ -158,21 +158,25 @@ public struct RecallView: View {
             }
 
             if showsDetails, !isLive, let moment = selectedMoment {
-                RecallDetailsMenu(
-                    moment: moment,
-                    page: $detailsPage,
-                    isProcessing: isProcessing,
-                    artifactLoader: artifactLoader,
-                    onToggleAudio: onToggleAudio,
-                    isAudioPlaying: isAudioPlaying,
-                    isAudioBuffering: isAudioBuffering,
-                    playingAudioArtifactID: playingAudioArtifactID,
-                    onClose: { showsDetails = false }
-                )
+                HStack {
+                    Spacer(minLength: 0)
+                    RecallDetailsMenu(
+                        moment: moment,
+                        page: $detailsPage,
+                        isProcessing: isProcessing,
+                        artifactLoader: artifactLoader,
+                        onToggleAudio: onToggleAudio,
+                        isAudioPlaying: isAudioPlaying,
+                        isAudioBuffering: isAudioBuffering,
+                        playingAudioArtifactID: playingAudioArtifactID,
+                        onClose: { showsDetails = false }
+                    )
+                }
                 .padding(.top, RecallGeometry.detailsMenuTopPadding(chromeTopPadding: chromeTopPadding))
                 .padding(.trailing, RecallGeometry.overlayChromeMargin)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .allowsHitTesting(true)
             }
 
             ScrollWheelMonitor(onScroll: handleScroll)
@@ -735,6 +739,7 @@ private struct AppUsageTimeline: View {
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
 
                 ZStack(alignment: .leading) {
+                    Color.black.opacity(0.001)
                     timelineTrack
                         .offset(x: width / 2 - selectedX)
 
@@ -744,13 +749,16 @@ private struct AppUsageTimeline: View {
                         .position(x: width / 2, y: (tuning.timelineSegmentHeight + 20) / 2)
                         .shadow(color: RecallPalette.ray.opacity(0.9), radius: 7)
                 }
+                .contentShape(Rectangle())
                 .clipped()
                 .onAppear { onViewportWidthChange(width) }
                 .onChange(of: width) { _, newWidth in
                     onViewportWidthChange(newWidth)
                 }
             }
+            .frame(maxWidth: .infinity)
             .frame(height: tuning.timelineSegmentHeight + 20)
+            .contentShape(Rectangle())
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
@@ -759,6 +767,8 @@ private struct AppUsageTimeline: View {
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
         }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
     }
 
     private var timestamp: some View {
@@ -843,7 +853,10 @@ private struct AppUsageSegmentView: View {
 
     private var color: Color {
         if run.isIdle { return Color.white.opacity(0.08) }
-        return RecallPalette.appColor(seed: run.bundleIdentifier ?? run.applicationName)
+        return AppIconPalette.color(
+            bundleIdentifier: run.bundleIdentifier,
+            fallbackSeed: run.bundleIdentifier ?? run.applicationName
+        )
     }
 
     var body: some View {
@@ -927,24 +940,38 @@ private enum DurationFormatter {
     }
 }
 
+private final class ScrollWheelHostView: NSView {
+    weak var coordinator: ScrollWheelMonitor.Coordinator?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        coordinator?.attachDisplayLinkIfNeeded()
+    }
+
+    override func hitTest(_: NSPoint) -> NSView? { nil }
+}
+
 private struct ScrollWheelMonitor: NSViewRepresentable {
     let onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onScroll: onScroll) }
 
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
+    func makeNSView(context: Context) -> ScrollWheelHostView {
+        let view = ScrollWheelHostView()
+        view.coordinator = context.coordinator
         context.coordinator.hostView = view
         context.coordinator.start()
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
+    func updateNSView(_ nsView: ScrollWheelHostView, context: Context) {
+        nsView.coordinator = context.coordinator
         context.coordinator.hostView = nsView
         context.coordinator.onScroll = onScroll
+        context.coordinator.attachDisplayLinkIfNeeded()
     }
 
-    static func dismantleNSView(_: NSView, coordinator: Coordinator) {
+    static func dismantleNSView(_: ScrollWheelHostView, coordinator: Coordinator) {
         coordinator.stop()
     }
 
@@ -966,13 +993,20 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
 
         func start() {
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self, event.window === self.hostView?.window else { return event }
-                if let hit = event.window?.contentView?.hitTest(event.locationInWindow),
-                   hit.enclosingScrollView != nil
+                guard let self, self.shouldHandle(event) else { return event }
+                let horizontal = abs(event.scrollingDeltaX) >= abs(event.scrollingDeltaY)
+                // Horizontal scrubs always belong to the timeline. A trailing
+                // details/search NSScrollView was swallowing those events and
+                // doing nothing with them — the right side felt dead.
+                if !horizontal,
+                   let window = self.hostView?.window,
+                   self.shouldDeferToDocumentScroll(
+                       at: self.locationInOverlay(event, window: window),
+                       in: window
+                   )
                 {
                     return event
                 }
-                let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
                 pendingDelta = RecallGeometry.accumulatedScrollDelta(
                     current: pendingDelta,
@@ -982,13 +1016,22 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 pendingEnd = event.phase == .ended || event.momentumPhase == .ended
                 lastEventTime = CACurrentMediaTime()
                 isScrolling = true
-                return event
+                return nil
             }
-            guard let hostView else { return }
-            let displayLink = hostView.displayLink(
-                target: self,
-                selector: #selector(displayLinkDidFire(_:))
-            )
+            attachDisplayLinkIfNeeded()
+        }
+
+        func attachDisplayLinkIfNeeded() {
+            guard displayLink == nil else { return }
+            let displayLink: CADisplayLink?
+            if let view = hostView?.window?.contentView {
+                displayLink = view.displayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+            } else if let screen = hostView?.window?.screen {
+                displayLink = screen.displayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+            } else {
+                displayLink = nil
+            }
+            guard let displayLink else { return }
             displayLink.preferredFrameRateRange = CAFrameRateRange(
                 minimum: 60,
                 maximum: 120,
@@ -996,6 +1039,31 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             )
             displayLink.add(to: .main, forMode: .common)
             self.displayLink = displayLink
+        }
+
+        private func shouldHandle(_ event: NSEvent) -> Bool {
+            guard let window = hostView?.window else { return false }
+            if event.window === window { return true }
+            return window.frame.contains(NSEvent.mouseLocation)
+        }
+
+        private func locationInOverlay(_ event: NSEvent, window: NSWindow) -> NSPoint {
+            if event.window === window { return event.locationInWindow }
+            let screenPoint = NSEvent.mouseLocation
+            return window.convertPoint(fromScreen: screenPoint)
+        }
+
+        private func shouldDeferToDocumentScroll(at point: NSPoint, in window: NSWindow) -> Bool {
+            guard let hit = window.contentView?.hitTest(point),
+                  let scroll = hit.enclosingScrollView
+            else { return false }
+            // Ignore host-wide or incidental clip views created by SwiftUI.
+            let width = scroll.bounds.width
+            let height = scroll.bounds.height
+            guard width > 40, height > 80, width < window.frame.width * 0.72 else {
+                return false
+            }
+            return true
         }
 
         func stop() {
@@ -1492,6 +1560,170 @@ public enum RecallPalette {
         ]
         let hash = seed.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
         return palette[Int(UInt(bitPattern: hash) % UInt(palette.count))]
+    }
+}
+
+/// Timeline swatches sampled from the app icon. Hue matches the icon;
+/// saturation and lightness are the icon averages, lifted just enough
+/// to stay readable on the dark track.
+enum AppIconPalette {
+    private static let cache = NSCache<NSString, Swatch>()
+
+    static func color(bundleIdentifier: String?, fallbackSeed: String) -> Color {
+        if let bundleIdentifier {
+            if let cached = cache.object(forKey: bundleIdentifier as NSString) {
+                return cached.color.map(Color.init(nsColor:))
+                    ?? RecallPalette.appColor(seed: fallbackSeed)
+            }
+            if let icon = applicationIcon(bundleIdentifier: bundleIdentifier),
+               let hsl = averageHSL(from: icon)
+            {
+                let rgb = RecallColorMath.rgb(
+                    hue: hsl.hue,
+                    saturation: min(max(hsl.saturation, 0.38), 0.90),
+                    lightness: min(max(hsl.lightness, 0.36), 0.62)
+                )
+                let nsColor = NSColor(
+                    calibratedRed: rgb.red,
+                    green: rgb.green,
+                    blue: rgb.blue,
+                    alpha: 1
+                )
+                cache.setObject(Swatch(nsColor), forKey: bundleIdentifier as NSString)
+                return Color(nsColor: nsColor)
+            }
+            cache.setObject(Swatch(nil), forKey: bundleIdentifier as NSString)
+        }
+        return RecallPalette.appColor(seed: fallbackSeed)
+    }
+
+    private static func applicationIcon(bundleIdentifier: String) -> NSImage? {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            return nil
+        }
+        return NSWorkspace.shared.icon(forFile: url.path)
+    }
+
+    private static func averageHSL(from image: NSImage) -> (hue: CGFloat, saturation: CGFloat, lightness: CGFloat)? {
+        let edge = 32
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: edge,
+            pixelsHigh: edge,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: edge * 4,
+            bitsPerPixel: 32
+        ) else { return nil }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .medium
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: edge, height: edge),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        NSGraphicsContext.restoreGraphicsState()
+
+        var sine: CGFloat = 0
+        var cosine: CGFloat = 0
+        var saturation: CGFloat = 0
+        var lightness: CGFloat = 0
+        var count: CGFloat = 0
+
+        for y in 0..<edge {
+            for x in 0..<edge {
+                guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                var red: CGFloat = 0
+                var green: CGFloat = 0
+                var blue: CGFloat = 0
+                var alpha: CGFloat = 0
+                color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+                guard alpha > 0.20 else { continue }
+                let hsl = RecallColorMath.hsl(red: red, green: green, blue: blue)
+                // Skip chrome that does not carry the brand hue.
+                guard hsl.saturation > 0.10, hsl.lightness > 0.08, hsl.lightness < 0.92 else {
+                    continue
+                }
+                let radians = hsl.hue * 2 * .pi
+                sine += sin(radians)
+                cosine += cos(radians)
+                saturation += hsl.saturation
+                lightness += hsl.lightness
+                count += 1
+            }
+        }
+        guard count > 0 else { return nil }
+        var hue = atan2(sine / count, cosine / count) / (2 * .pi)
+        if hue < 0 { hue += 1 }
+        return (hue, saturation / count, lightness / count)
+    }
+
+    private final class Swatch: NSObject {
+        let color: NSColor?
+        init(_ color: NSColor?) { self.color = color }
+    }
+}
+
+enum RecallColorMath {
+    static func hsl(
+        red: CGFloat,
+        green: CGFloat,
+        blue: CGFloat
+    ) -> (hue: CGFloat, saturation: CGFloat, lightness: CGFloat) {
+        let maximum = max(red, green, blue)
+        let minimum = min(red, green, blue)
+        let lightness = (maximum + minimum) / 2
+        let delta = maximum - minimum
+        guard delta > 0.000_1 else {
+            return (0, 0, lightness)
+        }
+        let saturation = lightness > 0.5
+            ? delta / (2 - maximum - minimum)
+            : delta / (maximum + minimum)
+        let hue: CGFloat
+        if maximum == red {
+            hue = (green - blue) / delta + (green < blue ? 6 : 0)
+        } else if maximum == green {
+            hue = (blue - red) / delta + 2
+        } else {
+            hue = (red - green) / delta + 4
+        }
+        return (hue / 6, saturation, lightness)
+    }
+
+    static func rgb(
+        hue: CGFloat,
+        saturation: CGFloat,
+        lightness: CGFloat
+    ) -> (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        guard saturation > 0.000_1 else {
+            return (lightness, lightness, lightness)
+        }
+        let q = lightness < 0.5
+            ? lightness * (1 + saturation)
+            : lightness + saturation - lightness * saturation
+        let p = 2 * lightness - q
+        return (
+            channel(p: p, q: q, t: hue + 1 / 3),
+            channel(p: p, q: q, t: hue),
+            channel(p: p, q: q, t: hue - 1 / 3)
+        )
+    }
+
+    private static func channel(p: CGFloat, q: CGFloat, t: CGFloat) -> CGFloat {
+        var wrapped = t
+        if wrapped < 0 { wrapped += 1 }
+        if wrapped > 1 { wrapped -= 1 }
+        if wrapped < 1 / 6 { return p + (q - p) * 6 * wrapped }
+        if wrapped < 1 / 2 { return q }
+        if wrapped < 2 / 3 { return p + (q - p) * (2 / 3 - wrapped) * 6 }
+        return p
     }
 }
 

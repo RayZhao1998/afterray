@@ -65,6 +65,24 @@ final class RecallGeometryTests: XCTestCase {
         XCTAssertNil(RecallGeometry.liveScrollStep(delta: -0.1))
     }
 
+    func testHSLRoundTripsPrimaryColorsAndAveragesHue() {
+        let red = RecallColorMath.hsl(red: 1, green: 0, blue: 0)
+        XCTAssertEqual(red.hue, 0, accuracy: 0.001)
+        XCTAssertEqual(red.saturation, 1, accuracy: 0.001)
+
+        let green = RecallColorMath.hsl(red: 0, green: 1, blue: 0)
+        XCTAssertEqual(green.hue, 1.0 / 3.0, accuracy: 0.001)
+
+        let blue = RecallColorMath.hsl(red: 0, green: 0, blue: 1)
+        XCTAssertEqual(blue.hue, 2.0 / 3.0, accuracy: 0.001)
+
+        let rgb = RecallColorMath.rgb(hue: 0.5, saturation: 0.6, lightness: 0.4)
+        let back = RecallColorMath.hsl(red: rgb.red, green: rgb.green, blue: rgb.blue)
+        XCTAssertEqual(back.hue, 0.5, accuracy: 0.01)
+        XCTAssertEqual(back.saturation, 0.6, accuracy: 0.01)
+        XCTAssertEqual(back.lightness, 0.4, accuracy: 0.01)
+    }
+
     func testScrollDeltaIsBoundedAndDrainedAcrossDisplayFrames() {
         let accumulated = RecallGeometry.accumulatedScrollDelta(
             current: 80,
