@@ -1,11 +1,11 @@
 mod gop_packer;
 
+use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_models::{
     JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
     ProcessAdapterConfig, QueueConfig, download_packs, library, model_directory,
     specs_for_download,
 };
-use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
 };
@@ -105,7 +105,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
-    let packer = Arc::new(gop_packer::GopPacker::new(gop_packer::GopPackerConfig::from_env()));
+    let packer = Arc::new(gop_packer::GopPacker::new(
+        gop_packer::GopPackerConfig::from_env(),
+    ));
     let capture_busy = Arc::new(AtomicBool::new(false));
     let state = Arc::new(AppState {
         store,
@@ -998,10 +1000,8 @@ fn spawn_gop_packer(state: Arc<AppState>) {
         return;
     }
     eprintln!(
-        "gop packer: enabled keyint={} keep_stills={} require_ac={}",
-        state.packer.config.policy.keyint,
-        state.packer.config.keep_stills,
-        state.packer.config.require_ac
+        "gop packer: enabled keyint={} cold_gop_only require_ac={}",
+        state.packer.config.policy.keyint, state.packer.config.require_ac
     );
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(5));
@@ -1044,7 +1044,7 @@ fn pack_status(state: &AppState) -> Response {
     match state.store.pack_status_counts() {
         Ok((running, done, failed, ready)) => Response::success(PackStatus {
             archive_enabled: state.packer.config.archive,
-            keep_stills: state.packer.config.keep_stills,
+            keep_stills: false,
             keyint: state.packer.config.policy.keyint,
             encoder: "rav1e".to_owned(),
             hot_window_seconds: u64::try_from(state.packer.config.policy.hot_window_ms / 1000)
@@ -1279,7 +1279,9 @@ print(json.dumps({
                     "-f",
                     "lavfi",
                     "-i",
-                    &format!("color=c=red:s=64x64:d=1,drawbox=c=white:t=fill:enable='gte(t\\,{index})'"),
+                    &format!(
+                        "color=c=red:s=64x64:d=1,drawbox=c=white:t=fill:enable='gte(t\\,{index})'"
+                    ),
                     "-frames:v",
                     "1",
                     "-q:v",
@@ -1327,7 +1329,6 @@ print(json.dumps({
         let jpeg_bytes: usize = jpegs.iter().map(Vec::len).sum();
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
-            keep_stills: true,
             require_ac: false,
             policy: afterray_store::PackPolicy {
                 hot_window_ms: 0,
@@ -1363,14 +1364,88 @@ print(json.dumps({
             "GOP should beat 5x vs JPEG, got {:.1}%",
             ratio * 100.0
         );
-        let poster = gop_packer::read_gop_frame(
-            &vault,
-            &segment,
-            0,
-            afterray_protocol::GopReadMode::Poster,
-        )
-        .unwrap();
+        let packed = vault.moments_sync(&session.id).unwrap();
+        for moment in &packed {
+            if ids.contains(&moment.id) {
+                assert!(moment.gop.is_some(), "cold moment should play from GOP");
+                assert!(
+                    moment.image_artifact_id.is_none(),
+                    "cold GOP must drop the JPEG still"
+                );
+            }
+        }
+        let poster =
+            gop_packer::read_gop_frame(&vault, &segment, 0, afterray_protocol::GopReadMode::Poster)
+                .unwrap();
         let poster_ivf = afterray_codec::parse_ivf(&poster.bytes).unwrap();
         assert_eq!(poster_ivf.frames.len(), 1);
+    }
+
+    fn tiny_jpeg() -> Option<Vec<u8>> {
+        let scratch = tempfile::tempdir().ok()?;
+        let path = scratch.path().join("one.jpg");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=64x64:d=1",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+            ])
+            .arg(&path)
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        std::fs::read(path).ok()
+    }
+
+    #[test]
+    fn packer_encodes_a_single_cold_still() {
+        let Some(jpeg) = tiny_jpeg() else {
+            eprintln!("skip single-frame pack: ffmpeg unavailable");
+            return;
+        };
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &jpeg)
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                "screen",
+                1_000,
+                None,
+                "ocr",
+            )
+            .unwrap();
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            require_ac: false,
+            policy: afterray_store::PackPolicy {
+                hot_window_ms: 0,
+                hot_min_stills: 0,
+                ocr_grace_ms: 0,
+                keyint: 12,
+            },
+        });
+        let segment = packer
+            .pack_one(&vault, 10_000_000)
+            .unwrap()
+            .expect("n==1 cold tail should encode as a still GOP");
+        let view = vault.gop_segment_view(&segment).unwrap();
+        assert_eq!(view.frames.len(), 1);
+        let packed = vault.moments_sync(&session.id).unwrap();
+        assert!(packed[0].gop.is_some());
+        assert!(packed[0].image_artifact_id.is_none());
     }
 }

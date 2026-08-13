@@ -81,6 +81,13 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.displayCacheKey, "gop:g1#3")
     }
 
+    func testDisplayCacheKeyPrefersGopOverLeftoverStill() throws {
+        let json = #"{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":true,"gop":{"segment_id":"g1","index":3,"keyframe_index":0,"frame_count":12,"codec":"av01"}}"#
+        let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))
+        XCTAssertEqual(moment.imageArtifactId, "a1")
+        XCTAssertEqual(moment.displayCacheKey, "gop:g1#3")
+    }
+
     func testArtifactMetaDecodesByteLengthWithoutPayload() throws {
         let json = #"{"id":"a1","content_type":"image/jpeg","byte_length":12}"#
         let meta = try JSONDecoder().decode(ArtifactMeta.self, from: Data(json.utf8))

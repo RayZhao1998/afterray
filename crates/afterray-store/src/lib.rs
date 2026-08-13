@@ -361,6 +361,7 @@ impl Vault {
             max_unstarred_moments: config.max_unstarred_moments,
         };
         let _ = vault.rollback_orphan_gops();
+        let _ = vault.reconcile_packed_stills();
         Ok(vault)
     }
 
@@ -1714,7 +1715,10 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         accessibility_artifact_id: row.get(9)?,
         application_name: row.get(10)?,
         bundle_identifier: row.get(11)?,
-        gop: match (row.get::<_, Option<String>>(12)?, row.get::<_, Option<i64>>(13)?) {
+        gop: match (
+            row.get::<_, Option<String>>(12)?,
+            row.get::<_, Option<i64>>(13)?,
+        ) {
             (Some(segment_id), Some(index)) => Some(afterray_protocol::GopRef {
                 segment_id,
                 index: u16::try_from(index).unwrap_or(0),
@@ -2090,7 +2094,8 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 2, "image/jpeg", b"private-screen-text")
             .unwrap();
-        let on_disk = fs::read(vault.artifact_path(moment.image_artifact_id.as_deref().unwrap())).unwrap();
+        let on_disk =
+            fs::read(vault.artifact_path(moment.image_artifact_id.as_deref().unwrap())).unwrap();
         assert_eq!(&on_disk[..4], ARTIFACT_MAGIC);
         assert!(
             !on_disk
@@ -2114,7 +2119,9 @@ mod tests {
                 .windows(wrapped_key.len())
                 .any(|window| window == wrapped_key)
         );
-        let payload = vault.read_artifact(moment.image_artifact_id.as_deref().unwrap()).unwrap();
+        let payload = vault
+            .read_artifact(moment.image_artifact_id.as_deref().unwrap())
+            .unwrap();
         assert_eq!(payload.bytes, b"private-screen-text");
         drop(directory);
     }
@@ -2606,6 +2613,8 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                started_at_ms: 0,
+                ended_at_ms: 50_000,
                 content_hash: "abc",
                 frames: &frames,
             })
@@ -2655,6 +2664,8 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                started_at_ms: 0,
+                ended_at_ms: 20_000,
                 content_hash: "abc",
                 frames: &frames,
             })
@@ -2669,6 +2680,189 @@ mod tests {
         assert!(by_id[&ids[1]].image_artifact_id.is_some());
         assert!(by_id[&ids[2]].image_artifact_id.is_none());
         assert!(by_id[&ids[0]].gop.is_some());
+    }
+
+    #[test]
+    fn abort_gop_restores_stills_and_deletes_the_segment() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let moment = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", &jpeg)
+            .unwrap();
+        let still = moment.image_artifact_id.clone().expect("still");
+        let frames = [GopCommitFrame {
+            index: 0,
+            is_keyframe: true,
+            byte_offset: 0,
+            byte_length: 8,
+            content_hash: [1; 32],
+        }];
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &[moment.id.clone()],
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 1,
+                started_at_ms: 10_000,
+                ended_at_ms: 10_000,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap();
+        vault.abort_gop(&segment).unwrap();
+        let restored = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].image_artifact_id.as_deref(),
+            Some(still.as_str())
+        );
+        assert!(restored[0].gop.is_none());
+        assert!(matches!(
+            vault.gop_segment(&segment),
+            Err(StoreError::GopNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn reconcile_drops_leftover_dual_stills() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            ids.push(
+                vault
+                    .insert_moment(&session.id, 10_000 * i64::from(index), "image/jpeg", &jpeg)
+                    .unwrap()
+                    .id,
+            );
+        }
+        let frames: Vec<GopCommitFrame> = (0..2)
+            .map(|index| GopCommitFrame {
+                index,
+                is_keyframe: index == 0,
+                byte_offset: u32::from(index) * 8,
+                byte_length: 8,
+                content_hash: [index as u8; 32],
+            })
+            .collect();
+        vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                started_at_ms: 0,
+                ended_at_ms: 10_000,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap();
+        assert_eq!(vault.reconcile_packed_stills().unwrap(), 2);
+        let moments = vault.moments_sync(&session.id).unwrap();
+        assert!(
+            moments
+                .iter()
+                .all(|moment| moment.image_artifact_id.is_none())
+        );
+        assert!(moments.iter().all(|moment| moment.gop.is_some()));
+    }
+
+    #[test]
+    fn pack_candidates_skip_hot_loginwindow_and_already_packed() {
+        let (_directory, vault) = test_vault(100);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let cold = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &jpeg)
+            .unwrap();
+        let login = vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", &jpeg)
+            .unwrap();
+        let hot = vault
+            .insert_moment(&session.id, 8_000_000, "image/jpeg", &jpeg)
+            .unwrap();
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments SET application_name = 'loginwindow',
+                        bundle_identifier = 'com.apple.loginwindow'
+                  WHERE id = ?1",
+                [&login.id],
+            )
+            .unwrap();
+        for moment in [&cold, &login, &hot] {
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    "text",
+                    moment.captured_at_ms,
+                    None,
+                    "ocr",
+                )
+                .unwrap();
+        }
+        let policy = PackPolicy {
+            hot_window_ms: 7_200_000,
+            hot_min_stills: 0,
+            ocr_grace_ms: 0,
+            keyint: 12,
+        };
+        let candidates = vault.list_pack_candidates(8_100_000, &policy).unwrap();
+        assert_eq!(
+            candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec![cold.id.as_str()]
+        );
+
+        let frames = [GopCommitFrame {
+            index: 0,
+            is_keyframe: true,
+            byte_offset: 0,
+            byte_length: 8,
+            content_hash: [0; 32],
+        }];
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &[cold.id.clone()],
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 1,
+                started_at_ms: 1_000,
+                ended_at_ms: 1_000,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap();
+        vault.drop_unpinned_stills(&segment).unwrap();
+        let after_pack = vault.list_pack_candidates(8_100_000, &policy).unwrap();
+        assert!(after_pack.is_empty());
     }
 
     #[test]

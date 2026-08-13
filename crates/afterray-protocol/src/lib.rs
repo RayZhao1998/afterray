@@ -212,6 +212,7 @@ pub enum GopReadMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackStatus {
     pub archive_enabled: bool,
+    /// Always false. Cold packed frames drop unpinned JPEGs; Dual write is gone.
     pub keep_stills: bool,
     pub keyint: u16,
     pub encoder: String,

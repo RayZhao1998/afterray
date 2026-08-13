@@ -109,8 +109,8 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     }
 
     public var displayCacheKey: String {
-        if let imageArtifactId { return imageArtifactId }
         if let gop { return "gop:\(gop.segmentId)#\(gop.index)" }
+        if let imageArtifactId { return imageArtifactId }
         return id
     }
 }

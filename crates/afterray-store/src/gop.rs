@@ -64,6 +64,8 @@ pub struct GopCommitRequest<'a> {
     pub width: u32,
     pub height: u32,
     pub keyint: u16,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
     pub content_hash: &'a str,
     pub frames: &'a [GopCommitFrame],
 }
@@ -196,7 +198,10 @@ impl Vault {
                     m.bundle_identifier, m.application_name, m.width, m.height
                FROM moments m
               WHERE m.gop_segment_id IS NULL
+                AND m.image_artifact_id IS NOT NULL
                 AND m.width IS NOT NULL AND m.height IS NOT NULL
+                AND lower(coalesce(m.application_name, '')) != 'loginwindow'
+                AND lower(coalesce(m.bundle_identifier, '')) NOT LIKE '%loginwindow%'
                 AND m.captured_at_ms <= ?1
                 AND m.id NOT IN (
                     SELECT id FROM moments ORDER BY captured_at_ms DESC, id DESC LIMIT ?2
@@ -224,11 +229,7 @@ impl Vault {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn insert_pack_job(
-        &self,
-        now_ms: i64,
-        payload_json: &str,
-    ) -> Result<String, StoreError> {
+    pub fn insert_pack_job(&self, now_ms: i64, payload_json: &str) -> Result<String, StoreError> {
         let id = Uuid::now_v7().to_string();
         self.connection.lock().unwrap().execute(
             "INSERT INTO gop_pack_jobs
@@ -283,23 +284,22 @@ impl Vault {
         }
         let artifact_id = self.put_typed_artifact("video/x-ivf; codec=av01", request.ivf)?;
         let segment_id = Uuid::now_v7().to_string();
-        let started = {
-            let connection = self.connection.lock().unwrap();
-            let first: i64 = connection.query_row(
-                "SELECT captured_at_ms FROM moments WHERE id = ?1",
-                [&request.moment_ids[0]],
-                |row| row.get(0),
-            )?;
-            let last: i64 = connection.query_row(
-                "SELECT captured_at_ms FROM moments WHERE id = ?1",
-                [&request.moment_ids[request.moment_ids.len() - 1]],
-                |row| row.get(0),
-            )?;
-            (first, last)
-        };
         let result = (|| {
             let mut connection = self.connection.lock().unwrap();
             let transaction = connection.transaction()?;
+            for moment_id in request.moment_ids {
+                let present: Option<String> = transaction
+                    .query_row(
+                        "SELECT id FROM moments
+                          WHERE id = ?1 AND gop_segment_id IS NULL AND image_artifact_id IS NOT NULL",
+                        [moment_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if present.is_none() {
+                    return Err(StoreError::GopStale);
+                }
+            }
             transaction.execute(
                 "INSERT INTO gop_segments (
                      id, artifact_id, codec, encoder, encoder_version,
@@ -316,8 +316,8 @@ impl Vault {
                     i64::from(request.height),
                     request.frames.len() as i64,
                     i64::from(request.keyint),
-                    started.0,
-                    started.1,
+                    request.started_at_ms,
+                    request.ended_at_ms,
                     request.content_hash,
                 ],
             )?;
@@ -433,7 +433,10 @@ impl Vault {
         })
     }
 
-    pub fn read_gop_artifact(&self, segment_id: &str) -> Result<afterray_protocol::ArtifactPayload, StoreError> {
+    pub fn read_gop_artifact(
+        &self,
+        segment_id: &str,
+    ) -> Result<afterray_protocol::ArtifactPayload, StoreError> {
         let segment = self.gop_segment(segment_id)?;
         self.read_artifact(&segment.artifact_id)
     }
@@ -442,7 +445,61 @@ impl Vault {
         self.put_artifact(content_type, bytes)
     }
 
-    /// Drop unpinned Dual stills after a GOP is durable. Favorites keep JPEG.
+    /// Undo a ready GOP (verify failed or operator abort). Moments keep their JPEGs.
+    pub fn abort_gop(&self, segment_id: &str) -> Result<(), StoreError> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let artifact_id: Option<String> = transaction
+            .query_row(
+                "SELECT artifact_id FROM gop_segments WHERE id = ?1",
+                [segment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.execute(
+            "UPDATE moments SET gop_segment_id = NULL, gop_index = NULL
+              WHERE gop_segment_id = ?1",
+            [segment_id],
+        )?;
+        transaction.execute(
+            "UPDATE gop_pack_jobs SET segment_id = NULL WHERE segment_id = ?1",
+            [segment_id],
+        )?;
+        transaction.execute("DELETE FROM gop_frames WHERE segment_id = ?1", [segment_id])?;
+        transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+        if let Some(artifact_id) = &artifact_id {
+            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        if let Some(artifact_id) = artifact_id {
+            let _ = std::fs::remove_file(self.artifact_path(&artifact_id));
+        }
+        Ok(())
+    }
+
+    /// Drop leftover Dual JPEGs on ready GOP members. Favorites keep JPEG.
+    pub fn reconcile_packed_stills(&self) -> Result<usize, StoreError> {
+        let segment_ids: Vec<String> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT gop_segment_id FROM moments
+                  WHERE gop_segment_id IS NOT NULL
+                    AND is_favorite = 0
+                    AND image_artifact_id IS NOT NULL",
+            )?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut dropped = 0;
+        for segment_id in segment_ids {
+            dropped += self.drop_unpinned_stills(&segment_id)?;
+        }
+        Ok(dropped)
+    }
+
+    /// Drop unpinned cold stills after a GOP is durable. Favorites keep JPEG.
     pub fn drop_unpinned_stills(&self, segment_id: &str) -> Result<usize, StoreError> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
@@ -476,7 +533,11 @@ impl Vault {
     }
 }
 
-fn count_where(connection: &rusqlite::Connection, table: &str, predicate: &str) -> Result<u64, StoreError> {
+fn count_where(
+    connection: &rusqlite::Connection,
+    table: &str,
+    predicate: &str,
+) -> Result<u64, StoreError> {
     let sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
     let count: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -538,7 +599,14 @@ mod tests {
     #[test]
     fn fold_closes_at_keyint() {
         let frames: Vec<_> = (0..13)
-            .map(|index| candidate(&format!("m{index}"), i64::from(index) * 10_000, "Lody", "lody"))
+            .map(|index| {
+                candidate(
+                    &format!("m{index}"),
+                    i64::from(index) * 10_000,
+                    "Lody",
+                    "lody",
+                )
+            })
             .collect();
         let runs = fold_pack_runs(&frames, 12);
         assert_eq!(runs.len(), 2);

@@ -1,4 +1,4 @@
-//! Background Dual GOP packer. Encode is never on the capture hot path.
+//! Background cold-GOP packer. Hot stills stay JPEG; packed frames drop unpinned JPEGs.
 
 use afterray_codec::{
     Av1Encoder, CONTENT_TYPE_IVF_AV01, DEFAULT_KEYINT, EncodedGop, GopFrameInput, Rav1eEncoder,
@@ -15,7 +15,6 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub struct GopPackerConfig {
     pub archive: bool,
-    pub keep_stills: bool,
     pub require_ac: bool,
     pub policy: PackPolicy,
 }
@@ -27,7 +26,11 @@ impl GopPackerConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_KEYINT);
-        let keyint = if keyint == 6 || keyint == 12 { keyint } else { DEFAULT_KEYINT };
+        let keyint = if keyint == 6 || keyint == 12 {
+            keyint
+        } else {
+            DEFAULT_KEYINT
+        };
         let hot_window_seconds = std::env::var("AFTERRAY_GOP_HOT_WINDOW_SECONDS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -35,7 +38,6 @@ impl GopPackerConfig {
             .clamp(3_600, 7_200);
         Self {
             archive: env_flag("AFTERRAY_GOP_ARCHIVE", false),
-            keep_stills: env_flag("AFTERRAY_GOP_KEEP_STILLS", true),
             require_ac: env_flag("AFTERRAY_GOP_REQUIRE_AC", true),
             policy: PackPolicy {
                 hot_window_ms: i64::try_from(hot_window_seconds.saturating_mul(1000))
@@ -104,7 +106,7 @@ impl GopPacker {
     fn pack_one_inner(&self, vault: &Vault, now_ms: i64) -> Result<Option<String>, anyhow::Error> {
         let candidates = vault.list_pack_candidates(now_ms, &self.config.policy)?;
         let runs = fold_pack_runs(&candidates, self.config.policy.keyint);
-        let Some(run) = runs.into_iter().find(|run| run.len() >= 2) else {
+        let Some(run) = runs.into_iter().next() else {
             return Ok(None);
         };
         let moment_ids: Vec<String> = run.iter().map(|frame| frame.id.clone()).collect();
@@ -128,6 +130,11 @@ impl GopPacker {
                     })
                     .collect();
                 let content_hash = hash_hex(blake3::hash(&encoded.ivf).as_bytes());
+                let started_at_ms = run.first().map(|frame| frame.captured_at_ms).unwrap_or(0);
+                let ended_at_ms = run
+                    .last()
+                    .map(|frame| frame.captured_at_ms)
+                    .unwrap_or(started_at_ms);
                 match vault.commit_gop(GopCommitRequest {
                     moment_ids: &moment_ids,
                     ivf: &encoded.ivf,
@@ -137,23 +144,24 @@ impl GopPacker {
                     width: encoded.width,
                     height: encoded.height,
                     keyint: encoded.keyint,
+                    started_at_ms,
+                    ended_at_ms,
                     content_hash: &content_hash,
                     frames: &frames,
                 }) {
                     Ok(segment_id) => {
                         if let Err(error) = verify_gop(vault, &segment_id, &encoded) {
+                            let _ = vault.abort_gop(&segment_id);
                             let _ = vault.finish_pack_job(
                                 &job_id,
                                 now_ms,
-                                Some(&segment_id),
+                                None,
                                 Some(&error.to_string()),
                             );
                             return Err(error);
                         }
                         vault.finish_pack_job(&job_id, now_ms, Some(&segment_id), None)?;
-                        if !self.config.keep_stills
-                            && let Err(error) = vault.drop_unpinned_stills(&segment_id)
-                        {
+                        if let Err(error) = vault.drop_unpinned_stills(&segment_id) {
                             eprintln!("gop packer: drop stills failed for {segment_id}: {error}");
                         }
                         Ok(Some(segment_id))
@@ -245,9 +253,7 @@ pub fn read_gop_frame(
 ) -> Result<ArtifactPayload, StoreError> {
     let frames = vault.live_gop_frames(segment_id)?;
     if !frames.iter().any(|frame| frame.index == index) {
-        return Err(StoreError::GopNotFound(format!(
-            "{segment_id}#{index}"
-        )));
+        return Err(StoreError::GopNotFound(format!("{segment_id}#{index}")));
     }
     let payload = vault.read_gop_artifact(segment_id)?;
     let last = match mode {
