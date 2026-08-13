@@ -1,3 +1,4 @@
+mod ask;
 mod gop_packer;
 
 use afterray_models::{
@@ -382,6 +383,23 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Err(error) => Response::failure(error.to_string()),
         },
         Request::Summarize { session_id } => summarize(state, &session_id).await,
+        Request::Ask {
+            question,
+            from_ms,
+            to_ms,
+        } => {
+            let llm_present = ask::llm_pack_present(&model_library(state));
+            ask::handle_ask(
+                &state.store,
+                &state.models,
+                &question,
+                from_ms,
+                to_ms,
+                now_ms(),
+                llm_present,
+            )
+            .await
+        }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings { record_audio } => update_settings(state, record_audio).await,
         Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
@@ -843,7 +861,7 @@ async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: Stri
     }
 }
 
-async fn search_hits(
+pub(crate) async fn search_hits(
     store: &Vault,
     models: &ModelQueue,
     query: &str,

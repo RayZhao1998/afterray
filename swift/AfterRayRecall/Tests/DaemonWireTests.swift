@@ -163,6 +163,47 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(result.pid, 4321)
     }
 
+    func testAskRequestMatchesRustShape() throws {
+        let request = WireRequest(type: "ask", question: "我今天做了什么", fromMs: 10, toMs: 20)
+        let data = try JSONEncoder().encode(request)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "ask")
+        XCTAssertEqual(json["question"] as? String, "我今天做了什么")
+        XCTAssertEqual(json["from_ms"] as? Int, 10)
+        XCTAssertEqual(json["to_ms"] as? Int, 20)
+        XCTAssertNil(json["query"])
+    }
+
+    func testAskRequestOmitsRangeWhenDefaultingToToday() throws {
+        let request = WireRequest(type: "ask", question: "what did I do")
+        let data = try JSONEncoder().encode(request)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "ask")
+        XCTAssertEqual(json["question"] as? String, "what did I do")
+        XCTAssertNil(json["from_ms"])
+        XCTAssertNil(json["to_ms"])
+    }
+
+    func testAskAnswerDecodesRustShape() throws {
+        let json = #"{"answer":"You used Xcode.","citations":[{"moment_id":"m1","captured_at_ms":42,"label":"Xcode","excerpt":"fn main"}],"model_missing":false}"#
+        let answer = try JSONDecoder().decode(AskAnswer.self, from: Data(json.utf8))
+        XCTAssertEqual(answer.answer, "You used Xcode.")
+        XCTAssertEqual(answer.citations.count, 1)
+        XCTAssertEqual(answer.citations[0].momentId, "m1")
+        XCTAssertEqual(answer.citations[0].label, "Xcode")
+        XCTAssertFalse(answer.modelMissing)
+        XCTAssertEqual(answer.citations[0].asSearchHit().momentId, "m1")
+    }
+
+    func testAskAnswerDefaultsModelMissing() throws {
+        let json = #"{"answer":"ok"}"#
+        let answer = try JSONDecoder().decode(AskAnswer.self, from: Data(json.utf8))
+        XCTAssertEqual(answer.answer, "ok")
+        XCTAssertTrue(answer.citations.isEmpty)
+        XCTAssertFalse(answer.modelMissing)
+    }
+
     func testSearchRequestMatchesRustShape() throws {
         let request = WireRequest(type: "search", limit: 30, query: "design review")
         let data = try JSONEncoder().encode(request)

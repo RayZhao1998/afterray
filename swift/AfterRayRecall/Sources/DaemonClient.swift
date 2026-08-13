@@ -46,6 +46,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func recordStart() async throws -> RecordStartResult
     func recordStop(reason: String?) async throws -> RecordStopResult
     func search(query: String, limit: Int) async throws -> [RecallSearchHit]
+    func ask(question: String, fromMs: Int64?, toMs: Int64?) async throws -> AskAnswer
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
@@ -125,6 +126,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         try await request(
             WireRequest(type: "search", limit: limit, query: query),
             as: [RecallSearchHit].self
+        )
+    }
+
+    public func ask(question: String, fromMs: Int64? = nil, toMs: Int64? = nil) async throws -> AskAnswer {
+        try await request(
+            WireRequest(type: "ask", question: question, fromMs: fromMs, toMs: toMs),
+            as: AskAnswer.self
         )
     }
 
@@ -215,6 +223,9 @@ struct WireRequest: Encodable, Equatable {
     var momentID: String?
     var favorite: Bool?
     var query: String?
+    var question: String?
+    var fromMs: Int64?
+    var toMs: Int64?
     var sinceMs: Int64?
     var recordAudio: Bool?
     var reason: String?
@@ -232,6 +243,9 @@ struct WireRequest: Encodable, Equatable {
         case momentID = "moment_id"
         case favorite
         case query
+        case question
+        case fromMs = "from_ms"
+        case toMs = "to_ms"
         case sinceMs = "since_ms"
         case recordAudio = "record_audio"
         case reason
@@ -239,6 +253,28 @@ struct WireRequest: Encodable, Equatable {
         case segmentID = "segment_id"
         case gopIndex = "index"
         case gopMode = "mode"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(sessionID, forKey: .sessionID)
+        try container.encodeIfPresent(centerMs, forKey: .centerMs)
+        try container.encodeIfPresent(limit, forKey: .limit)
+        try container.encodeIfPresent(artifactID, forKey: .artifactID)
+        try container.encodeIfPresent(momentID, forKey: .momentID)
+        try container.encodeIfPresent(favorite, forKey: .favorite)
+        try container.encodeIfPresent(query, forKey: .query)
+        try container.encodeIfPresent(question, forKey: .question)
+        try container.encodeIfPresent(fromMs, forKey: .fromMs)
+        try container.encodeIfPresent(toMs, forKey: .toMs)
+        try container.encodeIfPresent(sinceMs, forKey: .sinceMs)
+        try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
+        try container.encodeIfPresent(reason, forKey: .reason)
+        try container.encodeIfPresent(packID, forKey: .packID)
+        try container.encodeIfPresent(segmentID, forKey: .segmentID)
+        try container.encodeIfPresent(gopIndex, forKey: .gopIndex)
+        try container.encodeIfPresent(gopMode, forKey: .gopMode)
     }
 }
 

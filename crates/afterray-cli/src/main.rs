@@ -62,6 +62,13 @@ enum Command {
     Summarize {
         session_id: String,
     },
+    Ask {
+        question: String,
+        #[arg(long = "from-ms")]
+        from_ms: Option<i64>,
+        #[arg(long = "to-ms")]
+        to_ms: Option<i64>,
+    },
     Gop {
         segment_id: String,
     },
@@ -111,18 +118,40 @@ async fn main() -> anyhow::Result<()> {
     let socket = cli
         .socket
         .unwrap_or_else(|| std::env::temp_dir().join("afterray-v0.sock"));
-    let request = match cli.command {
+    let Some(request) = request_from_command(cli.command, &socket).await? else {
+        return Ok(());
+    };
+    let response = send(&socket, &request).await?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else if response.ok {
+        println!("{}", serde_json::to_string_pretty(&response.data)?);
+    } else {
+        anyhow::bail!(
+            response
+                .error
+                .unwrap_or_else(|| "unknown daemon error".to_owned())
+        );
+    }
+    Ok(())
+}
+
+async fn request_from_command(
+    command: Command,
+    socket: &PathBuf,
+) -> anyhow::Result<Option<Request>> {
+    Ok(Some(match command {
         Command::Daemon {
             command: DaemonCommand::Start,
         } => {
             let status = ProcessCommand::new("afterrayd")
-                .env("AFTERRAY_SOCKET", &socket)
+                .env("AFTERRAY_SOCKET", socket)
                 .status()
                 .context("start afterrayd; ensure it is installed or available on PATH")?;
             if !status.success() {
                 anyhow::bail!("afterrayd exited with {status}");
             }
-            return Ok(());
+            return Ok(None);
         }
         Command::Daemon {
             command: DaemonCommand::Stop,
@@ -156,26 +185,8 @@ async fn main() -> anyhow::Result<()> {
             favorite: false,
         },
         Command::Download { pack, dir } => {
-            let directory = dir.unwrap_or_else(model_directory);
-            let packs =
-                specs_for_download_in(&directory, pack.as_deref()).map_err(anyhow::Error::msg)?;
-            if packs.is_empty() {
-                println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
-                return Ok(());
-            }
-            download_packs(&packs, |spec, progress| {
-                if let Some(percent) = progress.percent() {
-                    eprintln!("Downloading {} · {percent}%", spec.name);
-                } else {
-                    eprintln!(
-                        "Downloading {} ({}/{} files)",
-                        spec.name, progress.completed_files, progress.total_files
-                    );
-                }
-            })
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
-            return Ok(());
+            run_local_download(pack, dir).await?;
+            return Ok(None);
         }
         Command::Models => Request::ModelsStatus,
         Command::Jobs {
@@ -185,23 +196,41 @@ async fn main() -> anyhow::Result<()> {
             command: JobsCommand::Retry { job_id },
         } => Request::JobRetry { job_id },
         Command::Summarize { session_id } => Request::Summarize { session_id },
+        Command::Ask {
+            question,
+            from_ms,
+            to_ms,
+        } => Request::Ask {
+            question,
+            from_ms,
+            to_ms,
+        },
         Command::Gop { segment_id } => Request::GopShow { segment_id },
         Command::Pack {
             command: PackCommand::Status,
         } => Request::PackStatus,
-    };
-    let response = send(&socket, &request).await?;
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else if response.ok {
-        println!("{}", serde_json::to_string_pretty(&response.data)?);
-    } else {
-        anyhow::bail!(
-            response
-                .error
-                .unwrap_or_else(|| "unknown daemon error".to_owned())
-        );
+    }))
+}
+
+async fn run_local_download(pack: Option<String>, dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let directory = dir.unwrap_or_else(model_directory);
+    let packs = specs_for_download_in(&directory, pack.as_deref()).map_err(anyhow::Error::msg)?;
+    if packs.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
+        return Ok(());
     }
+    download_packs(&packs, |spec, progress| {
+        if let Some(percent) = progress.percent() {
+            eprintln!("Downloading {} · {percent}%", spec.name);
+        } else {
+            eprintln!(
+                "Downloading {} ({}/{} files)",
+                spec.name, progress.completed_files, progress.total_files
+            );
+        }
+    })
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&library_in(&directory))?);
     Ok(())
 }
 

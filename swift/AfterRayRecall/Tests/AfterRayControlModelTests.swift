@@ -59,12 +59,78 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertTrue(model.searchHits.isEmpty)
         XCTAssertNil(model.message)
     }
+
+    func testAskTrimsQuestionAndStoresAnswer() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        model.askQuestion = "  我今天做了什么  "
+
+        await model.ask()
+
+        XCTAssertEqual(model.askAnswer?.answer, "You used Safari and Xcode.")
+        XCTAssertEqual(model.askAnswer?.citations.map(\.momentId), ["m1"])
+        XCTAssertFalse(model.askAnswer?.modelMissing ?? true)
+        XCTAssertNil(model.askMessage)
+        let question = await daemon.lastAskQuestion
+        XCTAssertEqual(question, "我今天做了什么")
+    }
+
+    func testAskModelMissingKeepsAnswerForCTA() async {
+        let daemon = ControlDaemon()
+        await daemon.setModelMissing(true)
+        let model = AfterRayControlModel(daemon: daemon)
+        model.askQuestion = "what did I do"
+
+        await model.ask()
+
+        XCTAssertEqual(model.askAnswer?.modelMissing, true)
+        XCTAssertTrue(model.askAnswer?.answer.contains("Settings") ?? false)
+        XCTAssertNil(model.askMessage)
+    }
+
+    func testAskErrorSurfacesMessageWithoutBlankingQuestion() async {
+        let daemon = ControlDaemon()
+        await daemon.setAskShouldFail(true)
+        let model = AfterRayControlModel(daemon: daemon)
+        model.askQuestion = "hello"
+
+        await model.ask()
+
+        XCTAssertNil(model.askAnswer)
+        XCTAssertEqual(model.askMessage, "ask exploded")
+        XCTAssertEqual(model.askQuestion, "hello")
+    }
+
+    func testSystemLockClearsAskState() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        model.askQuestion = "secret"
+        await model.ask()
+
+        model.clearSensitiveState()
+
+        XCTAssertEqual(model.askQuestion, "")
+        XCTAssertNil(model.askAnswer)
+        XCTAssertNil(model.askMessage)
+        XCTAssertFalse(model.isAsking)
+    }
 }
 
 private actor ControlDaemon: AfterRayDaemonServing {
     var recordingState: DaemonRecordingState = .idle
     var recordCommands: [String] = []
     var lastSearchQuery: String?
+    var lastAskQuestion: String?
+    var modelMissing = false
+    var askShouldFail = false
+
+    func setModelMissing(_ value: Bool) {
+        modelMissing = value
+    }
+
+    func setAskShouldFail(_ value: Bool) {
+        askShouldFail = value
+    }
 
     func status() async throws -> DaemonStatus {
         DaemonStatus(
@@ -134,6 +200,27 @@ private actor ControlDaemon: AfterRayDaemonServing {
                 score: 1
             )
         ]
+    }
+
+    func ask(question: String, fromMs _: Int64?, toMs _: Int64?) async throws -> AskAnswer {
+        lastAskQuestion = question
+        if askShouldFail {
+            throw DaemonClientError.rejected("ask exploded")
+        }
+        if modelMissing {
+            return AskAnswer(
+                answer: "The local language model is not installed. Open Settings to download the LLM pack.",
+                citations: [],
+                modelMissing: true
+            )
+        }
+        return AskAnswer(
+            answer: "You used Safari and Xcode.",
+            citations: [
+                AskCitation(momentId: "m1", capturedAtMs: 100, label: "Safari", excerpt: "inbox")
+            ],
+            modelMissing: false
+        )
     }
 
     func sessions() async throws -> [RecallSession] { [] }

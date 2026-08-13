@@ -7,6 +7,10 @@ public final class AfterRayControlModel: ObservableObject {
     @Published public var searchQuery = ""
     @Published public private(set) var searchHits: [RecallSearchHit] = []
     @Published public private(set) var isSearching = false
+    @Published public var askQuestion = ""
+    @Published public private(set) var askAnswer: AskAnswer?
+    @Published public private(set) var isAsking = false
+    @Published public private(set) var askMessage: String?
     @Published public private(set) var message: String?
 
     private let daemon: any AfterRayDaemonServing
@@ -101,12 +105,44 @@ public final class AfterRayControlModel: ObservableObject {
         message = nil
     }
 
+    public func ask() async {
+        let requestGeneration = sensitiveGeneration
+        let question = askQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else {
+            askAnswer = nil
+            askMessage = nil
+            return
+        }
+        isAsking = true
+        defer { isAsking = false }
+        do {
+            let answer = try await daemon.ask(question: question, fromMs: nil, toMs: nil)
+            guard sensitiveGeneration == requestGeneration else { return }
+            askAnswer = answer
+            askMessage = nil
+        } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
+            askAnswer = nil
+            askMessage = error.localizedDescription
+        }
+    }
+
+    public func dismissAsk() {
+        askQuestion = ""
+        askAnswer = nil
+        askMessage = nil
+    }
+
     public func clearSensitiveState() {
         sensitiveGeneration &+= 1
         status = nil
         searchQuery = ""
         searchHits = []
         isSearching = false
+        askQuestion = ""
+        askAnswer = nil
+        isAsking = false
+        askMessage = nil
         message = nil
     }
 }
