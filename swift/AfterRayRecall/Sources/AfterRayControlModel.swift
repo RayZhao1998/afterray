@@ -36,14 +36,17 @@ public final class AfterRayControlModel: ObservableObject {
     public func ensureRecording() async -> Bool {
         await refreshStatus()
         guard status?.recordingState == .idle else { return isRecording }
+        AfterRayLog.info("ensureRecording: starting capture")
         isChangingRecording = true
         defer { isChangingRecording = false }
         do {
             _ = try await daemon.recordStart()
             status = try await daemon.status()
             message = nil
+            AfterRayLog.info("ensureRecording: recording=\(isRecording)")
             return isRecording
         } catch {
+            AfterRayLog.error("ensureRecording: \(error.localizedDescription)")
             message = error.localizedDescription
             return false
         }
@@ -64,6 +67,7 @@ public final class AfterRayControlModel: ObservableObject {
             message = nil
             return true
         } catch {
+            AfterRayLog.error("toggleRecording: \(error.localizedDescription)")
             message = error.localizedDescription
             return false
         }

@@ -193,6 +193,12 @@ impl MacOsCaptureBackend {
         if !self.record_audio() {
             command.arg("--no-audio");
         }
+        eprintln!(
+            "capture: spawning {} --output-dir {} audio={}",
+            self.config.shim_path.display(),
+            self.config.output_dir.display(),
+            self.record_audio()
+        );
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -203,6 +209,7 @@ impl MacOsCaptureBackend {
                 path: self.config.shim_path.clone(),
                 source,
             })?;
+        eprintln!("capture: shim pid {:?}", child.id());
         let stdin = child.stdin.take().ok_or_else(|| {
             CaptureError::Io(std::io::Error::other("capture shim stdin was not piped"))
         })?;
@@ -215,6 +222,7 @@ impl MacOsCaptureBackend {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
+                        eprintln!("capture: shim stdout {line}");
                         let parsed =
                             serde_json::from_str::<CaptureEvent>(&line).map_err(|source| {
                                 CaptureError::InvalidEvent {

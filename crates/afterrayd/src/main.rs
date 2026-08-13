@@ -369,15 +369,25 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     let _ = state.store.end_open_idle_spans(now_ms());
     let mut recording = state.recording.lock().await;
     if let Some(id) = &recording.active_session_id {
+        eprintln!("record_start: already recording session {id}");
         return Response::success(serde_json::json!({"session_id": id, "already_recording": true}));
     }
     let session = match state.store.create_session_sync(now_ms()) {
         Ok(session) => session,
-        Err(error) => return Response::failure(error.to_string()),
+        Err(error) => {
+            eprintln!("record_start: failed to create session: {error}");
+            return Response::failure(error.to_string());
+        }
     };
+    eprintln!(
+        "record_start: session {} audio={}",
+        session.id,
+        state.capture.record_audio()
+    );
     recording.active_session_id = Some(session.id.clone());
     drop(recording);
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
+        eprintln!("record_start: capture runtime failed: {error}");
         let _ = state.store.end_session_sync(&session.id, now_ms());
         let mut recording = state.recording.lock().await;
         if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
@@ -385,15 +395,28 @@ async fn record_start(state: &Arc<AppState>) -> Response {
         }
         return Response::failure(error);
     }
+    eprintln!("record_start: session {} is recording", session.id);
     Response::success(serde_json::json!({"session": session}))
 }
 
 async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Result<(), String> {
+    const READY_TIMEOUT: Duration = Duration::from_secs(30);
     if let Err(error) = state.capture.start_capture().await {
+        eprintln!("capture runtime: start_capture failed: {error}");
         return Err(error.to_string());
     }
-    match tokio::time::timeout(Duration::from_secs(15), state.capture.next_event()).await {
-        Ok(Some(Ok(CaptureEvent::Ready { .. }))) => {}
+    eprintln!(
+        "capture runtime: waiting up to {}s for shim ready (session {session_id})",
+        READY_TIMEOUT.as_secs()
+    );
+    match tokio::time::timeout(READY_TIMEOUT, state.capture.next_event()).await {
+        Ok(Some(Ok(CaptureEvent::Ready {
+            display_id,
+            width,
+            height,
+        }))) => {
+            eprintln!("capture runtime: shim ready display={display_id} {width}x{height}");
+        }
         Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
             let _ = state.capture.stop_capture().await;
             return Err(format!("capture startup failed [{code}]: {message}"));
@@ -414,7 +437,7 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
         }
         Err(_) => {
             let _ = state.capture.stop_capture().await;
-            return Err("capture helper did not become ready within 15 seconds".to_owned());
+            return Err("capture helper did not become ready within 30 seconds".to_owned());
         }
     }
 

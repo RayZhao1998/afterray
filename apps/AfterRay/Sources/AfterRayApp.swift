@@ -799,12 +799,17 @@ private struct AfterRayRootView: View {
                 : Color(red: 0.025, green: 0.022, blue: 0.026)
         )
         .overlay(alignment: .top) {
-            ImmersiveControlBar(
-                model: control,
-                onToggleRecording: toggleRecording,
-                onSearch: { Task { await control.search() } },
-                onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
-            )
+            VStack(spacing: 8) {
+                ImmersiveControlBar(
+                    model: control,
+                    onToggleRecording: toggleRecording,
+                    onSearch: { Task { await control.search() } },
+                    onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
+                )
+                if let message = control.message, !control.isRecording {
+                    CaptureFailureBanner(message: message, onRetry: toggleRecording)
+                }
+            }
             .padding(.top, controlBarTopPadding)
         }
         .overlay(alignment: .topTrailing) {
@@ -926,8 +931,12 @@ private struct AfterRayRootView: View {
         guard await startDaemonOrReportFailure() != nil else { return }
         await permissions.requestInitialPermissionsOnce()
         if permissions.allGranted {
+            AfterRayLog.info("bootstrap: permissions granted, ensuring recording")
             _ = await control.ensureRecording()
         } else {
+            AfterRayLog.info(
+                "bootstrap: permissions incomplete screen=\(permissions.screenRecording) mic=\(permissions.microphone) ax=\(permissions.accessibility) recordAudio=\(permissions.recordsAudio)"
+            )
             await control.refreshStatus()
         }
         await store.loadTimeline()
@@ -1187,6 +1196,9 @@ private struct ImmersiveControlBar: View {
     }
 
     private var statusLabel: String {
+        if let message = model.message, !model.isRecording {
+            return "Capture failed"
+        }
         guard let status = model.status else { return "Daemon offline" }
         switch status.recordingState {
         case .idle: return "Ready"
@@ -1194,6 +1206,33 @@ private struct ImmersiveControlBar: View {
         case .stopping: return "Stopping"
         case .failed: return "Capture failed"
         }
+    }
+}
+
+private struct CaptureFailureBanner: View {
+    let message: String
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            Text(message)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.88))
+                .lineLimit(3)
+            Button("Retry", action: onRetry)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.white.opacity(0.12), in: Capsule())
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .frame(maxWidth: 520)
+        .recallGlass(in: .capsule)
+        .help(message)
     }
 }
 

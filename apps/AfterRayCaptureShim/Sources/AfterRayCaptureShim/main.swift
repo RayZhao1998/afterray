@@ -620,11 +620,14 @@ private enum AfterRayCaptureShim {
                 withIntermediateDirectories: true
             )
             try hardenPrivateDirectory(options.outputDirectory)
+            log("starting recordAudio=\(options.recordAudio) output=\(options.outputDirectory.path)")
+            log("requesting SCShareableContent")
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false,
                 onScreenWindowsOnly: true
             )
             guard let display = content.displays.first else { throw ShimError.noDisplay }
+            log("got display id=\(display.displayID) \(display.width)x\(display.height) apps=\(content.applications.count)")
 
             let configuration = SCStreamConfiguration()
             configuration.width = display.width
@@ -660,7 +663,9 @@ private enum AfterRayCaptureShim {
                 try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
                 try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
             }
+            log("calling SCStream.startCapture")
             try await stream.startCapture()
+            log("startCapture returned, sending ready")
             events.send(.ready(display: display))
 
             let decoder = JSONDecoder()
@@ -697,9 +702,17 @@ private enum AfterRayCaptureShim {
             callbackQueue.sync { output.finishAudio() }
             events.send(.stopped)
         } catch {
+            log("startup failed: \(String(describing: error))")
             events.send(.failed(code: "startup", message: String(describing: error)))
             Foundation.exit(EXIT_FAILURE)
         }
+    }
+}
+
+private func log(_ message: String) {
+    let line = "capture-shim: \(message)\n"
+    if let data = line.data(using: .utf8) {
+        FileHandle.standardError.write(data)
     }
 }
 
