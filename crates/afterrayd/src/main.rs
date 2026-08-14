@@ -1,5 +1,6 @@
 mod agent;
 mod ask;
+mod chat;
 mod gop_packer;
 mod memory;
 mod tools;
@@ -537,6 +538,28 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 llm_ready,
             )
             .await
+        }
+        Request::ChatSend {
+            conversation_id,
+            message,
+        } => {
+            let llm_ready = ensure_remote_llm_model(state).await;
+            chat::handle_send(
+                &state.store,
+                &state.models,
+                conversation_id.as_deref(),
+                &message,
+                now_ms(),
+                llm_ready,
+            )
+            .await
+        }
+        Request::ChatList => chat::handle_list(&state.store),
+        Request::ChatHistory { conversation_id } => {
+            chat::handle_history(&state.store, &conversation_id)
+        }
+        Request::ChatDelete { conversation_id } => {
+            chat::handle_delete(&state.store, &conversation_id)
         }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
