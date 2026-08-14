@@ -1004,6 +1004,85 @@ impl Vault {
             .map_err(Into::into)
     }
 
+    /// OCR text + optional layout JSON for a moment.
+    pub fn ocr_evidence_for_moment(
+        &self,
+        moment_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT text, layout_json FROM text_evidence
+                  WHERE moment_id = ?1 AND source = 'ocr'
+                  ORDER BY started_at_ms DESC, id DESC
+                  LIMIT 1",
+                [moment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn moment_by_id(&self, moment_id: &str) -> Result<Option<Moment>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
+                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                    (SELECT group_concat(te.text, '\n')
+                       FROM text_evidence te
+                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
+                      WHERE audio.session_id = m.session_id
+                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                        AND te.source = 'transcript'),
+                    (SELECT audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
+                    (SELECT audio.started_at_ms
+                       FROM audio_segments audio
+                      WHERE audio.session_id = m.session_id
+                        AND audio.started_at_ms <= m.captured_at_ms + 30000
+                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                        audio.started_at_ms DESC
+                      LIMIT 1),
+                    m.accessibility_artifact_id,
+                    m.application_name,
+                    m.bundle_identifier,
+                    m.window_title,
+                    m.url,
+                    m.document,
+                    m.gop_segment_id,
+                    m.gop_index,
+                    m.still_origin,
+                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
+             FROM moments m WHERE m.id = ?1",
+        )?;
+        statement
+            .query_row([moment_id], moment_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Decrypted accessibility snapshot bytes for a moment, if present.
+    pub fn accessibility_bytes_for_moment(
+        &self,
+        moment_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(moment) = self.moment_by_id(moment_id)? else {
+            return Ok(None);
+        };
+        let Some(artifact_id) = moment.accessibility_artifact_id else {
+            return Ok(None);
+        };
+        let payload = self.read_artifact(&artifact_id)?;
+        Ok(Some(payload.bytes.clone()))
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(

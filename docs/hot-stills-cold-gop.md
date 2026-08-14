@@ -208,11 +208,10 @@ stateDiagram-v2
 | --- | --- | --- |
 | `AFTERRAY_GOP_HOT_WINDOW_SECONDS` | `7200` | 墙钟热窗口 2h；允许 3600–7200 |
 | `AFTERRAY_GOP_HOT_MIN_STILLS` | `360` | 至少保留这么多独立 still（1h × 10s 地板） |
-| `AFTERRAY_GOP_KEYINT` | `12` | closed GOP 最大帧数；允许 6 或 12。默认 12 是 live-vault 仿真里同时过 20× 与 20ms KF 的配置 |
-| `AFTERRAY_GOP_ARCHIVE` | `0` | 总开关 |
-| `AFTERRAY_GOP_KEEP_STILLS` | `1` | Dual 不删 still。PR 8 前禁止改 0 |
+| `AFTERRAY_GOP_KEYINT` | `12` | closed GOP 最大帧数；允许 6 / 12 / 20 / 24 / 30 |
+| `AFTERRAY_GOP_ARCHIVE` | `1` | 冷区默认归档。设 `0` 才停 packer |
 | `AFTERRAY_GOP_OCR_GRACE_SECONDS` | `600` | OCR 未完成也可 pack 的宽限 |
-| `AFTERRAY_GOP_REQUIRE_AC` | `1` | 仅 AC 时 encode |
+| `AFTERRAY_GOP_REQUIRE_AC` | `0` | 设 `1` 时仅 AC 编码 |
 
 Moment **同时**满足以下条件才可进入候选：
 

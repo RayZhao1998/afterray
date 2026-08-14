@@ -75,7 +75,11 @@ public struct TimelineLayout: Equatable, Sendable {
         let rawRuns = Self.makeRuns(moments: moments, endMs: bounds.endMs)
         let visualTotal = max(rawRuns.reduce(Int64(0)) { $0 + $1.visualDurationMs }, 1)
         let seconds = CGFloat(visualTotal) / 1_000
-        let baseWidth = max(max(viewportWidth, 1) * 1.18, min(seconds * CGFloat(density), 9_000))
+        // Zoom multiplies `density`. Keep a high ceiling so a long archive can
+        // still widen instead of sticking at the old 9_000 pt cap.
+        let naturalWidth = seconds * CGFloat(density)
+        let floorWidth = max(viewportWidth, 1) * 1.18
+        let baseWidth = max(floorWidth, min(naturalWidth, 64_000))
 
         var cursor: CGFloat = 0
         var placed: [AppUsageRun] = []

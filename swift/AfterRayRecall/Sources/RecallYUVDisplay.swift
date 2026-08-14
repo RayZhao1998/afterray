@@ -249,7 +249,10 @@ final class RecallDisplayFrame: NSObject {
 
 enum RecallFrameDecoder {
     static func decode(_ data: Data) -> RecallDisplayFrame? {
-        if isIVF(data), let buffer = RecallAV1Decoder.shared.decode(data) {
+        if isIVF(data) {
+            // DKIF must fail closed. ImageIO will not decode AV1 and must
+            // never see an IVF payload.
+            guard let buffer = RecallAV1Decoder.shared.decode(data) else { return nil }
             return RecallDisplayFrame(pixelBuffer: buffer)
         }
         if isJPEG(data), let buffer = RecallJPEGDecoder.shared.decode(data) {

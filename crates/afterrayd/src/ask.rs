@@ -1,4 +1,4 @@
-use afterray_models::{JobState, ModelInput, ModelOutput, ModelQueue, QueueError};
+use afterray_models::{LlmRuntimeConfig, ModelQueue};
 use afterray_protocol::{
     ActivitySpan, AskAnswer, AskCitation, Memory, ModelLibrary, Response, SearchHit,
     local_calendar_day_bounds_ms,
@@ -7,18 +7,21 @@ use afterray_store::Vault;
 use chrono::Local;
 use std::fmt::Write as _;
 
+use crate::agent;
 use crate::search_hits;
+use crate::tools::ToolHost;
 
 const CONTEXT_CHAR_CAP: usize = 10_000;
 const SEARCH_HIT_LIMIT: usize = 6;
 const CITATION_LIMIT: usize = 3;
 const EXCERPT_CHAR_CAP: usize = 180;
 const ASK_SYSTEM_PROMPT: &str = "You are AfterRay, a local memory assistant for this computer. \
-Answer only from the provided evidence. If the evidence does not contain the answer, say you do not know. \
-When you mention a specific activity, cite it as a markdown link using the exact moment URL from the evidence, \
-for example [2:14 Safari](afterray://moment/MOMENT_ID). Be concise. Never invent missing evidence.";
+Answer only from tool evidence. If tools do not contain the answer, say you do not know. \
+When you mention a specific activity, cite it as a markdown link using afterray://moment/MOMENT_ID, \
+for example [2:14 Safari](afterray://moment/MOMENT_ID). Be concise. Never invent missing evidence. \
+Prefer list_memories and list_activity first; use search_evidence for keywords; use get_ocr or get_ax_digest when you need detail for a moment_id.";
 
-const MODEL_MISSING_MESSAGE: &str = "The local language model is not installed. Open Settings to download the LLM pack, then ask again.";
+const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 #[must_use]
 pub(crate) fn llm_pack_present(library: &ModelLibrary) -> bool {
@@ -26,6 +29,11 @@ pub(crate) fn llm_pack_present(library: &ModelLibrary) -> bool {
         .packs
         .iter()
         .any(|pack| pack.id == "llm" && pack.present)
+}
+
+#[must_use]
+pub(crate) fn llm_ready(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
+    config.is_ready(llm_pack_present(library))
 }
 
 pub(crate) fn resolve_ask_range(
@@ -389,49 +397,27 @@ pub(crate) async fn handle_ask(
         });
     }
 
-    let prompt = build_ask_context(question, from_ms, to_ms, &memories, &spans, &hits);
-    let job_id = match models
-        .submit(ModelInput::Llm {
-            prompt,
-            system: Some(ASK_SYSTEM_PROMPT.to_owned()),
-        })
-        .await
-    {
-        Ok(id) => id,
-        Err(QueueError::MissingAdapter(_)) => {
-            return Response::success(missing_model_answer(&memories, &spans));
+    let seed = build_ask_context(question, from_ms, to_ms, &memories, &spans, &hits);
+    let user = format!(
+        "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
+    );
+    let host = ToolHost { store, models };
+    match agent::run_readonly_agent(models, &host, ASK_SYSTEM_PROMPT, &user).await {
+        Ok(answer) => Response::success(AskAnswer {
+            answer: answer.trim().to_owned(),
+            citations,
+            model_missing: false,
+        }),
+        Err(agent::AgentError::MissingModel) => {
+            Response::success(missing_model_answer(&memories, &spans))
         }
-        Err(error) => return Response::failure(error.to_string()),
-    };
-
-    match models.wait(&job_id).await {
-        Ok(snapshot) if snapshot.state == JobState::Done => {
-            let answer = match snapshot.output {
-                Some(ModelOutput::Llm { text }) if !text.trim().is_empty() => {
-                    text.trim().to_owned()
-                }
-                Some(ModelOutput::Llm { .. }) => {
-                    "The local model returned an empty answer.".to_owned()
-                }
-                _ => return Response::failure("ask job returned the wrong output type"),
-            };
-            Response::success(AskAnswer {
-                answer,
-                citations,
-                model_missing: false,
-            })
-        }
-        Ok(snapshot) => {
-            let error = snapshot
-                .last_error
-                .unwrap_or_else(|| "ask job did not complete".to_owned());
-            if model_missing_error(&error) {
+        Err(error) => {
+            if model_missing_error(&error.to_string()) {
                 Response::success(missing_model_answer(&memories, &spans))
             } else {
-                Response::failure(error)
+                Response::failure(error.to_string())
             }
         }
-        Err(error) => Response::failure(error.to_string()),
     }
 }
 
@@ -484,6 +470,33 @@ mod tests {
         let mut present = missing.clone();
         present.packs[0].present = true;
         assert!(llm_pack_present(&present));
+    }
+
+    #[test]
+    fn llm_ready_accepts_configured_remote_without_local_pack() {
+        let missing = ModelLibrary {
+            directory: "/tmp".into(),
+            packs: vec![ModelPack {
+                id: "llm".into(),
+                name: "Qwen3.6 27B".into(),
+                capability: "llm".into(),
+                path: "/tmp/missing.gguf".into(),
+                present: false,
+                bytes: 0,
+                required: false,
+                note: None,
+                expected_bytes: None,
+            }],
+            download: None,
+        };
+        let remote = LlmRuntimeConfig {
+            provider: afterray_protocol::LlmProvider::Ollama,
+            base_url: String::new(),
+            model: "qwen3.6:latest".into(),
+            api_key: None,
+        };
+        assert!(llm_ready(&missing, &remote));
+        assert!(!llm_ready(&missing, &LlmRuntimeConfig::default()));
     }
 
     #[test]

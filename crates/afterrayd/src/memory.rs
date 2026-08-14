@@ -1,4 +1,4 @@
-use afterray_models::{JobState, ModelInput, ModelOutput, ModelQueue};
+use afterray_models::ModelQueue;
 use afterray_protocol::Memory;
 use afterray_store::{
     AccessibilityDigest, Vault, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
@@ -6,11 +6,18 @@ use afterray_store::{
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::agent;
+use crate::tools::{self, ToolHost};
+
 const MIN_MEMORY_MS: i64 = 45_000;
 
-const MEMORY_SYSTEM_PROMPT: &str = "You write one or two short sentences about what a person \
-was doing on their Mac. Use only the accessibility evidence. Do not invent files, URLs, or tasks. \
-Do not mention idle time, the desktop, or AfterRay itself.";
+const MEMORY_SYSTEM_PROMPT: &str = "You write a local activity memory for AfterRay. \
+Produce one or two short sentences about what the person was doing. \
+Use tools to inspect accessibility first (get_ax_digest). If the digest is weak \
+(sufficient=false, empty visible text, or generic window titles like WeChat/Weixin), \
+call get_ocr on the same moment_id. Do not invent files, URLs, or tasks. \
+Do not mention idle time, the desktop, or AfterRay itself. \
+When done, answer with FINAL followed by only the memory sentences.";
 
 #[derive(Debug, Clone)]
 struct OpenEpisode {
@@ -133,7 +140,7 @@ async fn commit_episode(
         return;
     }
     let summary = if llm_present {
-        summarize_episode(models, &episode)
+        summarize_episode(store, models, &episode)
             .await
             .unwrap_or_else(|| episode.digest.fallback_summary())
     } else {
@@ -157,25 +164,26 @@ async fn commit_episode(
     }
 }
 
-async fn summarize_episode(models: &ModelQueue, episode: &OpenEpisode) -> Option<String> {
+async fn summarize_episode(store: &Vault, models: &ModelQueue, episode: &OpenEpisode) -> Option<String> {
     let minutes = ((episode.last_ms - episode.start_ms).max(1) + 30_000) / 60_000;
-    let prompt = format!(
-        "Duration: {minutes} minute(s)\n{}",
+    let sufficient = tools::digest_looks_sufficient(&episode.digest);
+    let user = format!(
+        "Write a memory for this episode.\n\
+moment_id: {}\n\
+duration_minutes: {minutes}\n\
+start_ms: {}\n\
+end_ms: {}\n\
+seed_digest_sufficient: {sufficient}\n\
+seed_digest:\n{}\n\
+Start by calling get_ax_digest for this moment_id. If evidence is thin, call get_ocr. Then FINAL.",
+        episode.moment_id,
+        episode.start_ms,
+        episode.last_ms,
         episode.digest.compact_text()
     );
-    let job_id = models
-        .submit(ModelInput::Llm {
-            prompt,
-            system: Some(MEMORY_SYSTEM_PROMPT.to_owned()),
-        })
-        .await
-        .ok()?;
-    let snapshot = models.wait(&job_id).await.ok()?;
-    if snapshot.state != JobState::Done {
-        return None;
-    }
-    match snapshot.output {
-        Some(ModelOutput::Llm { text }) => {
+    let host = ToolHost { store, models };
+    match agent::run_readonly_agent(models, &host, MEMORY_SYSTEM_PROMPT, &user).await {
+        Ok(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 None
@@ -183,7 +191,7 @@ async fn summarize_episode(models: &ModelQueue, episode: &OpenEpisode) -> Option
                 Some(trimmed.to_owned())
             }
         }
-        _ => None,
+        Err(_) => None,
     }
 }
 

@@ -114,6 +114,12 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(status.activeSessionId, "s1")
     }
 
+    func testStatusDecodesWaitingBeforeFirstFrame() throws {
+        let json = #"{"daemon_version":"0.1.0","protocol_version":4,"schema_version":8,"recording_state":"waiting","active_session_id":"s1"}"#
+        let status = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.recordingState, .waiting)
+    }
+
     func testSettingsRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "settings"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -142,6 +148,47 @@ final class DaemonWireTests: XCTestCase {
         let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_bundle_ids":["com.apple.Safari"]}"#
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
         XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari"])
+        XCTAssertEqual(settings.llmProvider, .builtin)
+        XCTAssertTrue(settings.llmModel.isEmpty)
+    }
+
+    func testAppSettingsDecodesLlmFields() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"llm_provider":"ollama","llm_base_url":"http://127.0.0.1:11434","llm_model":"qwen3.6:latest","llm_api_key_set":false}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.llmProvider, .ollama)
+        XCTAssertEqual(settings.llmBaseUrl, "http://127.0.0.1:11434")
+        XCTAssertEqual(settings.llmModel, "qwen3.6:latest")
+        XCTAssertFalse(settings.llmApiKeySet)
+    }
+
+    func testUpdateSettingsRequestIncludesLlmFields() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(
+                type: "update_settings",
+                llmProvider: "ollama",
+                llmModel: "qwen3.6:latest"
+            )
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["llm_provider"] as? String, "ollama")
+        XCTAssertEqual(json["llm_model"] as? String, "qwen3.6:latest")
+    }
+
+    func testLlmProbeRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "llm_probe", provider: "ollama"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "llm_probe")
+        XCTAssertEqual(json["provider"] as? String, "ollama")
+        XCTAssertNil(json["llm_provider"])
+    }
+
+    func testLlmEndpointStatusDecodesRustShape() throws {
+        let json = #"{"reachable":true,"models":[{"id":"qwen3.6:latest","name":"qwen3.6:latest"}],"recommended_model":"qwen3.6:latest","default_base_url":"http://127.0.0.1:11434"}"#
+        let status = try JSONDecoder().decode(LlmEndpointStatus.self, from: Data(json.utf8))
+        XCTAssertTrue(status.reachable)
+        XCTAssertEqual(status.models.first?.id, "qwen3.6:latest")
+        XCTAssertEqual(status.recommendedModel, "qwen3.6:latest")
     }
 
     func testModelLibraryDecodesInstalledPack() throws {

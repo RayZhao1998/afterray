@@ -9,6 +9,7 @@ description = "Closed-GOP AV1 encoder (rav1e) emitting IVF for the AfterRay cold
 [dependencies]
 blake3.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 zune-jpeg = "0.4"
 # `asm` is allowed here even though workspace crates deny `unsafe_code`.
 rav1e = { version = "0.7.1", default-features = false, features = ["asm", "threading"] }

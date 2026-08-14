@@ -229,7 +229,7 @@ final class DaemonSupervisor {
             "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
             "AFTERRAY_LLM_MODEL": defaultModelDirectory
-                .appendingPathComponent(environment["AFTERRAY_LLM_FILE"] ?? "qwen2.5-3b-instruct-q4_k_m.gguf"),
+                .appendingPathComponent(environment["AFTERRAY_LLM_FILE"] ?? "Qwen3.6-27B-Q4_K_M.gguf"),
         ]
         for (key, url) in defaults where environment[key] == nil {
             if FileManager.default.fileExists(atPath: url.path) {

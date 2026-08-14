@@ -152,7 +152,7 @@ fn chat_messages(
 }
 
 /// Qwen `ChatML` used when the GGUF has no built-in template. Compatible with
-/// Qwen2.5-Instruct and Qwen3.8 instruct GGUFs.
+/// Qwen2.5-Instruct and Qwen3.6 instruct GGUFs.
 #[must_use]
 pub(crate) fn compose_qwen_chatml(prompt: &str, system: Option<&str>) -> String {
     let mut composed = String::new();

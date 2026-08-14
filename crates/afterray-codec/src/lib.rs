@@ -69,6 +69,13 @@ pub struct EncodedGop {
     pub frames: Vec<EncodedGopFrame>,
 }
 
+impl Drop for EncodedGop {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.ivf.zeroize();
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("closed GOP needs at least one frame")]

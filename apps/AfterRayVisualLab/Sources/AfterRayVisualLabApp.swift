@@ -17,6 +17,7 @@ struct AfterRayVisualLabApp: App {
 private enum LabSurface: String, CaseIterable, Identifiable {
     case recall
     case settings
+    case onboarding
 
     var id: String { rawValue }
 
@@ -24,18 +25,36 @@ private enum LabSurface: String, CaseIterable, Identifiable {
         switch self {
         case .recall: "Recall"
         case .settings: "Settings"
+        case .onboarding: "Welcome"
         }
+    }
+
+    static var launchArgument: LabSurface {
+        if CommandLine.arguments.contains("--onboarding") { return .onboarding }
+        if CommandLine.arguments.contains("--settings") { return .settings }
+        return .recall
     }
 }
 
 private struct VisualLabView: View {
-    @State private var surface: LabSurface = CommandLine.arguments.contains("--settings") ? .settings : .recall
+    @State private var surface: LabSurface = LabSurface.launchArgument
     @State private var settingsPage: AfterRaySettingsPage = CommandLine.arguments.contains("--models") ? .models : .general
     @State private var settingsModel = SettingsPreviewModel()
     @State private var scenario: RecallScenario = .long
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
+    /// A lab-only store so tinkering never rebinds the shipping shortcut.
+    @State private var labHotKeys: RecallHotKeyStore
+    @State private var onboardingModel: AfterRayOnboardingModel
+    @State private var labGreeting = "Good evening."
+
+    @MainActor
+    init() {
+        let hotKeys = RecallHotKeyStore(storageKey: "dev.afterray.visual-lab.hotkey")
+        _labHotKeys = State(initialValue: hotKeys)
+        _onboardingModel = State(initialValue: AfterRayOnboardingModel(hotKeys: hotKeys))
+    }
 
     private var moments: [RecallMoment] {
         scenario.moments.map { moment in
@@ -62,6 +81,8 @@ private struct VisualLabView: View {
                 recallLab
             case .settings:
                 settingsLab
+            case .onboarding:
+                onboardingLab
             }
         }
         .onChange(of: scenario) { _, newScenario in
@@ -88,6 +109,37 @@ private struct VisualLabView: View {
             tuningPanel
                 .frame(minWidth: 250, idealWidth: 280, maxWidth: 320)
         }
+    }
+
+    /// Practising the shortcut needs the real Carbon hot key, which only the
+    /// app installs — the lab exercises everything else, including recording.
+    private var onboardingLab: some View {
+        ZStack {
+            Color(red: 0.025, green: 0.022, blue: 0.026).ignoresSafeArea()
+            VStack(spacing: 18) {
+                AfterRayOnboardingView(model: onboardingModel, greeting: labGreeting) {
+                    replayOnboarding()
+                }
+                .id(ObjectIdentifier(onboardingModel))
+                .shadow(color: .black.opacity(0.5), radius: 40, y: 18)
+
+                HStack(spacing: 10) {
+                    Button("Simulate the press") { onboardingModel.registerPractice() }
+                    Picker("", selection: $labGreeting) {
+                        ForEach(Self.labGreetings, id: \.self) { Text($0).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 170)
+                    Button("Replay", action: replayOnboarding)
+                }
+            }
+        }
+    }
+
+    private static let labGreetings = ["Good morning.", "Good afternoon.", "Good evening.", "Still up?"]
+
+    private func replayOnboarding() {
+        onboardingModel = AfterRayOnboardingModel(hotKeys: labHotKeys)
     }
 
     private var settingsLab: some View {

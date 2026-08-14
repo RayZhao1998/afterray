@@ -61,6 +61,15 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var isUpdatingExclusions = false
     @Published var isClearingHistory = false
     @Published var recentJobs: [ModelJob] = []
+    @Published var llmProbe: LlmEndpointStatus?
+    @Published var isProbingLlm = false
+    @Published var isUpdatingLlm = false
+    @Published var draftLlmBaseUrl = ""
+    @Published var draftLlmModel = ""
+    @Published var draftLlmApiKey = ""
+    @Published var isInstallingCli = false
+    @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary
+    @Published private(set) var cliInstalled = AfterRayCliInstall.isInstalled
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
     var excludedBundleIds: [String] { settings?.excludedBundleIds ?? [] }
@@ -76,6 +85,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     func refresh() async {
         isRefreshing = true
         defer { isRefreshing = false }
+        refreshCliStatus()
         storage = AfterRayStorageSnapshot.measure(
             dataDirectory: URL(fileURLWithPath: settings?.dataDir ?? DaemonSupervisor.shared.dataDirectory.path, isDirectory: true),
             modelDirectory: URL(fileURLWithPath: settings?.modelDir ?? DaemonSupervisor.shared.modelDirectory.path, isDirectory: true),
@@ -90,6 +100,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             settings = loaded.0
             library = loaded.1
             recentJobs = Array(loaded.2.suffix(8).reversed())
+            applyLlmDrafts(from: loaded.0)
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
             storage = AfterRayStorageSnapshot.measure(
                 dataDirectory: URL(fileURLWithPath: loaded.0.dataDir, isDirectory: true),
@@ -97,9 +108,32 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
             )
             message = nil
+            await probeLlm()
+            await persistRecommendedOllamaModelIfNeeded()
         } catch {
             message = error.localizedDescription
         }
+    }
+
+    func installCli() async {
+        isInstallingCli = true
+        defer {
+            isInstallingCli = false
+            refreshCliStatus()
+        }
+        do {
+            let destination = try AfterRayCliInstall.install()
+            message = AfterRayCliInstall.isOnPath
+                ? "Installed afterray at \(destination.path)."
+                : "Installed afterray at \(destination.path). Add ~/.local/bin to your PATH."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func refreshCliStatus() {
+        cliStatus = AfterRayCliInstall.statusSummary
+        cliInstalled = AfterRayCliInstall.isInstalled
     }
 
     func excludeBundle(_ bundleID: String) async {
@@ -144,7 +178,14 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         do {
             settings = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
-            ).updateSettings(recordAudio: nil, excludedBundleIds: ids)
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: ids,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil
+            )
             self.message = message
         } catch {
             self.message = error.localizedDescription
@@ -159,7 +200,14 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         do {
             settings = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
-            ).updateSettings(recordAudio: enabled, excludedBundleIds: nil)
+            ).updateSettings(
+                recordAudio: enabled,
+                excludedBundleIds: nil,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil
+            )
             message = enabled
                 ? "Audio recording is on."
                 : "Audio recording is off. Existing recordings stay in your vault."
@@ -220,6 +268,124 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(AfterRayLog.diagnosticsReport(), forType: .string)
         AfterRayLog.info("diagnostics report copied")
+    }
+
+    func setLlmProvider(_ provider: LlmProvider) async {
+        guard provider != settings?.llmProvider else { return }
+        isUpdatingLlm = true
+        defer { isUpdatingLlm = false }
+        do {
+            let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            settings = try await client.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                llmProvider: provider,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil
+            )
+            applyLlmDrafts(from: settings)
+            message = assistantSourceMessage(provider)
+            await probeLlm()
+            await persistRecommendedOllamaModelIfNeeded()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func saveLlmConnection() async {
+        isUpdatingLlm = true
+        defer { isUpdatingLlm = false }
+        do {
+            let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            let key = draftLlmApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            settings = try await client.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                llmProvider: settings?.llmProvider,
+                llmBaseUrl: draftLlmBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines),
+                llmModel: draftLlmModel.trimmingCharacters(in: .whitespacesAndNewlines),
+                llmApiKey: key.isEmpty ? nil : key
+            )
+            draftLlmApiKey = ""
+            applyLlmDrafts(from: settings)
+            message = "Assistant connection saved."
+            await probeLlm()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func probeLlm() async {
+        let provider = settings?.llmProvider ?? .builtin
+        guard provider != .builtin else {
+            llmProbe = nil
+            return
+        }
+        isProbingLlm = true
+        defer { isProbingLlm = false }
+        do {
+            let probed = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).probeLlm(
+                provider: provider,
+                baseUrl: draftLlmBaseUrl.isEmpty ? nil : draftLlmBaseUrl
+            )
+            llmProbe = probed
+            if draftLlmModel.isEmpty, let recommended = probed.recommendedModel {
+                draftLlmModel = recommended
+            }
+        } catch {
+            llmProbe = LlmEndpointStatus(
+                reachable: false,
+                error: error.localizedDescription,
+                defaultBaseUrl: draftLlmBaseUrl.isEmpty ? "http://127.0.0.1:11434" : draftLlmBaseUrl
+            )
+        }
+    }
+
+    private func applyLlmDrafts(from settings: AppSettings?) {
+        guard let settings else { return }
+        draftLlmBaseUrl = settings.llmBaseUrl
+        draftLlmModel = settings.llmModel
+    }
+
+    /// Probe fills the draft picker before we persist. Persist the recommended
+    /// Ollama model whenever Settings still has an empty `llm_model`.
+    private func persistRecommendedOllamaModelIfNeeded() async {
+        guard settings?.llmProvider == .ollama else { return }
+        let saved = settings?.llmModel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard saved.isEmpty else { return }
+        let chosen = [draftLlmModel, llmProbe?.recommendedModel ?? ""]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        guard !chosen.isEmpty else { return }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: chosen,
+                llmApiKey: nil
+            )
+            applyLlmDrafts(from: settings)
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func assistantSourceMessage(_ provider: LlmProvider) -> String {
+        switch provider {
+        case .builtin:
+            "Ask will use the on-device pack when it is installed."
+        case .ollama:
+            "Ask will use a local Ollama model."
+        case .openaiCompatible:
+            "Ask will use the OpenAI-compatible endpoint you configure."
+        }
     }
 
     private func displayName(for packID: String?) -> String {

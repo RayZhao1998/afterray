@@ -20,6 +20,16 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertEqual(commands, ["start", "stop"])
     }
 
+    func testWaitingIsNotRecordingButSessionIsActive() async {
+        let daemon = ControlDaemon()
+        await daemon.setRecordingState(.waiting)
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+        XCTAssertFalse(model.isRecording)
+        XCTAssertTrue(model.isWaitingToRecord)
+        XCTAssertTrue(model.isCaptureSessionActive)
+    }
+
     func testSearchTrimsQueryAndReturnsTypedHits() async {
         let daemon = ControlDaemon()
         let model = AfterRayControlModel(daemon: daemon)
@@ -132,13 +142,17 @@ private actor ControlDaemon: AfterRayDaemonServing {
         askShouldFail = value
     }
 
+    func setRecordingState(_ value: DaemonRecordingState) {
+        recordingState = value
+    }
+
     func status() async throws -> DaemonStatus {
         DaemonStatus(
             daemonVersion: "0.1.0",
             protocolVersion: 1,
             schemaVersion: 1,
             recordingState: recordingState,
-            activeSessionId: recordingState == .recording ? "s1" : nil
+            activeSessionId: recordingState == .idle || recordingState == .failed ? nil : "s1"
         )
     }
 
@@ -171,13 +185,27 @@ private actor ControlDaemon: AfterRayDaemonServing {
         )
     }
 
-    func updateSettings(recordAudio: Bool?, excludedBundleIds _: [String]?) async throws -> AppSettings {
+    func updateSettings(
+        recordAudio: Bool?,
+        excludedBundleIds _: [String]?,
+        llmProvider: LlmProvider?,
+        llmBaseUrl: String?,
+        llmModel: String?,
+        llmApiKey _: String?
+    ) async throws -> AppSettings {
         AppSettings(
             dataDir: "/tmp/afterray-data",
             modelDir: "/tmp/afterray-models",
             recordAudio: recordAudio ?? true,
-            captureIntervalSeconds: 10
+            captureIntervalSeconds: 10,
+            llmProvider: llmProvider ?? .builtin,
+            llmBaseUrl: llmBaseUrl ?? "",
+            llmModel: llmModel ?? ""
         )
+    }
+
+    func probeLlm(provider _: LlmProvider?, baseUrl _: String?) async throws -> LlmEndpointStatus {
+        LlmEndpointStatus(reachable: false)
     }
 
     func clearHistory(scope _: HistoryScope) async throws -> HistoryClearResult {

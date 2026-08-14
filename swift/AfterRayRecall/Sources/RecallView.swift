@@ -28,6 +28,8 @@ public struct RecallView: View {
     @State private var showsDetails = false
     @State private var detailsPage = RecallDetailsPage.root
     @State private var timelineViewportWidth: CGFloat = 720
+    @State private var timelineZoom: CGFloat = 1
+    @State private var isZoomingTimeline = false
 
     public init(
         moments: [RecallMoment],
@@ -78,7 +80,7 @@ public struct RecallView: View {
         TimelineLayout(
             moments: moments,
             viewportWidth: max(timelineViewportWidth, 1),
-            density: tuning.timelineDensity
+            density: tuning.timelineDensity * Double(timelineZoom)
         )
     }
 
@@ -151,6 +153,8 @@ public struct RecallView: View {
                     isLive: isLive,
                     selectedMoment: selectedMoment,
                     tuning: tuning,
+                    zoom: $timelineZoom,
+                    isZooming: $isZoomingTimeline,
                     onSelectMs: { selectPlayhead(playheadMs: $0) },
                     onViewportWidthChange: { timelineViewportWidth = $0 }
                 )
@@ -184,6 +188,9 @@ public struct RecallView: View {
         }
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
+        .onChange(of: isZoomingTimeline) { _, zooming in
+            if zooming { dragOrigin = nil }
+        }
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
             guard !isLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
@@ -242,14 +249,6 @@ public struct RecallView: View {
             RecallGlassCluster {
                 HStack(spacing: RecallGeometry.overlayChromeItemGap) {
                     RecallChromeIconButton(
-                        symbol: selectedMoment?.isFavorite == true ? "star.fill" : "star",
-                        help: selectedMoment?.isFavorite == true ? "Remove favorite" : "Keep this moment",
-                        tint: selectedMoment?.isFavorite == true ? RecallPalette.ray : .white,
-                        action: { onToggleFavorite?() }
-                    )
-                    .disabled(selectedMoment == nil || onToggleFavorite == nil)
-
-                    RecallChromeIconButton(
                         symbol: showsDetails ? "sidebar.right" : "info.circle",
                         help: showsDetails ? "Hide captured context" : "Show captured context",
                         action: {
@@ -277,6 +276,10 @@ public struct RecallView: View {
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
+                if isZoomingTimeline {
+                    dragOrigin = nil
+                    return
+                }
                 if dragOrigin == nil {
                     dragOrigin = (playheadMs, isLive)
                 }
@@ -719,12 +722,21 @@ private struct AppUsageTimeline: View {
     let isLive: Bool
     let selectedMoment: RecallMoment?
     let tuning: RecallVisualTuning
+    @Binding var zoom: CGFloat
+    @Binding var isZooming: Bool
     let onSelectMs: (Int64) -> Void
     let onViewportWidthChange: (CGFloat) -> Void
 
     var body: some View {
         VStack(spacing: 9) {
             timestamp
+
+            HStack(spacing: 0) {
+                TimelineZoomStrip(zoom: $zoom, isDragging: $isZooming)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+
             GeometryReader { geometry in
                 let width = geometry.size.width
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
@@ -750,10 +762,11 @@ private struct AppUsageTimeline: View {
             .frame(maxWidth: .infinity)
             .frame(height: tuning.timelineSegmentHeight + 20)
             .contentShape(Rectangle())
+            .allowsHitTesting(!isZooming)
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
-                Text("Swipe or scroll to travel · Esc to close · ⌘⇧Space to return")
+                Text("Drag to zoom · Swipe to travel · Esc to close")
             }
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
@@ -835,6 +848,81 @@ private struct AppUsageTimeline: View {
         }
         .frame(width: layout.contentWidth, height: 56)
         .padding(.vertical, 6)
+    }
+}
+
+private struct TimelineZoomStrip: View {
+    @Binding var zoom: CGFloat
+    @Binding var isDragging: Bool
+    @State private var dragOrigin: CGFloat?
+
+    private static let range: ClosedRange<CGFloat> = 0.4...5
+    private static let trackWidth: CGFloat = 148
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "minus.magnifyingglass")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.5))
+                .onTapGesture { step(0.8) }
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: Self.trackWidth, height: 5)
+                Capsule()
+                    .fill(RecallPalette.ray.opacity(0.85))
+                    .frame(width: max(thumbX, 6), height: 5)
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 11, height: 11)
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                    .offset(x: thumbX - 5.5)
+            }
+            .frame(width: Self.trackWidth, height: 18)
+            .contentShape(Rectangle())
+
+            Image(systemName: "plus.magnifyingglass")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.5))
+                .onTapGesture { step(1.25) }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .recallGlass(in: .capsule)
+        .help("Drag left to zoom out, right to zoom in")
+        .highPriorityGesture(drag)
+    }
+
+    private var thumbX: CGFloat {
+        let lower = log(Self.range.lowerBound)
+        let span = log(Self.range.upperBound) - lower
+        let t = (log(min(max(zoom, Self.range.lowerBound), Self.range.upperBound)) - lower) / span
+        return t * Self.trackWidth
+    }
+
+    private var drag: some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if !isDragging { isDragging = true }
+                if dragOrigin == nil { dragOrigin = zoom }
+                guard let origin = dragOrigin else { return }
+                zoom = Self.clamped(origin * exp(value.translation.width / 130))
+            }
+            .onEnded { _ in
+                dragOrigin = nil
+                isDragging = false
+            }
+    }
+
+    private func step(_ factor: CGFloat) {
+        withAnimation(.easeOut(duration: 0.14)) {
+            zoom = Self.clamped(zoom * factor)
+        }
+    }
+
+    private static func clamped(_ value: CGFloat) -> CGFloat {
+        min(max(value, range.lowerBound), range.upperBound)
     }
 }
 

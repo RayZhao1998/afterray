@@ -1,20 +1,23 @@
+mod agent;
 mod ask;
 mod gop_packer;
 mod memory;
+mod tools;
 
 use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_models::{
-    JobState, ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, ProcessAdapter,
-    ProcessAdapterConfig, QueueConfig, download_packs, library, model_directory,
-    specs_for_download,
+    JobState, LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput,
+    ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig, download_packs,
+    library, model_directory, probe_llm, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
     apply_background_qos,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, HistoryScope, ModelDownloadProgress, PROTOCOL_VERSION,
-    PackStatus, RecordingState, Request, Response, SearchHit, Status, local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, HistoryScope, LlmProvider, ModelDownloadProgress,
+    PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit, Status,
+    local_calendar_day_bounds_ms,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
@@ -79,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
     let persisted = load_persisted_settings(&vault_config.data_dir);
+    let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
     let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
@@ -102,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         PathBuf::from,
     );
     let models = ModelQueue::new(
-        local_model_adapters(native_worker_path, worker_path),
+        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config)),
         QueueConfig::default(),
     )?;
 
@@ -134,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
+        llm_config,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -205,24 +210,34 @@ async fn shutdown_signal() {
 fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
+    llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
 ) -> Vec<Arc<dyn ModelAdapter>> {
-    [
-        (ModelCapability::Ocr, native_worker, "vision-ocr"),
-        (ModelCapability::Asr, general_worker.clone(), "qwen3-asr"),
-        (
-            ModelCapability::Embedding,
+    let llm = Arc::new(LlmRouterAdapter::new(
+        ProcessAdapter::new(ProcessAdapterConfig::new(
+            "llama-llm",
+            ModelCapability::Llm,
             general_worker.clone(),
-            "llama-embedding",
-        ),
-        (ModelCapability::Llm, general_worker, "llama-llm"),
-    ]
-    .into_iter()
-    .map(|(capability, program, name)| {
+        )),
+        llm_config,
+    ));
+    vec![
         Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            name, capability, program,
-        ))) as Arc<dyn ModelAdapter>
-    })
-    .collect()
+            "vision-ocr",
+            ModelCapability::Ocr,
+            native_worker,
+        ))) as Arc<dyn ModelAdapter>,
+        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+            "qwen3-asr",
+            ModelCapability::Asr,
+            general_worker.clone(),
+        ))),
+        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+            "llama-embedding",
+            ModelCapability::Embedding,
+            general_worker,
+        ))),
+        llm,
+    ]
 }
 
 struct AppState {
@@ -240,6 +255,7 @@ struct AppState {
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
+    llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -248,6 +264,14 @@ struct PersistedSettings {
     record_audio: bool,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
+    #[serde(default)]
+    llm_provider: LlmProvider,
+    #[serde(default)]
+    llm_base_url: String,
+    #[serde(default)]
+    llm_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    llm_api_key: String,
 }
 
 const fn default_record_audio() -> bool {
@@ -259,6 +283,10 @@ impl Default for PersistedSettings {
         Self {
             record_audio: true,
             excluded_bundle_ids: Vec::new(),
+            llm_provider: LlmProvider::Builtin,
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
         }
     }
 }
@@ -388,12 +416,38 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
-        Request::Search { query, limit } => {
+        Request::Search {
+            query,
+            limit,
+            from_ms,
+            to_ms,
+        } => {
             match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
-                Ok(hits) => Response::success(hits),
+                Ok(mut hits) => {
+                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+                    }
+                    Response::success(hits)
+                }
                 Err(error) => Response::failure(error.to_string()),
             }
         }
+        Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
+            Ok(moment) => Response::success(moment),
+            Err(error) => Response::failure(error),
+        },
+        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
+            Ok(evidence) => Response::success(evidence),
+            Err(error) => Response::failure(error),
+        },
+        Request::EvidenceAx {
+            moment_id,
+            digest_only,
+        } => match tools::ax_evidence(&state.store, &moment_id, digest_only) {
+            Ok(evidence) => Response::success(evidence),
+            Err(error) => Response::failure(error),
+        },
         Request::ActivitySpans {
             from_ms,
             to_ms,
@@ -415,7 +469,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
         } => {
-            let llm_present = ask::llm_pack_present(&model_library(state));
+            let llm_ready = ensure_remote_llm_model(state).await;
             ask::handle_ask(
                 &state.store,
                 &state.models,
@@ -423,7 +477,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 from_ms,
                 to_ms,
                 now_ms(),
-                llm_present,
+                llm_ready,
             )
             .await
         }
@@ -431,7 +485,47 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::UpdateSettings {
             record_audio,
             excluded_bundle_ids,
-        } => update_settings(state, record_audio, excluded_bundle_ids).await,
+            llm_provider,
+            llm_base_url,
+            llm_model,
+            llm_api_key,
+        } => {
+            update_settings(
+                state,
+                record_audio,
+                excluded_bundle_ids,
+                llm_provider,
+                llm_base_url,
+                llm_model,
+                llm_api_key,
+            )
+            .await
+        }
+        Request::LlmProbe {
+            provider,
+            base_url,
+        } => {
+            let config = current_llm_config(state);
+            let provider = provider.unwrap_or(config.provider);
+            let base_url = base_url
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    let resolved = config.resolved_base_url();
+                    if resolved.is_empty() {
+                        None
+                    } else {
+                        Some(resolved)
+                    }
+                });
+            Response::success(
+                probe_llm(
+                    provider,
+                    base_url.as_deref(),
+                    config.api_key.as_deref(),
+                )
+                .await,
+            )
+        }
         Request::ClearHistory { scope } => clear_history(state, scope).await,
         Request::MemoriesList {
             from_ms,
@@ -593,7 +687,58 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
     start_capture_runtime(state, session_id).await
 }
 
+fn current_llm_config(state: &AppState) -> LlmRuntimeConfig {
+    state
+        .llm_config
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn llm_is_ready(state: &AppState) -> bool {
+    ask::llm_ready(&model_library(state), &current_llm_config(state))
+}
+
+/// Ollama Settings can leave `llm_model` empty after a probe fills only the UI
+/// draft. Resolve a recommended chat model and persist it so Ask can run.
+async fn ensure_remote_llm_model(state: &AppState) -> bool {
+    let config = current_llm_config(state);
+    if ask::llm_ready(&model_library(state), &config) {
+        return true;
+    }
+    if config.provider != LlmProvider::Ollama || !config.chat_model().is_empty() {
+        return false;
+    }
+    let origin = config.resolved_base_url();
+    let probe = probe_llm(
+        config.provider,
+        Some(origin.as_str()).filter(|value| !value.is_empty()),
+        config.api_key.as_deref(),
+    )
+    .await;
+    let Some(model) = probe
+        .recommended_model
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+    {
+        let mut llm = state
+            .llm_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if llm.model.trim().is_empty() {
+            llm.model = model;
+        }
+    }
+    if let Err(error) = persist_current_settings(state) {
+        eprintln!("could not persist discovered Ollama model: {error}");
+    }
+    llm_is_ready(state)
+}
+
 fn current_settings(state: &AppState) -> AppSettings {
+    let llm = current_llm_config(state);
     AppSettings {
         data_dir: state.data_dir.display().to_string(),
         model_dir: model_directory().display().to_string(),
@@ -604,10 +749,18 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        llm_provider: llm.provider,
+        llm_base_url: llm.base_url,
+        llm_model: llm.model,
+        llm_api_key_set: llm
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
     }
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
+    let llm = current_llm_config(state);
     save_persisted_settings(
         &state.data_dir,
         &PersistedSettings {
@@ -617,6 +770,10 @@ fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
                 .lock()
                 .map(|ids| ids.clone())
                 .unwrap_or_default(),
+            llm_provider: llm.provider,
+            llm_base_url: llm.base_url,
+            llm_model: llm.model,
+            llm_api_key: llm.api_key.unwrap_or_default(),
         },
     )
 }
@@ -625,6 +782,10 @@ async fn update_settings(
     state: &Arc<AppState>,
     record_audio: Option<bool>,
     excluded_bundle_ids: Option<Vec<String>>,
+    llm_provider: Option<LlmProvider>,
+    llm_base_url: Option<String>,
+    llm_model: Option<String>,
+    llm_api_key: Option<String>,
 ) -> Response {
     if let Some(enabled) = record_audio {
         let previous = state.capture.record_audio();
@@ -654,7 +815,67 @@ async fn update_settings(
             return Response::failure(format!("could not save settings: {error}"));
         }
     }
+    if llm_provider.is_some()
+        || llm_base_url.is_some()
+        || llm_model.is_some()
+        || llm_api_key.is_some()
+    {
+        {
+            let mut llm = state
+                .llm_config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(provider) = llm_provider {
+                llm.provider = provider;
+            }
+            if let Some(base_url) = llm_base_url {
+                llm.base_url = base_url.trim().to_owned();
+            }
+            if let Some(model) = llm_model {
+                llm.model = model.trim().to_owned();
+            }
+            if let Some(api_key) = llm_api_key {
+                let trimmed = api_key.trim();
+                llm.api_key = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+            }
+        }
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save assistant settings: {error}"));
+        }
+    }
     Response::success(current_settings(state))
+}
+
+fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
+    LlmRuntimeConfig {
+        provider: std::env::var("AFTERRAY_LLM_PROVIDER")
+            .ok()
+            .as_deref()
+            .and_then(LlmProvider::parse)
+            .unwrap_or(persisted.llm_provider),
+        base_url: env_nonempty("AFTERRAY_LLM_BASE_URL")
+            .unwrap_or_else(|| persisted.llm_base_url.clone()),
+        model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL").unwrap_or_else(|| persisted.llm_model.clone()),
+        api_key: env_nonempty("AFTERRAY_LLM_API_KEY").or_else(|| {
+            let key = persisted.llm_api_key.trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some(key.to_owned())
+            }
+        }),
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_bundle_ids(ids: Vec<String>) -> Vec<String> {
@@ -690,7 +911,7 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         &state.store,
         &state.models,
         &state.memories,
-        ask::llm_pack_present(&model_library(state)),
+        llm_is_ready(state),
     )
     .await;
     match state.store.delete_history(from_ms, to_ms) {
@@ -724,8 +945,7 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    let llm_present = ask::llm_pack_present(&model_library(state));
-    memory::flush(&state.store, &state.models, &state.memories, llm_present).await;
+    memory::flush(&state.store, &state.models, &state.memories, llm_is_ready(state)).await;
     let _ = state
         .store
         .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
@@ -978,7 +1198,7 @@ async fn import_artifact(
                         started_at_ms,
                         &moment_id,
                         &bytes,
-                        ask::llm_pack_present(&model_library(state)),
+                        llm_is_ready(state),
                     )
                     .await;
                 }

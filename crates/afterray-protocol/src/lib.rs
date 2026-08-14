@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingState {
     Idle,
+    Waiting,
     Recording,
     Stopping,
     Failed,
@@ -58,6 +59,22 @@ pub enum Request {
     Search {
         query: String,
         limit: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_ms: Option<i64>,
+    },
+    MomentGet {
+        moment_id: String,
+    },
+    EvidenceOcr {
+        moment_id: String,
+    },
+    EvidenceAx {
+        moment_id: String,
+        /// When true (default), return only the accessibility digest, not the full tree.
+        #[serde(default = "default_true")]
+        digest_only: bool,
     },
     ActivitySpans {
         from_ms: i64,
@@ -86,6 +103,20 @@ pub enum Request {
         record_audio: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_provider: Option<LlmProvider>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_api_key: Option<String>,
+    },
+    LlmProbe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<LlmProvider>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
     },
     ClearHistory {
         scope: HistoryScope,
@@ -177,6 +208,53 @@ pub struct Status {
     pub active_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    #[default]
+    Builtin,
+    Ollama,
+    OpenaiCompatible,
+}
+
+impl LlmProvider {
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Ollama => "ollama",
+            Self::OpenaiCompatible => "openai_compatible",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "builtin" | "built_in" | "local" => Some(Self::Builtin),
+            "ollama" => Some(Self::Ollama),
+            "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenaiCompatible),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmRemoteModel {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmEndpointStatus {
+    pub reachable: bool,
+    pub models: Vec<LlmRemoteModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub default_base_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     pub data_dir: String,
@@ -185,6 +263,14 @@ pub struct AppSettings {
     pub capture_interval_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
+    #[serde(default)]
+    pub llm_provider: LlmProvider,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub llm_base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub llm_model: String,
+    #[serde(default)]
+    pub llm_api_key_set: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +346,39 @@ fn default_still_origin() -> String {
 
 fn default_activity_spans_limit() -> usize {
     100
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// OCR text for a moment, optionally with Vision-normalized regions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrEvidence {
+    pub moment_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<OcrRegion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrRegion {
+    pub text: String,
+    pub confidence: f32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Accessibility digest and optional full tree JSON for a moment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxEvidence {
+    pub moment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_json: Option<String>,
 }
 
 /// Consecutive moments that share an app identity and the same URL, document,
@@ -507,10 +626,34 @@ mod tests {
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: Some(false),
                 excluded_bundle_ids: None,
+                llm_provider: None,
+                llm_base_url: None,
+                llm_model: None,
+                llm_api_key: None,
             })
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
         );
+        assert_eq!(
+            serde_json::to_string(&Request::LlmProbe {
+                provider: Some(LlmProvider::Ollama),
+                base_url: None,
+            })
+            .unwrap(),
+            r#"{"type":"llm_probe","provider":"ollama"}"#
+        );
+    }
+
+    #[test]
+    fn app_settings_decode_defaults_llm_fields() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.llm_provider, LlmProvider::Builtin);
+        assert!(settings.llm_base_url.is_empty());
+        assert!(settings.llm_model.is_empty());
+        assert!(!settings.llm_api_key_set);
     }
 
     #[test]

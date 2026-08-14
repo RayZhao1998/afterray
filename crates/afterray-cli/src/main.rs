@@ -35,6 +35,10 @@ enum Command {
     Moments {
         session_id: String,
     },
+    /// Fetch one moment by id (agent-friendly).
+    Moment {
+        moment_id: String,
+    },
     Timeline {
         #[arg(long)]
         since_ms: Option<i64>,
@@ -43,6 +47,15 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long = "from-ms")]
+        from_ms: Option<i64>,
+        #[arg(long = "to-ms")]
+        to_ms: Option<i64>,
+    },
+    /// Read OCR / accessibility evidence for a moment.
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
     },
     Activity {
         #[arg(long)]
@@ -133,6 +146,19 @@ enum PackCommand {
 }
 
 #[derive(Subcommand)]
+enum EvidenceCommand {
+    /// OCR text and bounding boxes for a moment.
+    Ocr { moment_id: String },
+    /// Accessibility digest (default) or full tree JSON.
+    Ax {
+        moment_id: String,
+        /// Include the full accessibility tree JSON (large).
+        #[arg(long)]
+        full: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum HistoryCommand {
     Clear {
         #[arg(long, value_enum)]
@@ -202,11 +228,31 @@ async fn request_from_command(
             command: SessionsCommand::List,
         } => Request::SessionsList,
         Command::Moments { session_id } => Request::MomentsList { session_id },
+        Command::Moment { moment_id } => Request::MomentGet { moment_id },
         Command::Timeline { since_ms: None } => Request::TimelineList,
         Command::Timeline {
             since_ms: Some(since_ms),
         } => Request::TimelineSince { since_ms },
-        Command::Search { query, limit } => Request::Search { query, limit },
+        Command::Search {
+            query,
+            limit,
+            from_ms,
+            to_ms,
+        } => Request::Search {
+            query,
+            limit,
+            from_ms,
+            to_ms,
+        },
+        Command::Evidence {
+            command: EvidenceCommand::Ocr { moment_id },
+        } => Request::EvidenceOcr { moment_id },
+        Command::Evidence {
+            command: EvidenceCommand::Ax { moment_id, full },
+        } => Request::EvidenceAx {
+            moment_id,
+            digest_only: !full,
+        },
         Command::Activity {
             from_ms,
             to_ms,

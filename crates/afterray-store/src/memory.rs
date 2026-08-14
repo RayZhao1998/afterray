@@ -134,7 +134,9 @@ pub fn parse_accessibility_digest(snapshot: &[u8]) -> AccessibilityDigest {
             document: nonempty(header.document).or(digest.document),
             focused_role: digest.focused_role,
             focused_title: digest.focused_title,
-            focused_value: digest.focused_value.map(|value| clip(&value, FOCUSED_VALUE_CHARS)),
+            focused_value: digest
+                .focused_value
+                .map(|value| clip(&value, FOCUSED_VALUE_CHARS)),
             selected_text: digest.selected_text,
             headings: digest.headings,
             visible_text: digest.visible_text,
@@ -218,7 +220,8 @@ fn fill_digest(digest: &mut AccessibilityDigest, node: &SnapshotNode) {
     if node.focused == Some(true) && digest.focused_role.is_none() {
         digest.focused_role = nonempty(node.role.clone());
         digest.focused_title = nonempty(node.title.clone());
-        digest.focused_value = nonempty(node.value.clone()).map(|value| clip(&value, FOCUSED_VALUE_CHARS));
+        digest.focused_value =
+            nonempty(node.value.clone()).map(|value| clip(&value, FOCUSED_VALUE_CHARS));
     }
     let role = node.role.as_deref().unwrap_or("");
     let subrole = node.subrole.as_deref().unwrap_or("");
@@ -228,10 +231,16 @@ fn fill_digest(digest: &mut AccessibilityDigest, node: &SnapshotNode) {
     {
         push_unique(&mut digest.headings, title, 8);
     }
-    if matches!(role, "AXStaticText" | "AXTextField" | "AXTextArea" | "AXLink")
-        && let Some(text) = first_text(node)
+    if matches!(
+        role,
+        "AXStaticText" | "AXTextField" | "AXTextArea" | "AXLink"
+    ) && let Some(text) = first_text(node)
     {
-        push_unique(&mut digest.visible_text, clip(&text, VISIBLE_TEXT_CHARS), VISIBLE_TEXT_LIMIT);
+        push_unique(
+            &mut digest.visible_text,
+            clip(&text, VISIBLE_TEXT_CHARS),
+            VISIBLE_TEXT_LIMIT,
+        );
     }
     for child in &node.children {
         if digest.visible_text.len() >= VISIBLE_TEXT_LIMIT && digest.focused_role.is_some() {
@@ -268,7 +277,13 @@ fn clip(value: &str, max_chars: usize) -> String {
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_owned();
     }
-    format!("{}…", trimmed.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        trimmed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
 }
 
 #[cfg(test)]
@@ -314,11 +329,13 @@ mod tests {
         let digest = parse_accessibility_digest(snapshot);
         assert_eq!(digest.focused_role.as_deref(), Some("AXTextArea"));
         assert_eq!(digest.focused_value.as_deref(), Some("fn main() {}"));
-        assert!(digest.visible_text.iter().any(|text| text == "Package.swift"));
-        assert_eq!(
-            digest_fingerprint(&digest),
-            digest_fingerprint(&digest)
+        assert!(
+            digest
+                .visible_text
+                .iter()
+                .any(|text| text == "Package.swift")
         );
+        assert_eq!(digest_fingerprint(&digest), digest_fingerprint(&digest));
     }
 
     #[test]

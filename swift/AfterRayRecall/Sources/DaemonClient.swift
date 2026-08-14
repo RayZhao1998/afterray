@@ -50,7 +50,15 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
-    func updateSettings(recordAudio: Bool?, excludedBundleIds: [String]?) async throws -> AppSettings
+    func updateSettings(
+        recordAudio: Bool?,
+        excludedBundleIds: [String]?,
+        llmProvider: LlmProvider?,
+        llmBaseUrl: String?,
+        llmModel: String?,
+        llmApiKey: String?
+    ) async throws -> AppSettings
+    func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
     func downloadModels(packID: String?) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
     func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
@@ -58,12 +66,19 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
 
 public extension AfterRayDaemonServing {
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
-        try await updateSettings(recordAudio: recordAudio, excludedBundleIds: nil)
+        try await updateSettings(
+            recordAudio: recordAudio,
+            excludedBundleIds: nil,
+            llmProvider: nil,
+            llmBaseUrl: nil,
+            llmModel: nil,
+            llmApiKey: nil
+        )
     }
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 3
+    public static let protocolVersion = 5
     public let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -113,15 +128,30 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func updateSettings(
         recordAudio: Bool?,
-        excludedBundleIds: [String]?
+        excludedBundleIds: [String]?,
+        llmProvider: LlmProvider? = nil,
+        llmBaseUrl: String? = nil,
+        llmModel: String? = nil,
+        llmApiKey: String? = nil
     ) async throws -> AppSettings {
         try await request(
             WireRequest(
                 type: "update_settings",
                 recordAudio: recordAudio,
-                excludedBundleIds: excludedBundleIds
+                excludedBundleIds: excludedBundleIds,
+                llmProvider: llmProvider?.rawValue,
+                llmBaseUrl: llmBaseUrl,
+                llmModel: llmModel,
+                llmApiKey: llmApiKey
             ),
             as: AppSettings.self
+        )
+    }
+
+    public func probeLlm(provider: LlmProvider? = nil, baseUrl: String? = nil) async throws -> LlmEndpointStatus {
+        try await request(
+            WireRequest(type: "llm_probe", provider: provider?.rawValue, baseUrl: baseUrl),
+            as: LlmEndpointStatus.self
         )
     }
 
@@ -256,6 +286,12 @@ struct WireRequest: Encodable, Equatable {
     var gopMode: String?
     var excludedBundleIds: [String]?
     var historyScope: String?
+    var llmProvider: String?
+    var llmBaseUrl: String?
+    var llmModel: String?
+    var llmApiKey: String?
+    var provider: String?
+    var baseUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -278,6 +314,12 @@ struct WireRequest: Encodable, Equatable {
         case gopMode = "mode"
         case excludedBundleIds = "excluded_bundle_ids"
         case historyScope = "scope"
+        case llmProvider = "llm_provider"
+        case llmBaseUrl = "llm_base_url"
+        case llmModel = "llm_model"
+        case llmApiKey = "llm_api_key"
+        case provider
+        case baseUrl = "base_url"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -302,6 +344,12 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(gopMode, forKey: .gopMode)
         try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
         try container.encodeIfPresent(historyScope, forKey: .historyScope)
+        try container.encodeIfPresent(llmProvider, forKey: .llmProvider)
+        try container.encodeIfPresent(llmBaseUrl, forKey: .llmBaseUrl)
+        try container.encodeIfPresent(llmModel, forKey: .llmModel)
+        try container.encodeIfPresent(llmApiKey, forKey: .llmApiKey)
+        try container.encodeIfPresent(provider, forKey: .provider)
+        try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
     }
 }
 

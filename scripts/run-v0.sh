@@ -150,6 +150,7 @@ cp "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
 cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
 cp "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
+cp "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
@@ -162,6 +163,7 @@ if [[ "$codesign_identity" == '-' ]]; then
 fi
 printf '==> Signing with: %s\n' "$codesign_identity"
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-model-worker" >/dev/null
@@ -221,6 +223,9 @@ else
 fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
 export AFTERRAY_NATIVE_MODEL_WORKER="$native_model_worker"
+export AFTERRAY_GOP_ARCHIVE="${AFTERRAY_GOP_ARCHIVE:-1}"
+export AFTERRAY_GOP_REQUIRE_AC="${AFTERRAY_GOP_REQUIRE_AC:-0}"
+export AFTERRAY_GOP_KEYINT="${AFTERRAY_GOP_KEYINT:-12}"
 mkdir -p "$AFTERRAY_DATA_DIR"
 default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B"
 if [[ -z "${AFTERRAY_ASR_MODEL:-}" && -d "$default_asr_model" ]]; then
@@ -230,7 +235,7 @@ default_embedding_model="$repo_root/.afterray/models/nomic-embed-text-v1.5.Q4_K_
 if [[ -z "${AFTERRAY_EMBEDDING_MODEL:-}" && -f "$default_embedding_model" ]]; then
   export AFTERRAY_EMBEDDING_MODEL="$default_embedding_model"
 fi
-default_llm_model="$repo_root/.afterray/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+default_llm_model="$repo_root/.afterray/models/Qwen3.6-27B-Q4_K_M.gguf"
 if [[ -z "${AFTERRAY_LLM_MODEL:-}" && -f "$default_llm_model" ]]; then
   export AFTERRAY_LLM_MODEL="$default_llm_model"
 fi

@@ -70,6 +70,19 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 
+    func testHigherDensityWidensALongTimeline() {
+        let moments = evenlySpacedMoments(count: 720)
+        let compact = TimelineLayout(moments: moments, viewportWidth: 720, density: 0.12)
+        let zoomed = TimelineLayout(moments: moments, viewportWidth: 720, density: 0.36)
+        XCTAssertGreaterThan(zoomed.contentWidth, compact.contentWidth)
+    }
+
+    func testZoomCanWidenPastTheOldNineThousandPointCap() {
+        let moments = evenlySpacedMoments(count: 200)
+        let zoomed = TimelineLayout(moments: moments, viewportWidth: 720, density: 5.0)
+        XCTAssertGreaterThan(zoomed.contentWidth, 9_000)
+    }
+
     func testApplicationNameChangeSplitsRunsWithoutChangingCountOrEndpoints() {
         let first = moment(id: "a", at: 0, app: "Safari", bundle: "safari")
         let middle = moment(id: "b", at: 10_000, app: "Safari", bundle: "safari")
@@ -258,6 +271,17 @@ final class TimelineLayoutTests: XCTestCase {
             moments: moments
         )
         XCTAssertTrue(toLive.isLive)
+    }
+
+    private func evenlySpacedMoments(count: Int) -> [RecallMoment] {
+        (0..<count).map { index in
+            moment(
+                id: "m\(index)",
+                at: Int64(index) * 10_000,
+                app: "Lody",
+                bundle: "lody"
+            )
+        }
     }
 
     private func clusteredShortSwitchesThenLongRun() -> [RecallMoment] {

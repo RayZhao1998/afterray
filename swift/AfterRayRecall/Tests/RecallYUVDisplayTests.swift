@@ -27,6 +27,16 @@ final class RecallYUVDisplayTests: XCTestCase {
     func testIVFHeaderDoesNotFallThroughToImageIO() {
         let ivf = Data([0x44, 0x4B, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00])
         XCTAssertTrue(RecallFrameDecoder.isIVF(ivf))
+        XCTAssertFalse(RecallFrameDecoder.isJPEG(ivf))
+        XCTAssertNil(RecallFrameDecoder.decode(ivf))
+    }
+
+    func testCorruptIVFDoesNotFallThroughToImageIO() {
+        var ivf = Data("DKIF".utf8)
+        ivf.append(contentsOf: [0, 0, 32, 0])
+        ivf.append(Data(repeating: 0, count: 24))
+        ivf.append(contentsOf: [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xD8, 0xFF, 0x00])
+        XCTAssertTrue(RecallFrameDecoder.isIVF(ivf))
         XCTAssertNil(RecallFrameDecoder.decode(ivf))
     }
 

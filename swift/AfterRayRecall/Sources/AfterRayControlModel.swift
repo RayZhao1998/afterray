@@ -21,6 +21,13 @@ public final class AfterRayControlModel: ObservableObject {
     }
 
     public var isRecording: Bool { status?.recordingState == .recording }
+    public var isWaitingToRecord: Bool { status?.recordingState == .waiting }
+    public var isCaptureSessionActive: Bool {
+        switch status?.recordingState {
+        case .waiting, .recording, .stopping: return true
+        default: return false
+        }
+    }
     public var canToggleRecording: Bool {
         !isChangingRecording && status?.recordingState != .stopping
     }
@@ -39,16 +46,21 @@ public final class AfterRayControlModel: ObservableObject {
     @discardableResult
     public func ensureRecording() async -> Bool {
         await refreshStatus()
-        guard status?.recordingState == .idle else { return isRecording }
+        guard status?.recordingState == .idle || status == nil else {
+            return isCaptureSessionActive
+        }
         AfterRayLog.info("ensureRecording: starting capture")
         isChangingRecording = true
+        markWaitingOptimistically()
         defer { isChangingRecording = false }
         do {
             _ = try await daemon.recordStart()
             status = try await daemon.status()
             message = nil
-            AfterRayLog.info("ensureRecording: recording=\(isRecording)")
-            return isRecording
+            AfterRayLog.info(
+                "ensureRecording: state=\(status?.recordingState.rawValue ?? "nil")"
+            )
+            return isCaptureSessionActive
         } catch {
             AfterRayLog.error("ensureRecording: \(error.localizedDescription)")
             message = error.localizedDescription
@@ -62,9 +74,10 @@ public final class AfterRayControlModel: ObservableObject {
         isChangingRecording = true
         defer { isChangingRecording = false }
         do {
-            if isRecording {
+            if isCaptureSessionActive {
                 _ = try await daemon.recordStop(reason: "pause")
             } else {
+                markWaitingOptimistically()
                 _ = try await daemon.recordStart()
             }
             status = try await daemon.status()
@@ -144,5 +157,17 @@ public final class AfterRayControlModel: ObservableObject {
         isAsking = false
         askMessage = nil
         message = nil
+    }
+
+    private func markWaitingOptimistically() {
+        if let status {
+            self.status = DaemonStatus(
+                daemonVersion: status.daemonVersion,
+                protocolVersion: status.protocolVersion,
+                schemaVersion: status.schemaVersion,
+                recordingState: .waiting,
+                activeSessionId: status.activeSessionId
+            )
+        }
     }
 }

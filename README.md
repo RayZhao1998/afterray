@@ -24,7 +24,8 @@ stay local.
 - A native macOS timeline with horizontal drag-to-recall.
 - Screenshot previews, OCR text, transcripts, and audio playback by moment.
 - Full-text and local embedding search across captured evidence.
-- Local session summaries through an AfterRay-managed MLX runtime.
+- Local session summaries through a built-in GGUF, local Ollama, or an
+  OpenAI-compatible endpoint.
 - Favorites that survive automatic retention cleanup.
 - An encrypted local vault backed by SQLCipher and XChaCha20-Poly1305.
 - A Rust CLI that exposes the same API used by the Swift app.
@@ -36,9 +37,9 @@ stay local.
 - Apple Silicon Mac (M3 or newer recommended).
 - macOS 15 or newer.
 - Around 8 GB of free space for the default development model set (Qwen3-ASR
-  + embeddings), plus space for recordings. The optional local assistant is
-  another ~2 GB with the current Qwen2.5-3B Instruct fallback, or ~16 GB
-  once `AFTERRAY_LLM_*` points at Qwen3.8-27B Q4 (not Qwen3.8-Max).
+  + embeddings), plus space for recordings. The optional built-in assistant is
+  another ~17 GB (Qwen3.6-27B Q4). Qwen 3.7 has no local GGUF; use Ollama
+  or an OpenAI-compatible URL for a hosted 3.7.
 - Xcode and the Xcode Command Line Tools.
 - A current Rust toolchain.
 
@@ -97,18 +98,24 @@ with `AFTERRAY_CAPTURE_INTERVAL_SECONDS`.
 
 ## Local models
 
-AfterRay downloads model files into `.afterray/models` and owns the inference
-processes itself. No Ollama installation, server, account, or API is involved.
-Rust continues to own scheduling, concurrency, retries, cancellation, and
-result storage; native workers only execute typed local inference jobs.
+AfterRay downloads ASR and embedding weights into `.afterray/models` and owns
+those inference processes. Overlay Q&A can use one of three assistant sources,
+chosen in **Settings → AI Models**:
 
-The optional `llm` pack is the on-device assistant for overlay Q&A. Capture,
-OCR, and search still work if it is missing. Settings labels this pack
-**Qwen3.8 27B**. Until that GGUF is published on Hugging Face, download uses a
-known-good Qwen2.5-3B Instruct Q4 file so setup still works today. Set
-`AFTERRAY_LLM_REPOSITORY` and `AFTERRAY_LLM_FILE` (and optionally
-`AFTERRAY_LLM_MODEL`) to fetch Qwen3.8-27B — no protocol change. Do not point
-this pack at Qwen3.8-Max 2.4T; it is not runnable on a Mac.
+- **Built-in** — AfterRay downloads Qwen3.6-27B Q4 (~17 GB) and runs it
+  with the bundled llama.cpp worker.
+- **Ollama** — AfterRay probes `http://127.0.0.1:11434`, lists installed chat
+  models, and sends OpenAI-compatible `/v1/chat/completions` requests. Prefer
+  a local `qwen3.6` tag when one is installed.
+- **OpenAI compatible** — any `/v1` chat-completions URL, optional API key,
+  and model name. This is the path for hosted Qwen 3.7 (no open weights).
+
+Rust still owns scheduling, retries, cancellation, and result storage.
+Capture, OCR, and search keep working if no assistant is configured.
+
+Qwen 3.7 Max is API-only as of August 2026. Do not expect `ollama pull
+qwen3.7` or a local GGUF to exist. Use a hosted OpenAI-compatible endpoint, or
+run a local Qwen 3.6 from Ollama.
 
 ## Architecture
 
@@ -162,13 +169,36 @@ afterray record start
 afterray record stop
 afterray sessions list --json
 afterray moments <session-id> --json
+afterray moment <moment-id> --json
 afterray search 'weekly planning' --json
+afterray search 'bug' --from-ms 0 --to-ms 9999999999999 --json
+afterray evidence ocr <moment-id> --json
+afterray evidence ax <moment-id> --json
+afterray activity --from-ms … --to-ms … --json
+afterray memories --from-ms … --to-ms … --json
 afterray favorite add <moment-id>
 afterray favorite remove <moment-id>
 afterray summarize <session-id> --json
 afterray models --json
 afterray jobs list --json
 ```
+
+### PATH install for external agents
+
+AfterRay can copy the bundled CLI to `~/.local/bin/afterray` so Claude Code,
+Codex, Cursor, and similar tools can query local history without MCP.
+
+- First-run onboarding offers **Install CLI**
+- Settings → Advanced → **CLI for agents** reinstalls later
+- Ensure `~/.local/bin` is on your shell `PATH`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The CLI is read-mostly agent surface (search, moment detail, OCR boxes, AX
+digest/tree, activity spans, memories). The vault key stays in the daemon;
+external tools never open the database.
 
 When running from the repository, replace `afterray` with
 `target/debug/afterray`.
@@ -235,15 +265,22 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_DATA_DIR` | Persistent vault location | `.afterray/v0-data` through the V0 runner |
 | `AFTERRAY_SOCKET` | Unix socket shared by clients and daemon | Runner-generated temporary path |
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
+| `AFTERRAY_GOP_ARCHIVE` | Pack cold stills into closed-GOP AV1 | `1` |
+| `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `12` |
+| `AFTERRAY_GOP_REQUIRE_AC` | Only encode while on AC power | `0` |
 | `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
 | `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
 | `AFTERRAY_MODEL_DIR` | Weight directory | `.afterray/models` |
 | `AFTERRAY_ASR_MODEL` | Qwen3-ASR snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B` |
 | `AFTERRAY_ASR_REPOSITORY` | Hugging Face repo for ASR | `Qwen/Qwen3-ASR-1.7B` |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | `$AFTERRAY_MODEL_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf` |
-| `AFTERRAY_LLM_MODEL` | Optional instruct GGUF path | `$AFTERRAY_MODEL_DIR/<AFTERRAY_LLM_FILE>` |
-| `AFTERRAY_LLM_REPOSITORY` | Hugging Face repo for the assistant GGUF | `Qwen/Qwen2.5-3B-Instruct-GGUF` (fallback until Qwen3.8-27B lands) |
-| `AFTERRAY_LLM_FILE` | GGUF filename in that repo | `qwen2.5-3b-instruct-q4_k_m.gguf` (fallback) |
+| `AFTERRAY_LLM_MODEL` | Optional built-in instruct GGUF path | `$AFTERRAY_MODEL_DIR/<AFTERRAY_LLM_FILE>` |
+| `AFTERRAY_LLM_REPOSITORY` | Hugging Face repo for the built-in GGUF | `unsloth/Qwen3.6-27B-GGUF` |
+| `AFTERRAY_LLM_FILE` | GGUF filename in that repo | `Qwen3.6-27B-Q4_K_M.gguf` |
+| `AFTERRAY_LLM_PROVIDER` | Assistant backend (`builtin`, `ollama`, `openai_compatible`) | persisted Settings value, else `builtin` |
+| `AFTERRAY_LLM_BASE_URL` | Ollama origin or OpenAI-compatible `/v1` URL | `http://127.0.0.1:11434` for Ollama |
+| `AFTERRAY_LLM_CHAT_MODEL` | Remote chat model id | persisted Settings value |
+| `AFTERRAY_LLM_API_KEY` | Optional bearer token for OpenAI-compatible URLs | persisted Settings value |
 | `AFTERRAY_LLM_N_CTX` | llama.cpp context length | `8192` |
 | `AFTERRAY_LLM_MAX_TOKENS` | Generation cap | `512` |
 

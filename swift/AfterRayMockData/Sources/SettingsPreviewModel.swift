@@ -28,6 +28,22 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
     @Published public var excludedBundleIds: [String] = []
+    @Published public var llmProbe: LlmEndpointStatus? = LlmEndpointStatus(
+        reachable: true,
+        models: [
+            LlmRemoteModel(id: "qwen3.6:latest"),
+            LlmRemoteModel(id: "qwen2.5vl:3b"),
+        ],
+        recommendedModel: "qwen3.6:latest"
+    )
+    @Published public var isProbingLlm = false
+    @Published public var isUpdatingLlm = false
+    @Published public var draftLlmBaseUrl = ""
+    @Published public var draftLlmModel = "qwen3.6:latest"
+    @Published public var draftLlmApiKey = ""
+    @Published public var cliStatus = "Not installed. Other AI agents cannot call `afterray` yet."
+    @Published public var isInstallingCli = false
+    @Published public var cliInstalled = false
     @Published public var recentJobs: [ModelJob] = [
         ModelJob(
             id: "job-asr",
@@ -77,14 +93,14 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                 ),
                 ModelPack(
                     id: "llm",
-                    name: "Qwen3.8 27B",
+                    name: "Qwen3.6 27B",
                     capability: "llm",
-                    path: "\(modelDirectoryPath)/qwen2.5-3b-instruct-q4_k_m.gguf",
+                    path: "\(modelDirectoryPath)/Qwen3.6-27B-Q4_K_M.gguf",
                     present: false,
                     bytes: 0,
                     required: false,
-                    note: "Powers overlay Q&A · optional for capture. Qwen3.8-27B (~16 GB Q4) via AFTERRAY_LLM_REPOSITORY / AFTERRAY_LLM_FILE when the GGUF lands. Fallback download is Qwen2.5-3B Instruct Q4.",
-                    expectedBytes: 2_000_000_000
+                    note: "Powers overlay Q&A · optional. Built-in download is Qwen3.6-27B Q4 (~17 GB). Qwen 3.7 has no local GGUF — use Ollama or an OpenAI-compatible URL for a hosted 3.7.",
+                    expectedBytes: 16_817_244_384
                 ),
             ]
         )
@@ -163,5 +179,37 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     public func copyDiagnostics() {
         message = "Preview diagnostics copied."
+    }
+
+    public func setLlmProvider(_ provider: LlmProvider) async {
+        settings = AppSettings(
+            dataDir: settings?.dataDir ?? dataDirectoryPath,
+            modelDir: settings?.modelDir ?? modelDirectoryPath,
+            recordAudio: recordAudio,
+            captureIntervalSeconds: 10,
+            llmProvider: provider,
+            llmBaseUrl: draftLlmBaseUrl,
+            llmModel: draftLlmModel
+        )
+        message = "Preview switched assistant source to \(provider.title)."
+    }
+
+    public func saveLlmConnection() async {
+        message = "Preview saved assistant connection."
+    }
+
+    public func probeLlm() async {
+        isProbingLlm = true
+        try? await Task.sleep(for: .milliseconds(120))
+        isProbingLlm = false
+    }
+
+    public func installCli() async {
+        isInstallingCli = true
+        try? await Task.sleep(for: .milliseconds(200))
+        isInstallingCli = false
+        cliInstalled = true
+        cliStatus = "Installed at ~/.local/bin/afterray and available on PATH."
+        message = "Preview installed afterray CLI."
     }
 }

@@ -46,6 +46,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
+        OnboardingController.shared.showIfNeeded()
     }
 
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
@@ -176,6 +177,7 @@ private final class AfterRayMenuBar: NSObject {
     private var statusItem: NSStatusItem?
     private var pauseItem: NSMenuItem?
     private var isRecording = false
+    private var shortcut = RecallHotKeyStore.shared.hotKey
 
     private override init() {
         super.init()
@@ -253,6 +255,11 @@ private final class AfterRayMenuBar: NSObject {
         refresh()
     }
 
+    func setShortcut(_ shortcut: RecallHotKey) {
+        self.shortcut = shortcut
+        refresh()
+    }
+
     func setOverlayVisible(_: Bool) {}
 
     @objc private func openAfterRay() {
@@ -302,7 +309,8 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
-        button.toolTip = isRecording ? "AfterRay is recording" : "AfterRay is paused"
+        let state = isRecording ? "AfterRay is recording" : "AfterRay is paused"
+        button.toolTip = "\(state) · press \(shortcut.displayString) to open"
         pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
     }
 
@@ -340,13 +348,15 @@ private final class PermissionGuidePanel: NSPanel {
 
 private let recallHotKeyHandler: EventHandlerUPP = { _, _, _ in
     DispatchQueue.main.async {
+        // While the welcome window is up the press is the lesson, not a command.
+        guard !OnboardingController.shared.handleHotKey() else { return }
         RecallOverlayController.shared.toggle()
     }
     return noErr
 }
 
 @MainActor
-final class RecallOverlayController {
+final class RecallOverlayController: RecallHotKeyBinding {
     static let shared = RecallOverlayController()
 
     private var panel: RecallOverlayPanel?
@@ -530,29 +540,83 @@ final class RecallOverlayController {
     }
 
     private func registerHotKey() {
+        let store = RecallHotKeyStore.shared
+        store.binding = self
+        guard !installHotKey(store.hotKey) else { return }
+        // A shortcut saved on an older macOS can stop being available. Falling
+        // back keeps the app reachable instead of silently deaf.
+        if store.hotKey != .default, installHotKey(.default) {
+            store.restoreDefault()
+        }
+    }
+
+    // MARK: RecallHotKeyBinding
+
+    func hotKeyBindingSuspend() {
+        guard let hotKey else { return }
+        UnregisterEventHotKey(hotKey)
+        self.hotKey = nil
+    }
+
+    func hotKeyBindingResume() {
+        installHotKey(RecallHotKeyStore.shared.hotKey)
+    }
+
+    func hotKeyBindingApply(_ candidate: RecallHotKey) -> Bool {
+        installHotKey(candidate)
+    }
+
+    @discardableResult
+    private func installHotKey(_ candidate: RecallHotKey) -> Bool {
+        guard installHotKeyHandler() else { return false }
+        if let hotKey {
+            UnregisterEventHotKey(hotKey)
+            self.hotKey = nil
+        }
+        var reference: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            UInt32(candidate.keyCode),
+            carbonModifiers(candidate.modifiers),
+            EventHotKeyID(signature: 0x4152_5952, id: 1),
+            GetApplicationEventTarget(),
+            0,
+            &reference
+        )
+        guard status == noErr, let reference else {
+            AfterRayLog.error(
+                "macOS refused \(candidate.displayString) (status \(status))",
+                source: "hotkey"
+            )
+            return false
+        }
+        hotKey = reference
+        AfterRayMenuBar.shared.setShortcut(candidate)
+        return true
+    }
+
+    private func installHotKeyHandler() -> Bool {
+        guard eventHandler == nil else { return true }
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
-        let handlerStatus = InstallEventHandler(
+        return InstallEventHandler(
             GetApplicationEventTarget(),
             recallHotKeyHandler,
             1,
             &eventType,
             nil,
             &eventHandler
-        )
-        guard handlerStatus == noErr else { return }
+        ) == noErr
+    }
 
-        let identifier = EventHotKeyID(signature: 0x4152_5952, id: 1)
-        RegisterEventHotKey(
-            UInt32(kVK_Space),
-            UInt32(cmdKey | shiftKey),
-            identifier,
-            GetApplicationEventTarget(),
-            0,
-            &hotKey
-        )
+    private func carbonModifiers(_ modifiers: RecallHotKey.Modifiers) -> UInt32 {
+        var flags = 0
+        if modifiers.contains(.command) { flags |= cmdKey }
+        if modifiers.contains(.shift) { flags |= shiftKey }
+        if modifiers.contains(.option) { flags |= optionKey }
+        if modifiers.contains(.control) { flags |= controlKey }
+        return UInt32(flags)
     }
 }
 
@@ -666,6 +730,7 @@ private final class PermissionGuideController {
 private struct PermissionDropGuide: View {
     let permission: RequiredPermission
     let onDismiss: () -> Void
+    @ObservedObject private var hotKeys = RecallHotKeyStore.shared
 
     private var applicationURL: URL { Bundle.main.bundleURL }
 
@@ -731,7 +796,7 @@ private struct PermissionDropGuide: View {
                 ApplicationBundleDragSource(applicationURL: applicationURL)
             }
 
-            Text("After granting access, press ⌘⇧Space to return.")
+            Text("After granting access, press \(hotKeys.hotKey.displayString) to return.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
@@ -833,9 +898,6 @@ private struct AfterRayRootView: View {
             artifactLoader: { artifactID in
                 try await images.data(artifactID: artifactID)
             },
-            onToggleFavorite: {
-                Task { await store.toggleFavorite() }
-            },
             onToggleAudio: { moment in
                 audioPlayer.toggle(moment: moment)
             },
@@ -930,11 +992,13 @@ private struct AfterRayRootView: View {
             await keepDaemonAlive()
         }
         .task(id: control.status?.recordingState) {
-            while !Task.isCancelled, control.isRecording {
-                try? await Task.sleep(for: .seconds(5))
+            while !Task.isCancelled, control.isCaptureSessionActive || control.isChangingRecording {
+                try? await Task.sleep(for: .seconds(control.isWaitingToRecord ? 1 : 5))
                 guard !Task.isCancelled else { return }
-                await store.refreshTimeline(preservingSelection: !isLive)
                 await control.refreshStatus()
+                if control.isRecording {
+                    await store.refreshTimeline(preservingSelection: !isLive)
+                }
             }
         }
         .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
@@ -992,6 +1056,9 @@ private struct AfterRayRootView: View {
 
     private func bootstrap() async {
         guard await startDaemonOrReportFailure() != nil else { return }
+        // Let the welcome window have the screen to itself: stacking macOS
+        // permission sheets on top of it makes the first launch a pile-up.
+        await OnboardingController.shared.waitUntilFinished()
         await permissions.requestInitialPermissionsOnce()
         if permissions.allGranted {
             AfterRayLog.info("bootstrap: permissions granted, ensuring recording")
@@ -1073,6 +1140,7 @@ private struct AfterRayRootView: View {
 
 private struct PermissionPanel: View {
     @ObservedObject var coordinator: SystemPermissionCoordinator
+    @ObservedObject private var hotKeys = RecallHotKeyStore.shared
 
     var body: some View {
         ZStack {
@@ -1107,7 +1175,7 @@ private struct PermissionPanel: View {
                     }
                 }
 
-                Text("After changing a permission, press ⌘⇧Space to return to AfterRay.")
+                Text("After changing a permission, press \(hotKeys.hotKey.displayString) to return to AfterRay.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -1224,7 +1292,7 @@ private struct ImmersiveControlBar: View {
         HStack(spacing: 10) {
             HStack(spacing: 7) {
                 Circle()
-                    .fill(model.isRecording ? Color.red : Color.secondary.opacity(0.55))
+                    .fill(statusDotColor)
                     .frame(width: 6, height: 6)
                     .shadow(color: model.isRecording ? .red.opacity(0.8) : .clear, radius: 5)
                 Text(statusLabel)
@@ -1233,13 +1301,13 @@ private struct ImmersiveControlBar: View {
             }
 
             Button(action: onToggleRecording) {
-                Image(systemName: model.isRecording ? "pause.fill" : "record.circle")
+                Image(systemName: model.isCaptureSessionActive ? "pause.fill" : "record.circle")
                     .frame(width: 26, height: 26)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white.opacity(0.82))
             .disabled(!model.canToggleRecording)
-            .help(model.isRecording ? "Pause capture" : "Resume capture")
+            .help(model.isCaptureSessionActive ? "Pause capture" : "Resume capture")
 
             Rectangle()
                 .fill(.white.opacity(0.12))
@@ -1279,13 +1347,23 @@ private struct ImmersiveControlBar: View {
         .recallGlass(in: .capsule)
     }
 
+    private var statusDotColor: Color {
+        if model.isRecording { return .red }
+        if model.isWaitingToRecord || model.isChangingRecording { return .orange }
+        return Color.secondary.opacity(0.55)
+    }
+
     private var statusLabel: String {
-        if let message = model.message, !model.isRecording {
+        if let message = model.message, !model.isCaptureSessionActive {
             return "Capture failed"
+        }
+        if model.isChangingRecording, model.status?.recordingState == .idle || model.status == nil {
+            return "Waiting"
         }
         guard let status = model.status else { return "Daemon offline" }
         switch status.recordingState {
         case .idle: return "Ready"
+        case .waiting: return "Waiting"
         case .recording: return "Recording"
         case .stopping: return "Stopping"
         case .failed: return "Capture failed"

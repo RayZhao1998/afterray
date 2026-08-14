@@ -186,6 +186,7 @@ public struct ArtifactMeta: Decodable, Equatable, Sendable {
 
 public enum DaemonRecordingState: String, Codable, Equatable, Sendable {
     case idle
+    case waiting
     case recording
     case stopping
     case failed
@@ -384,25 +385,93 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+    case builtin
+    case ollama
+    case openaiCompatible = "openai_compatible"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .builtin: "Built-in"
+        case .ollama: "Ollama"
+        case .openaiCompatible: "OpenAI compatible"
+        }
+    }
+}
+
+public struct LlmRemoteModel: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let name: String
+
+    public init(id: String, name: String? = nil) {
+        self.id = id
+        self.name = name ?? id
+    }
+}
+
+public struct LlmEndpointStatus: Codable, Equatable, Sendable {
+    public let reachable: Bool
+    public let models: [LlmRemoteModel]
+    public let recommendedModel: String?
+    public let error: String?
+    public let defaultBaseUrl: String
+
+    public init(
+        reachable: Bool,
+        models: [LlmRemoteModel] = [],
+        recommendedModel: String? = nil,
+        error: String? = nil,
+        defaultBaseUrl: String = "http://127.0.0.1:11434"
+    ) {
+        self.reachable = reachable
+        self.models = models
+        self.recommendedModel = recommendedModel
+        self.error = error
+        self.defaultBaseUrl = defaultBaseUrl
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case reachable
+        case models
+        case recommendedModel = "recommended_model"
+        case error
+        case defaultBaseUrl = "default_base_url"
+    }
+}
+
 public struct AppSettings: Codable, Equatable, Sendable {
     public let dataDir: String
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
     public let excludedBundleIds: [String]
+    public let llmProvider: LlmProvider
+    public let llmBaseUrl: String
+    public let llmModel: String
+    public let llmApiKeySet: Bool
 
     public init(
         dataDir: String,
         modelDir: String,
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
-        excludedBundleIds: [String] = []
+        excludedBundleIds: [String] = [],
+        llmProvider: LlmProvider = .builtin,
+        llmBaseUrl: String = "",
+        llmModel: String = "",
+        llmApiKeySet: Bool = false
     ) {
         self.dataDir = dataDir
         self.modelDir = modelDir
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
         self.excludedBundleIds = excludedBundleIds
+        self.llmProvider = llmProvider
+        self.llmBaseUrl = llmBaseUrl
+        self.llmModel = llmModel
+        self.llmApiKeySet = llmApiKeySet
     }
 
     enum CodingKeys: String, CodingKey {
@@ -411,6 +480,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
         case excludedBundleIds = "excluded_bundle_ids"
+        case llmProvider = "llm_provider"
+        case llmBaseUrl = "llm_base_url"
+        case llmModel = "llm_model"
+        case llmApiKeySet = "llm_api_key_set"
     }
 
     public init(from decoder: Decoder) throws {
@@ -420,6 +493,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         recordAudio = try container.decode(Bool.self, forKey: .recordAudio)
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
+        llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
+        llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""
+        llmModel = try container.decodeIfPresent(String.self, forKey: .llmModel) ?? ""
+        llmApiKeySet = try container.decodeIfPresent(Bool.self, forKey: .llmApiKeySet) ?? false
     }
 }
 

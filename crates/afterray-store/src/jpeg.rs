@@ -32,7 +32,10 @@ pub fn jpeg_pixel_size(bytes: &[u8]) -> Option<(i64, i64)> {
         ) {
             let height = i64::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
             let width = i64::from(u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]));
-            if width > 0 && height > 0 {
+            // Match jpeg_to_i420: odd SOF edges are cropped before encode.
+            let width = width & !1;
+            let height = height & !1;
+            if width >= 16 && height >= 16 {
                 return Some((width, height));
             }
             return None;
@@ -54,6 +57,16 @@ mod tests {
             0x00, 0xFF, 0xD9,
         ];
         assert_eq!(jpeg_pixel_size(&jpeg), Some((32, 16)));
+    }
+
+    #[test]
+    fn crops_odd_sof_to_even_i420_size() {
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x04, 0x5D, 0x06, 0xC0, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        // 1728x1117 → 1728x1116
+        assert_eq!(jpeg_pixel_size(&jpeg), Some((1728, 1116)));
     }
 
     #[test]

@@ -102,15 +102,66 @@ pub struct GopPackJob {
     pub error: Option<String>,
 }
 
-/// Fold ordered pack candidates into closed-GOP runs.
+/// Fold pack candidates into closed-GOP runs.
+///
+/// Frames are grouped by app + resolution first, then split only on that
+/// app's own timeline (idle gap / keyint). A↔B flicker therefore fills two
+/// GOPs instead of a pile of one-frame stills.
 #[must_use]
 pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<PackCandidate>> {
     let keyint = usize::from(keyint.max(1));
+    let mut buckets: std::collections::HashMap<BucketKey, Vec<PackCandidate>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<BucketKey> = Vec::new();
+    for candidate in candidates {
+        let key = bucket_key(candidate);
+        match buckets.get_mut(&key) {
+            Some(bucket) => bucket.push(candidate.clone()),
+            None => {
+                order.push(key.clone());
+                buckets.insert(key, vec![candidate.clone()]);
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    for key in order {
+        let Some(bucket) = buckets.remove(&key) else {
+            continue;
+        };
+        runs.extend(fold_app_timeline(&bucket, keyint));
+    }
+    runs.sort_by(|left, right| {
+        let left = left
+            .first()
+            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
+        let right = right
+            .first()
+            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
+        left.cmp(&right)
+    });
+    runs
+}
+
+type BucketKey = (Option<String>, Option<String>, u32, u32);
+
+fn bucket_key(candidate: &PackCandidate) -> BucketKey {
+    (
+        candidate.bundle_identifier.clone(),
+        candidate.application_name.clone(),
+        candidate.width,
+        candidate.height,
+    )
+}
+
+fn fold_app_timeline(frames: &[PackCandidate], keyint: usize) -> Vec<Vec<PackCandidate>> {
     let mut runs = Vec::new();
     let mut current: Vec<PackCandidate> = Vec::new();
-    for candidate in candidates {
+    for candidate in frames {
         if let Some(previous) = current.last()
-            && should_cut(previous, candidate)
+            && candidate
+                .captured_at_ms
+                .saturating_sub(previous.captured_at_ms)
+                > IDLE_GAP_MS
         {
             runs.push(std::mem::take(&mut current));
         }
@@ -123,13 +174,6 @@ pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<Pack
         runs.push(current);
     }
     runs
-}
-
-fn should_cut(previous: &PackCandidate, next: &PackCandidate) -> bool {
-    previous.identity_key() != next.identity_key()
-        || previous.width != next.width
-        || previous.height != next.height
-        || next.captured_at_ms.saturating_sub(previous.captured_at_ms) > IDLE_GAP_MS
 }
 
 impl Vault {
@@ -282,11 +326,24 @@ impl Vault {
         if request.moment_ids.is_empty() || request.frames.len() != request.moment_ids.len() {
             return Err(StoreError::GopStale);
         }
-        let artifact_id = self.put_typed_artifact("video/x-ivf; codec=av01", request.ivf)?;
+        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let staged = self.stage_artifact_unlocked("video/x-ivf; codec=av01", request.ivf)?;
         let segment_id = Uuid::now_v7().to_string();
         let result = (|| {
             let mut connection = self.connection.lock().unwrap();
             let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO artifacts (
+                     id, content_type, byte_length, format_version, wrapped_key, wrapping_nonce
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![
+                    staged.id,
+                    staged.content_type,
+                    staged.byte_length,
+                    staged.wrapped_dek,
+                    staged.wrapping_nonce,
+                ],
+            )?;
             for moment_id in request.moment_ids {
                 let present: Option<String> = transaction
                     .query_row(
@@ -305,10 +362,10 @@ impl Vault {
                      id, artifact_id, codec, encoder, encoder_version,
                      width, height, frame_count, keyint, started_at_ms, ended_at_ms,
                      status, content_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ready', ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'writing', ?12)",
                 params![
                     segment_id,
-                    artifact_id,
+                    staged.id,
                     request.codec,
                     request.encoder,
                     request.encoder_version,
@@ -354,21 +411,40 @@ impl Vault {
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = self.delete_artifact_record_and_file(&artifact_id);
+            self.discard_staged_artifact(&staged.id);
             return Err(error);
         }
         Ok(segment_id)
     }
 
+    pub fn mark_gop_ready(&self, segment_id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.lock().unwrap().execute(
+            "UPDATE gop_segments SET status = 'ready' WHERE id = ?1 AND status = 'writing'",
+            [segment_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::GopNotFound(segment_id.to_owned()));
+        }
+        Ok(())
+    }
+
     pub fn gop_segment(&self, segment_id: &str) -> Result<GopSegmentRecord, StoreError> {
+        self.load_gop_segment(segment_id, "ready")
+    }
+
+    fn load_gop_segment(
+        &self,
+        segment_id: &str,
+        status: &str,
+    ) -> Result<GopSegmentRecord, StoreError> {
         self.connection
             .lock()
             .unwrap()
             .query_row(
                 "SELECT id, artifact_id, codec, encoder, width, height,
                         frame_count, keyint, started_at_ms, ended_at_ms, status
-                   FROM gop_segments WHERE id = ?1 AND status = 'ready'",
-                [segment_id],
+                   FROM gop_segments WHERE id = ?1 AND status = ?2",
+                params![segment_id, status],
                 |row| {
                     Ok(GopSegmentRecord {
                         id: row.get(0)?,
@@ -441,8 +517,12 @@ impl Vault {
         self.read_artifact(&segment.artifact_id)
     }
 
-    fn put_typed_artifact(&self, content_type: &str, bytes: &[u8]) -> Result<String, StoreError> {
-        self.put_artifact(content_type, bytes)
+    pub fn read_gop_artifact_writing(
+        &self,
+        segment_id: &str,
+    ) -> Result<afterray_protocol::ArtifactPayload, StoreError> {
+        let segment = self.load_gop_segment(segment_id, "writing")?;
+        self.read_artifact(&segment.artifact_id)
     }
 
     /// Undo a ready GOP (verify failed or operator abort). Moments keep their JPEGs.
@@ -478,15 +558,16 @@ impl Vault {
         Ok(())
     }
 
-    /// Drop leftover Dual JPEGs on ready GOP members. Favorites keep JPEG.
+    /// Drop leftover Dual JPEGs only after a GOP is ready and readable.
     pub fn reconcile_packed_stills(&self) -> Result<usize, StoreError> {
         let segment_ids: Vec<String> = {
             let connection = self.connection.lock().unwrap();
             let mut statement = connection.prepare(
-                "SELECT DISTINCT gop_segment_id FROM moments
-                  WHERE gop_segment_id IS NOT NULL
-                    AND is_favorite = 0
-                    AND image_artifact_id IS NOT NULL",
+                "SELECT DISTINCT m.gop_segment_id
+                   FROM moments m
+                   JOIN gop_segments gs ON gs.id = m.gop_segment_id
+                  WHERE m.image_artifact_id IS NOT NULL
+                    AND gs.status = 'ready'",
             )?;
             statement
                 .query_map([], |row| row.get(0))?
@@ -494,12 +575,15 @@ impl Vault {
         };
         let mut dropped = 0;
         for segment_id in segment_ids {
+            if self.read_gop_artifact(&segment_id).is_err() {
+                continue;
+            }
             dropped += self.drop_unpinned_stills(&segment_id)?;
         }
         Ok(dropped)
     }
 
-    /// Drop unpinned cold stills after a GOP is durable. Favorites keep JPEG.
+    /// Drop cold stills after a GOP is durable and verified.
     pub fn drop_unpinned_stills(&self, segment_id: &str) -> Result<usize, StoreError> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
@@ -507,7 +591,6 @@ impl Vault {
             let mut statement = transaction.prepare(
                 "SELECT id, image_artifact_id FROM moments
                   WHERE gop_segment_id = ?1
-                    AND is_favorite = 0
                     AND image_artifact_id IS NOT NULL",
             )?;
             statement
@@ -517,7 +600,6 @@ impl Vault {
         transaction.execute(
             "UPDATE moments SET image_artifact_id = NULL
               WHERE gop_segment_id = ?1
-                AND is_favorite = 0
                 AND image_artifact_id IS NOT NULL",
             [segment_id],
         )?;
@@ -622,5 +704,33 @@ mod tests {
         ];
         let runs = fold_pack_runs(&frames, 12);
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn fold_groups_interleaved_apps_into_per_app_gops() {
+        let frames = [
+            candidate("a1", 0, "Chrome", "chrome"),
+            candidate("b1", 10_000, "Feishu", "feishu"),
+            candidate("a2", 20_000, "Chrome", "chrome"),
+            candidate("b2", 30_000, "Feishu", "feishu"),
+            candidate("a3", 40_000, "Chrome", "chrome"),
+            candidate("b3", 50_000, "Feishu", "feishu"),
+        ];
+        let runs = fold_pack_runs(&frames, 12);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0]
+                .iter()
+                .map(|frame| frame.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a1", "a2", "a3"]
+        );
+        assert_eq!(
+            runs[1]
+                .iter()
+                .map(|frame| frame.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b1", "b2", "b3"]
+        );
     }
 }

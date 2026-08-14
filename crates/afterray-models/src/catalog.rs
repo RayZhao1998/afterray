@@ -117,20 +117,18 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
     ]
 }
 
-/// Known-good instruct GGUF used until Qwen3.8-27B weights are published.
-/// Production retargets with `AFTERRAY_LLM_REPOSITORY` + `AFTERRAY_LLM_FILE`
-/// (and optionally `AFTERRAY_LLM_MODEL`) — no protocol change.
-pub const FALLBACK_LLM_REPOSITORY: &str = "Qwen/Qwen2.5-3B-Instruct-GGUF";
-pub const FALLBACK_LLM_FILE: &str = "qwen2.5-3b-instruct-q4_k_m.gguf";
+/// Built-in overlay Q&A GGUF. Retarget with `AFTERRAY_LLM_REPOSITORY` +
+/// `AFTERRAY_LLM_FILE` (and optionally `AFTERRAY_LLM_MODEL`) — no protocol
+/// change. Qwen 3.7 has no local GGUF.
+pub const FALLBACK_LLM_REPOSITORY: &str = "unsloth/Qwen3.6-27B-GGUF";
+pub const FALLBACK_LLM_FILE: &str = "Qwen3.6-27B-Q4_K_M.gguf";
 
-/// Approximate size of the fallback 3B Q4 GGUF. Kept as `expected_bytes` so
-/// today's download progress stays accurate.
-const FALLBACK_LLM_EXPECTED_BYTES: u64 = 2_000_000_000;
+/// Exact size of `Qwen3.6-27B-Q4_K_M.gguf` on Hugging Face. Used as
+/// download `expected_bytes` so Settings progress stays honest.
+pub const QWEN36_27B_Q4_EXPECTED_BYTES: u64 = 16_817_244_384;
 
-/// Approximate on-disk size of a 27B Q4 GGUF. Documented for Settings; not
-/// used as download `expected_bytes` so the 3B fallback still reports
-/// correctly. Qwen3.8-Max 2.4T is not a local target.
-pub const QWEN38_27B_Q4_EXPECTED_BYTES: u64 = 16_000_000_000;
+/// Alias kept for older call sites that documented a 27B Q4 budget.
+pub const QWEN38_27B_Q4_EXPECTED_BYTES: u64 = QWEN36_27B_Q4_EXPECTED_BYTES;
 
 /// Builds the optional assistant pack. `file` is both the Hugging Face
 /// filename and the local basename unless `model_path` overrides the path.
@@ -143,15 +141,12 @@ pub fn llm_pack_from(
 ) -> PackSpec {
     PackSpec {
         id: "llm".into(),
-        name: "Qwen3.8 27B".into(),
+        name: "Qwen3.6 27B".into(),
         capability: "llm".into(),
         path: model_path.unwrap_or_else(|| directory.join(file)),
         required: false,
-        note: format!(
-            "Powers overlay Q&A · optional for capture. Qwen3.8-27B (~{} GB Q4, not Qwen3.8-Max) via AFTERRAY_LLM_REPOSITORY / AFTERRAY_LLM_FILE when the GGUF lands. Download fallback is Qwen2.5-3B Instruct Q4.",
-            QWEN38_27B_Q4_EXPECTED_BYTES / 1_000_000_000
-        ),
-        expected_bytes: FALLBACK_LLM_EXPECTED_BYTES,
+        note: "Powers overlay Q&A · optional. Built-in download is Qwen3.6-27B Q4 (~17 GB). Qwen 3.7 has no local GGUF — use Ollama or an OpenAI-compatible URL for a hosted 3.7.".into(),
+        expected_bytes: QWEN36_27B_Q4_EXPECTED_BYTES,
         source: PackSource::HuggingFaceFile {
             repository: repository.to_owned(),
             file: file.to_owned(),
@@ -303,11 +298,11 @@ mod tests {
         assert!(catalog[0].required);
         assert!(catalog[1].required);
         assert!(!catalog[2].required);
-        assert_eq!(catalog[2].name, "Qwen3.8 27B");
+        assert_eq!(catalog[2].name, "Qwen3.6 27B");
         assert!(catalog[2].note.contains("overlay Q&A"));
         assert!(catalog[2].note.contains("optional"));
-        assert_eq!(catalog[2].expected_bytes, FALLBACK_LLM_EXPECTED_BYTES);
-        assert!(catalog[2].expected_bytes < QWEN38_27B_Q4_EXPECTED_BYTES);
+        assert!(catalog[2].note.contains("Qwen3.6-27B"));
+        assert_eq!(catalog[2].expected_bytes, QWEN36_27B_Q4_EXPECTED_BYTES);
         assert_eq!(
             catalog[2].path,
             Path::new("/tmp/afterray-models").join(FALLBACK_LLM_FILE)
@@ -350,7 +345,7 @@ mod tests {
                 file: "Qwen3.8-27B-Q4_K_M.gguf".into(),
             }
         );
-        assert_eq!(pack.expected_bytes, FALLBACK_LLM_EXPECTED_BYTES);
+        assert_eq!(pack.expected_bytes, QWEN36_27B_Q4_EXPECTED_BYTES);
     }
 
     #[test]

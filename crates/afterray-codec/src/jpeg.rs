@@ -1,12 +1,13 @@
 //! JPEG → tightly packed I420 for the packer.
 
 use crate::{CodecError, i420_len};
+use zeroize::{Zeroize, Zeroizing};
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
 /// Decode a JPEG still to 8-bit I420. Odd dimensions are cropped to even.
-pub fn jpeg_to_i420(jpeg: &[u8]) -> Result<(u32, u32, Vec<u8>), CodecError> {
+pub fn jpeg_to_i420(jpeg: &[u8]) -> Result<(u32, u32, Zeroizing<Vec<u8>>), CodecError> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(jpeg, options);
     let rgb = decoder
@@ -25,8 +26,10 @@ pub fn jpeg_to_i420(jpeg: &[u8]) -> Result<(u32, u32, Vec<u8>), CodecError> {
     }
     let width = src_w & !1;
     let height = src_h & !1;
-    let mut yuv = vec![0_u8; i420_len(width, height)];
+    let mut yuv = Zeroizing::new(vec![0_u8; i420_len(width, height)]);
     rgb_to_i420(&rgb, src_w, width, height, &mut yuv);
+    let mut rgb = rgb;
+    rgb.zeroize();
     Ok((width, height, yuv))
 }
 

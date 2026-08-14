@@ -26,7 +26,7 @@ impl GopPackerConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_KEYINT);
-        let keyint = if keyint == 6 || keyint == 12 {
+        let keyint = if matches!(keyint, 6 | 12 | 20 | 24 | 30) {
             keyint
         } else {
             DEFAULT_KEYINT
@@ -37,8 +37,8 @@ impl GopPackerConfig {
             .unwrap_or(7_200_u64)
             .clamp(3_600, 7_200);
         Self {
-            archive: env_flag("AFTERRAY_GOP_ARCHIVE", false),
-            require_ac: env_flag("AFTERRAY_GOP_REQUIRE_AC", true),
+            archive: env_flag("AFTERRAY_GOP_ARCHIVE", true),
+            require_ac: env_flag("AFTERRAY_GOP_REQUIRE_AC", false),
             policy: PackPolicy {
                 hot_window_ms: i64::try_from(hot_window_seconds.saturating_mul(1000))
                     .unwrap_or(7_200_000),
@@ -63,6 +63,33 @@ fn env_flag(name: &str, default: bool) -> bool {
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(default)
+}
+
+/// Yield to capture: startup (no frame yet), an in-flight screenshot, or
+/// the 2s window before the next heartbeat.
+#[must_use]
+pub fn should_yield_to_capture(
+    capture_busy: bool,
+    recording: bool,
+    last_capture_ms: i64,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    if capture_busy {
+        return true;
+    }
+    if !recording {
+        return false;
+    }
+    // Shim is still coming up. rav1e must not starve SCShareableContent.
+    if last_capture_ms <= 0 {
+        return true;
+    }
+    if interval_ms <= 0 {
+        return false;
+    }
+    let next = last_capture_ms.saturating_add(interval_ms);
+    next.saturating_sub(now_ms) < 2_000
 }
 
 pub struct GopPacker {
@@ -151,7 +178,11 @@ impl GopPacker {
                 }) {
                     Ok(segment_id) => {
                         if let Err(error) = verify_gop(vault, &segment_id, &encoded) {
-                            let _ = vault.abort_gop(&segment_id);
+                            if let Err(abort_error) = vault.abort_gop(&segment_id) {
+                                eprintln!(
+                                    "gop packer: abort after verify fail for {segment_id}: {abort_error}"
+                                );
+                            }
                             let _ = vault.finish_pack_job(
                                 &job_id,
                                 now_ms,
@@ -160,6 +191,7 @@ impl GopPacker {
                             );
                             return Err(error);
                         }
+                        vault.mark_gop_ready(&segment_id)?;
                         vault.finish_pack_job(&job_id, now_ms, Some(&segment_id), None)?;
                         if let Err(error) = vault.drop_unpinned_stills(&segment_id) {
                             eprintln!("gop packer: drop stills failed for {segment_id}: {error}");
@@ -195,9 +227,11 @@ fn encode_run(vault: &Vault, run: &[PackCandidate]) -> Result<EncodedGop, anyhow
     for frame in run {
         let still = vault.read_artifact(&frame.image_artifact_id)?;
         let (width, height, yuv) = jpeg_to_i420(&still.bytes)?;
-        if width != frame.width || height != frame.height {
+        let even_width = frame.width & !1;
+        let even_height = frame.height & !1;
+        if width != even_width || height != even_height {
             anyhow::bail!(
-                "decoded {}x{} but SOF was {}x{}",
+                "decoded {}x{} but stored size was {}x{}",
                 width,
                 height,
                 frame.width,
@@ -229,7 +263,7 @@ fn encode_run(vault: &Vault, run: &[PackCandidate]) -> Result<EncodedGop, anyhow
 }
 
 fn verify_gop(vault: &Vault, segment_id: &str, encoded: &EncodedGop) -> Result<(), anyhow::Error> {
-    let payload = vault.read_gop_artifact(segment_id)?;
+    let payload = vault.read_gop_artifact_writing(segment_id)?;
     let parsed = parse_ivf(&payload.bytes)?;
     if !payload.bytes.starts_with(afterray_codec::IVF_MAGIC) {
         anyhow::bail!("packed GOP is not IVF");
@@ -275,4 +309,33 @@ fn hash_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_yield_to_capture;
+
+    #[test]
+    fn yields_while_capture_is_busy() {
+        assert!(should_yield_to_capture(true, true, 0, 10_000, 10_000));
+    }
+
+    #[test]
+    fn yields_inside_two_second_heartbeat_window() {
+        // last capture at t=0, interval 10s → next heartbeat at 10_000.
+        assert!(should_yield_to_capture(false, true, 1, 8_500, 10_000));
+        assert!(should_yield_to_capture(false, true, 1, 9_500, 10_000));
+        assert!(!should_yield_to_capture(false, true, 1, 7_000, 10_000));
+    }
+
+    #[test]
+    fn ignores_heartbeat_when_not_recording() {
+        assert!(!should_yield_to_capture(false, false, 1, 9_500, 10_000));
+        assert!(!should_yield_to_capture(false, false, 0, 9_500, 10_000));
+    }
+
+    #[test]
+    fn yields_until_the_first_capture_while_recording() {
+        assert!(should_yield_to_capture(false, true, 0, 9_500, 10_000));
+    }
 }
