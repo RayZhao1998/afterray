@@ -140,7 +140,13 @@ extension ChatSendResult: Decodable {
     enum CodingKeys: String, CodingKey {
         case conversationId = "conversation_id"
         case messageId = "message_id"
+        case assistantMessageId = "assistant_message_id"
+        case conversation
         case id
+    }
+
+    private struct NestedConversation: Decodable {
+        let id: String
     }
 
     public init(from decoder: Decoder) throws {
@@ -151,6 +157,22 @@ extension ChatSendResult: Decodable {
             return
         }
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        // The daemon answers a send with the whole conversation plus the id of
+        // the message it just wrote, so the id lives one level down and under
+        // a different name than the stream's `done` event uses.
+        if let nested = try container.decodeIfPresent(
+            NestedConversation.self,
+            forKey: .conversation
+        ) {
+            self.init(
+                conversationId: nested.id,
+                messageId: try container.decodeIfPresent(
+                    String.self,
+                    forKey: .assistantMessageId
+                ) ?? container.decodeIfPresent(String.self, forKey: .messageId)
+            )
+            return
+        }
         if let id = try container.decodeIfPresent(String.self, forKey: .conversationId) {
             self.init(
                 conversationId: id,

@@ -89,6 +89,31 @@ final class ChatWireTests: XCTestCase {
         )
     }
 
+    func testChatSendDecodesTheDaemonsNestedConversationShape() throws {
+        // Verified against a live daemon on 2026-08-14: a send answers with
+        // the whole conversation plus `assistant_message_id`, so the id sits
+        // one level down and under a different name than the stream's `done`
+        // event uses.
+        let json = Data(#"""
+        {
+          "answer": "you were writing code",
+          "assistant_message_id": "01a000ce-67da",
+          "user_message_id": "01a000ce-67d8",
+          "model_missing": false,
+          "conversation": {
+            "id": "01a000cd-c5a4",
+            "title": "t",
+            "created_at_ms": 1786719880612,
+            "updated_at_ms": 1786719880613,
+            "message_count": 2
+          }
+        }
+        """#.utf8)
+        let result = try JSONDecoder().decode(ChatSendResult.self, from: json)
+        XCTAssertEqual(result.conversationId, "01a000cd-c5a4")
+        XCTAssertEqual(result.messageId, "01a000ce-67da")
+    }
+
     func testSendResultAcceptsConversationId() throws {
         let json = #"{"conversation_id":"c9","message_id":"m9"}"#
         let result = try JSONDecoder().decode(ChatSendResult.self, from: Data(json.utf8))
