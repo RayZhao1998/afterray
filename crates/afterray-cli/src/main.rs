@@ -54,7 +54,7 @@ enum Command {
         at_ms: Option<i64>,
         #[arg(long, conflicts_with = "at_ms")]
         moment_id: Option<String>,
-        /// Destination path. Defaults to ./frame-<moment_id>.jpg
+        /// Destination path. Defaults to `./frame-<moment_id>.jpg`.
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -129,6 +129,11 @@ enum Command {
         from_ms: Option<i64>,
         #[arg(long = "to-ms")]
         to_ms: Option<i64>,
+    },
+    /// Multi-turn chat against the local vault.
+    Chat {
+        #[command(subcommand)]
+        command: ChatCommand,
     },
     Gop {
         segment_id: String,
@@ -224,6 +229,22 @@ enum HistoryCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ChatCommand {
+    Send {
+        message: String,
+        #[arg(long)]
+        conversation: Option<String>,
+    },
+    List,
+    History {
+        conversation_id: String,
+    },
+    Delete {
+        conversation_id: String,
+    },
+}
+
 #[derive(Clone, clap::ValueEnum)]
 enum HistoryScopeArg {
     LastHour,
@@ -255,6 +276,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn chat_request(command: ChatCommand) -> Request {
+    match command {
+        ChatCommand::Send {
+            message,
+            conversation,
+        } => Request::ChatSend {
+            conversation_id: conversation,
+            message,
+        },
+        ChatCommand::List => Request::ChatList,
+        ChatCommand::History { conversation_id } => Request::ChatHistory { conversation_id },
+        ChatCommand::Delete { conversation_id } => Request::ChatDelete { conversation_id },
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn request_from_command(
     command: Command,
     socket: &PathBuf,
@@ -433,6 +470,7 @@ async fn request_from_command(
             from_ms,
             to_ms,
         },
+        Command::Chat { command } => chat_request(command),
         Command::Gop { segment_id } => Request::GopShow { segment_id },
         Command::Pack {
             command: PackCommand::Status,
@@ -476,9 +514,12 @@ async fn save_frame(
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let moment_id = resolve_moment(socket, moment_id, at_ms).await?;
-    let moment = send(socket, &Request::MomentGet {
-        moment_id: moment_id.clone(),
-    })
+    let moment = send(
+        socket,
+        &Request::MomentGet {
+            moment_id: moment_id.clone(),
+        },
+    )
     .await?;
     let artifact_id = moment
         .data

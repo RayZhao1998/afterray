@@ -1043,6 +1043,33 @@ impl Vault {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
+    /// One conversation by id, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation(&self, id: &str) -> Result<Option<Conversation>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              WHERE c.id = ?1",
+        )?;
+        let mut rows = statement.query(params![id])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            }),
+            None => None,
+        })
+    }
+
     /// Appends a message and bumps the conversation's updated timestamp.
     ///
     /// # Errors
@@ -4272,6 +4299,8 @@ mod tests {
         assert_eq!(listed[0].title, "昨天下午");
         assert_eq!(listed[0].message_count, 2);
         assert_eq!(listed[0].updated_at_ms, 1_200, "append bumps updated_at");
+        assert_eq!(vault.conversation(&id).unwrap().unwrap().title, "昨天下午");
+        assert!(vault.conversation("missing").unwrap().is_none());
 
         let messages = vault.conversation_messages(&id).unwrap();
         assert_eq!(messages.len(), 2);

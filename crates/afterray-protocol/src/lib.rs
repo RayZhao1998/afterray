@@ -116,6 +116,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_ms: Option<i64>,
     },
+    ChatSend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        message: String,
+    },
+    ChatList,
+    ChatHistory {
+        conversation_id: String,
+    },
+    ChatDelete {
+        conversation_id: String,
+    },
     Settings,
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,6 +417,33 @@ pub struct ConversationMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_log: Option<String>,
     pub created_at_ms: i64,
+}
+
+/// Reply to [`Request::ChatSend`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatReply {
+    pub conversation: Conversation,
+    pub answer: String,
+    pub user_message_id: String,
+    pub assistant_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_log: Option<String>,
+    #[serde(default)]
+    pub model_missing: bool,
+}
+
+/// One conversation plus its messages, in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatThread {
+    pub conversation: Conversation,
+    pub messages: Vec<ConversationMessage>,
+}
+
+/// Reply to [`Request::ChatDelete`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatDeleteResult {
+    pub deleted: bool,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -804,6 +843,53 @@ mod tests {
             json,
             r#"{"type":"update_settings","storage_limit_bytes":250000000000}"#
         );
+    }
+
+    #[test]
+    fn chat_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ChatSend {
+                conversation_id: None,
+                message: "我今天下午在干嘛".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_send","message":"我今天下午在干嘛"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatSend {
+                conversation_id: Some("c1".into()),
+                message: "那第三件呢".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_send","conversation_id":"c1","message":"那第三件呢"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatList).unwrap(),
+            r#"{"type":"chat_list"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatHistory {
+                conversation_id: "c1".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_history","conversation_id":"c1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatDelete {
+                conversation_id: "c1".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_delete","conversation_id":"c1"}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"chat_send","message":"hello"}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::ChatSend {
+                ref message,
+                conversation_id: None
+            } if message == "hello"
+        ));
     }
 
     #[test]
