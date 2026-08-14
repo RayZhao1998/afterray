@@ -437,7 +437,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )

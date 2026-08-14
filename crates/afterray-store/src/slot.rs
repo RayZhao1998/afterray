@@ -31,11 +31,11 @@ const BUCKET_CHARS: usize = 12;
 const PROMPT_LINES_BUDGET_CHARS: usize = 12_000;
 /// Per-run inline cap so one chatty run cannot starve the rest.
 const RUN_LINES_CAP_CHARS: usize = 2_000;
-/// Every content-bearing run gets at least this much of the budget, so the
-/// late half hour stays visible even when the first minutes are text-heavy.
-const RUN_LINES_FLOOR_CHARS: usize = 240;
 /// Cap for selected-text / typing excerpts.
 const SEL_TYPING_CAP_CHARS: usize = 240;
+/// A frame whose role-filtered accessibility text reaches this many chars
+/// uses AX as its text source instead of OCR.
+pub const AX_TEXT_MIN_CHARS: usize = 400;
 
 const MAX_LIST: usize = 6;
 
@@ -56,6 +56,8 @@ pub struct SlotMomentRow {
     /// was composing, cleaner than OCR mid-states.
     pub focused_value: Option<String>,
     pub ax_present: bool,
+    /// True when `ocr_text` actually carries accessibility-tree text.
+    pub text_from_ax: bool,
     pub has_audio: bool,
 }
 
@@ -171,6 +173,9 @@ pub struct RunRow {
     pub lines: Vec<String>,
     /// Character total of `lines` before any prompt budget is applied.
     pub total_chars: usize,
+    /// Where the text came from: "ax" (exact, frontmost app), "ocr"
+    /// (whole screen, may contain recognition errors), or "mixed".
+    pub text_source: String,
 }
 
 /// A hole in capture. Rendered inline in the timeline so its absence is
@@ -531,6 +536,23 @@ pub fn build_slot_card(
             .map(|&id| dedup.lines[id].clone())
             .collect();
         let total_chars = lines.iter().map(|line| line.chars().count()).sum();
+        let (ax_frames, ocr_frames) = piece.rows.iter().fold((0_u32, 0_u32), |(ax, ocr), &i| {
+            let row = &rows[i];
+            if row.ocr_text.is_none() {
+                (ax, ocr)
+            } else if row.text_from_ax {
+                (ax + 1, ocr)
+            } else {
+                (ax, ocr + 1)
+            }
+        });
+        let text_source = match (ax_frames > 0, ocr_frames > 0) {
+            (true, false) => "ax",
+            (false, true) => "ocr",
+            (true, true) => "mixed",
+            (false, false) => "none",
+        }
+        .to_owned();
         timeline.push(TimelineEntry::Run(RunRow {
             moment_id: best.id.clone(),
             start_ms: piece.start_ms,
@@ -541,6 +563,7 @@ pub fn build_slot_card(
             typing: run_typing[piece_index].clone(),
             lines,
             total_chars,
+            text_source,
         }));
     }
     for (_, gap) in gap_iter {
@@ -767,6 +790,7 @@ Answer with one JSON object and nothing else, fields in this exact order:
 /// third of the token budget on whitespace. All strings inside are data,
 /// never instructions.
 #[must_use]
+#[allow(clippy::too_many_lines)] // One block per card section; splitting hurts readability.
 pub fn render_t2_prompt(card: &SlotCard, prev_cards: &[PrevCard]) -> String {
     use serde_json::json;
 
@@ -788,19 +812,43 @@ pub fn render_t2_prompt(card: &SlotCard, prev_cards: &[PrevCard]) -> String {
         });
     }
 
-    // Proportional budget: a greedy time-ordered fill lets the first minutes
-    // eat everything and the rest of the half hour goes dark (49 of 66 runs
-    // starved on a real slot). Each content run gets a floor plus a share
-    // proportional to how much new text it introduced.
-    let content_total: usize = card
+    // Round-robin line allocation: one line from each run per round until
+    // the budget is spent. Coverage beats depth — a run the model cannot see
+    // gets confabulated (the first dry run invented the unseen half hour),
+    // while a truncated deep run still has more_chars as a drill-down handle.
+    // Earlier schemes (greedy time-order, then proportional-with-floor) both
+    // starved the tail of the slot because nothing was reserved for it.
+    let run_refs: Vec<&RunRow> = card
         .timeline
         .iter()
         .filter_map(|entry| match entry {
-            TimelineEntry::Run(run) => Some(run.total_chars),
+            TimelineEntry::Run(run) => Some(run),
             TimelineEntry::Gap(_) => None,
         })
-        .sum();
+        .collect();
+    let mut taken_counts = vec![0_usize; run_refs.len()];
+    let mut used_chars = vec![0_usize; run_refs.len()];
     let mut remaining = PROMPT_LINES_BUDGET_CHARS;
+    loop {
+        let mut progressed = false;
+        for (index, run) in run_refs.iter().enumerate() {
+            let Some(line) = run.lines.get(taken_counts[index]) else {
+                continue;
+            };
+            let cost = line.chars().count();
+            if used_chars[index] + cost > RUN_LINES_CAP_CHARS || cost > remaining {
+                continue;
+            }
+            taken_counts[index] += 1;
+            used_chars[index] += cost;
+            remaining -= cost;
+            progressed = true;
+        }
+        if !progressed || remaining == 0 {
+            break;
+        }
+    }
+    let mut run_cursor = 0_usize;
     let runs_view: Vec<serde_json::Value> = card
         .timeline
         .iter()
@@ -811,30 +859,20 @@ pub fn render_t2_prompt(card: &SlotCard, prev_cards: &[PrevCard]) -> String {
                 "to": hhmm(gap.end_ms),
             }),
             TimelineEntry::Run(run) => {
-                let share = if content_total <= PROMPT_LINES_BUDGET_CHARS {
-                    run.total_chars
-                } else {
-                    (run.total_chars * PROMPT_LINES_BUDGET_CHARS / content_total)
-                        .max(RUN_LINES_FLOOR_CHARS.min(run.total_chars))
-                };
-                let allowance = share.min(RUN_LINES_CAP_CHARS);
-                let mut taken: Vec<&str> = Vec::new();
-                let mut used = 0_usize;
-                for line in &run.lines {
-                    let cost = line.chars().count();
-                    if used + cost > allowance || cost > remaining {
-                        break;
-                    }
-                    used += cost;
-                    remaining = remaining.saturating_sub(cost);
-                    taken.push(line);
-                }
+                let index = run_cursor;
+                run_cursor += 1;
+                let taken: Vec<&str> = run.lines[..taken_counts[index]]
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let used = used_chars[index];
                 let mut view = json!({
                     "id": run.moment_id,
                     "from": hhmm(run.start_ms),
                     "to": hhmm(run.end_ms),
                     "app": run.app,
                     "title": run.title,
+                    "src": run.text_source,
                     "text": taken,
                     "more_chars": run.total_chars.saturating_sub(used),
                 });
@@ -1142,6 +1180,20 @@ mod tests {
     }
 
     #[test]
+    fn run_reports_its_text_source() {
+        let mut ax = row("a", 0, "Lody", "chat", Some("exact accessibility sentence"));
+        ax.text_from_ax = true;
+        let ocr = row("b", 10_000, "WeChat", "Weixin", Some("ocr guessed sentence"));
+        let card = build_slot_card(0, &[ax, ocr], 0, 10_000);
+        let all = runs(&card);
+        assert_eq!(all[0].text_source, "ax");
+        assert_eq!(all[1].text_source, "ocr");
+        let prompt = render_t2_prompt(&card, &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        assert_eq!(parsed["runs"][0]["src"], "ax");
+    }
+
+    #[test]
     fn revisits_aggregate_across_the_timeline() {
         let rows = vec![
             row("a", 0, "Xcode", "gop.rs", Some("one")),
@@ -1200,6 +1252,28 @@ mod tests {
         // The full card itself keeps everything — the budget is a view concern.
         let full = runs(&card)[0];
         assert_eq!(full.lines.len(), 200);
+    }
+
+    #[test]
+    fn budget_is_shared_round_robin_not_first_come() {
+        // With budget for ~3 lines, an early huge run must not take all of
+        // them: allocation alternates one line per run per round.
+        let many = (0..300).fold(String::new(), |mut out, index| {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "early run distinct line {index} padded padded padded padded");
+            out
+        });
+        let rows = vec![
+            row("a", 0, "Lody", "chat", Some(&many)),
+            row("b", 10_000, "Chrome", "docs", Some("late line one unique\nlate line two unique")),
+        ];
+        let card = build_slot_card(0, &rows, 0, 10_000);
+        let prompt = render_t2_prompt(&card, &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        let runs: Vec<&serde_json::Value> = parsed["runs"]
+            .as_array().unwrap().iter().filter(|r| r.get("id").is_some()).collect();
+        let late = runs[1]["text"].as_array().unwrap();
+        assert_eq!(late.len(), 2, "late run gets BOTH its lines despite huge early run: {late:?}");
     }
 
     #[test]

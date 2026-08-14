@@ -15,9 +15,9 @@ use afterray_platform_macos::{
     apply_background_qos,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, HistoryScope, LlmProvider, ModelDownloadProgress,
-    PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit, Status,
-    local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, DEFAULT_STORAGE_LIMIT_BYTES, HistoryScope, LlmProvider,
+    ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit,
+    Status, local_calendar_day_bounds_ms,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
@@ -73,15 +73,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
         vault_config.data_dir = PathBuf::from(path);
     }
-    if let Ok(value) = std::env::var("AFTERRAY_MAX_UNSTARRED_MOMENTS") {
-        vault_config.max_unstarred_moments = value.parse().context("invalid retention limit")?;
-    }
     let staging_dir = vault_config.data_dir.join("capture-staging");
     let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
     if removed_staging_files > 0 {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
     let persisted = load_persisted_settings(&vault_config.data_dir);
+    vault_config.max_storage_bytes = persisted.storage_limit_bytes;
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
@@ -262,6 +260,8 @@ struct AppState {
 struct PersistedSettings {
     #[serde(default = "default_record_audio")]
     record_audio: bool,
+    #[serde(default = "default_storage_limit_bytes")]
+    storage_limit_bytes: u64,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
     #[serde(default)]
@@ -278,10 +278,15 @@ const fn default_record_audio() -> bool {
     true
 }
 
+const fn default_storage_limit_bytes() -> u64 {
+    DEFAULT_STORAGE_LIMIT_BYTES
+}
+
 impl Default for PersistedSettings {
     fn default() -> Self {
         Self {
             record_audio: true,
+            storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
@@ -497,6 +502,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
             record_audio,
+            storage_limit_bytes,
             excluded_bundle_ids,
             llm_provider,
             llm_base_url,
@@ -506,6 +512,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             update_settings(
                 state,
                 record_audio,
+                storage_limit_bytes,
                 excluded_bundle_ids,
                 llm_provider,
                 llm_base_url,
@@ -757,6 +764,7 @@ fn current_settings(state: &AppState) -> AppSettings {
         model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
             .lock()
@@ -773,33 +781,50 @@ fn current_settings(state: &AppState) -> AppSettings {
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
+    save_persisted_settings(&state.data_dir, &persisted_settings(state))
+}
+
+fn persisted_settings(state: &AppState) -> PersistedSettings {
     let llm = current_llm_config(state);
-    save_persisted_settings(
-        &state.data_dir,
-        &PersistedSettings {
-            record_audio: state.capture.record_audio(),
-            excluded_bundle_ids: state
-                .excluded_bundle_ids
-                .lock()
-                .map(|ids| ids.clone())
-                .unwrap_or_default(),
-            llm_provider: llm.provider,
-            llm_base_url: llm.base_url,
-            llm_model: llm.model,
-            llm_api_key: llm.api_key.unwrap_or_default(),
-        },
-    )
+    PersistedSettings {
+        record_audio: state.capture.record_audio(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
+        excluded_bundle_ids: state
+            .excluded_bundle_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default(),
+        llm_provider: llm.provider,
+        llm_base_url: llm.base_url,
+        llm_model: llm.model,
+        llm_api_key: llm.api_key.unwrap_or_default(),
+    }
 }
 
 async fn update_settings(
     state: &Arc<AppState>,
     record_audio: Option<bool>,
+    storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
 ) -> Response {
+    if let Some(bytes) = storage_limit_bytes {
+        let previous = state.store.storage_limit_bytes();
+        let mut pending = persisted_settings(state);
+        pending.storage_limit_bytes = bytes;
+        if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
+            return Response::failure(format!("could not save storage limit: {error}"));
+        }
+        if let Err(error) = state.store.set_storage_limit_bytes(bytes) {
+            let mut rollback = persisted_settings(state);
+            rollback.storage_limit_bytes = previous;
+            let _ = save_persisted_settings(&state.data_dir, &rollback);
+            return Response::failure(format!("could not apply storage limit: {error}"));
+        }
+    }
     if let Some(enabled) = record_audio {
         let previous = state.capture.record_audio();
         state.capture.set_record_audio(enabled);
@@ -1589,12 +1614,19 @@ mod tests {
         assert_eq!(clear_stale_capture_files(directory.path()).unwrap(), 0);
     }
 
+    #[test]
+    fn legacy_settings_default_to_one_hundred_gigabytes() {
+        let settings: PersistedSettings =
+            serde_json::from_str(r#"{"record_audio":false}"#).unwrap();
+        assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
     fn test_vault() -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )

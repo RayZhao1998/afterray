@@ -8,7 +8,8 @@
 
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
-    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Memory, Moment, SearchHit, Session,
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, DEFAULT_STORAGE_LIMIT_BYTES, Memory,
+    Moment, SearchHit, Session,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -37,7 +38,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -54,7 +58,8 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
-    AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
+    AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
+    parse_accessibility_digest,
 };
 pub use slot::{
     AppFact, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS, SlotCard, SlotEvidence,
@@ -69,6 +74,8 @@ const ARTIFACT_FORMAT_VERSION: i64 = 1;
 const NONCE_LENGTH: usize = 24;
 const WRAPPED_DEK_LENGTH: usize = 32 + 16;
 const ARTIFACT_HEADER_LENGTH: usize = 4 + NONCE_LENGTH;
+const ARTIFACT_FILE_OVERHEAD_BYTES: i64 = (ARTIFACT_HEADER_LENGTH + 16) as i64;
+const RETENTION_BATCH_SIZE: i64 = 256;
 const DATABASE_KEY_CONTEXT: &str = "dev.afterray.vault.database-key.v1";
 const ARTIFACT_WRAP_KEY_CONTEXT: &str = "dev.afterray.vault.artifact-wrap-key.v1";
 const KEYCHAIN_SERVICE: &str = "dev.afterray.v0.vault";
@@ -316,14 +323,14 @@ fn decode_key(value: &[u8]) -> Result<VaultKey, StoreError> {
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
     pub data_dir: PathBuf,
-    pub max_unstarred_moments: usize,
+    pub max_storage_bytes: u64,
 }
 
 impl Default for VaultConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            max_unstarred_moments: 10_000,
+            max_storage_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
         }
     }
 }
@@ -334,7 +341,7 @@ pub struct Vault {
     artifact_wrap_key: Zeroizing<[u8; 32]>,
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
-    max_unstarred_moments: usize,
+    max_storage_bytes: AtomicU64,
 }
 
 impl Vault {
@@ -371,12 +378,36 @@ impl Vault {
             )),
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
-            max_unstarred_moments: config.max_unstarred_moments,
+            max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
         let _ = vault.cleanup_unreferenced_gop_artifacts();
+        vault.enforce_retention()?;
         Ok(vault)
+    }
+
+    #[must_use]
+    pub fn storage_limit_bytes(&self) -> u64 {
+        self.max_storage_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_storage_limit_bytes(&self, bytes: u64) -> Result<(), StoreError> {
+        let previous = self.max_storage_bytes.swap(bytes, Ordering::Relaxed);
+        if let Err(error) = self.enforce_retention() {
+            self.max_storage_bytes.store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn storage_usage_bytes(&self) -> Result<u64, StoreError> {
+        let bytes = self.connection.lock().unwrap().query_row(
+            "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+            [ARTIFACT_FILE_OVERHEAD_BYTES],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
     pub fn create_session_sync(&self, started_at_ms: i64) -> Result<Session, StoreError> {
@@ -784,10 +815,14 @@ impl Vault {
         let slot_start_ms = slot::slot_start_for(at_ms);
         let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
         let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
-        // Selected text and the focused value live in the encrypted AX
-        // artifact, not in the moments table. One decrypt+parse per frame at
-        // T1 build time (once per half hour) is the price of surfacing the
-        // two strongest intent signals the digest carries.
+        // The AX artifact is decrypted once per frame at T1 build time
+        // (once per half hour). It yields the two strongest intent signals
+        // (selection, composition) and, when the tree is rich enough, the
+        // frame's text itself: AX text is exact where OCR guesses, and is
+        // scoped to the frontmost app — the thing the user was operating,
+        // not everything on screen. Measured on a real slot, the two
+        // sources barely merge (60KB + 73KB ≈ 132KB combined), so this is
+        // a per-frame either/or, never a blend.
         for row in &mut rows {
             if !row.ax_present {
                 continue;
@@ -796,6 +831,12 @@ impl Vault {
                 let digest = parse_accessibility_digest(&bytes);
                 row.selected_text = digest.selected_text;
                 row.focused_value = digest.focused_value;
+                let lines = accessibility_text_lines(&bytes);
+                let chars: usize = lines.iter().map(|line| line.chars().count()).sum();
+                if chars >= slot::AX_TEXT_MIN_CHARS {
+                    row.ocr_text = Some(lines.join("\n"));
+                    row.text_from_ax = true;
+                }
             }
         }
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
@@ -842,6 +883,7 @@ impl Vault {
                 ocr_text: row.get(7)?,
                 selected_text: None,
                 focused_value: None,
+                text_from_ax: false,
                 ax_present: row.get(8)?,
                 has_audio: row.get(9)?,
             })
@@ -1588,111 +1630,170 @@ impl Vault {
 
     #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
-        let max = i64::try_from(self.max_unstarred_moments).unwrap_or(i64::MAX);
-        let mut connection = self.connection.lock().unwrap();
-        let count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM moments", [], |row| row.get(0))?;
-        let excess = count.saturating_sub(max).max(0);
-        if excess == 0 {
-            return Ok(());
-        }
-        let transaction = connection.transaction()?;
-        let candidates = {
-            let mut statement = transaction.prepare(
-                "SELECT id, image_artifact_id, accessibility_artifact_id
-                   FROM moments
-                 ORDER BY captured_at_ms ASC LIMIT ?1",
+        loop {
+            let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
+            let mut connection = self.connection.lock().unwrap();
+            let used: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+                [ARTIFACT_FILE_OVERHEAD_BYTES],
+                |row| row.get(0),
             )?;
-            statement
-                .query_map([excess], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut gop_artifact_ids = Vec::new();
-        for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE moment_id = ?1)",
-                [moment_id],
-            )?;
-            transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
-            transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-            if let Some(artifact_id) = artifact_id {
-                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            let excess = used.saturating_sub(max).max(0);
+            if excess == 0 {
+                return Ok(());
             }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                transaction.execute(
-                    "DELETE FROM artifacts WHERE id = ?1",
-                    [accessibility_artifact_id],
+
+            let transaction = connection.transaction()?;
+            let candidate_pool = {
+                let mut statement = transaction.prepare(
+                    "SELECT m.id, m.image_artifact_id, m.accessibility_artifact_id,
+                            COALESCE(image.byte_length + ?1, 0)
+                              + COALESCE(accessibility.byte_length + ?1, 0)
+                              + CASE
+                                  WHEN m.gop_segment_id IS NOT NULL
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM moments favorite
+                                      WHERE favorite.gop_segment_id = m.gop_segment_id
+                                        AND favorite.is_favorite = 1
+                                   )
+                                  THEN COALESCE(gop_artifact.byte_length + ?1, 0)
+                                    / MAX((
+                                        SELECT COUNT(*) FROM moments sibling
+                                         WHERE sibling.gop_segment_id = m.gop_segment_id
+                                           AND sibling.is_favorite = 0
+                                      ), 1)
+                                  ELSE 0
+                                END
+                       FROM moments m
+                       LEFT JOIN artifacts image ON image.id = m.image_artifact_id
+                       LEFT JOIN artifacts accessibility
+                         ON accessibility.id = m.accessibility_artifact_id
+                       LEFT JOIN gop_segments gop ON gop.id = m.gop_segment_id
+                       LEFT JOIN artifacts gop_artifact ON gop_artifact.id = gop.artifact_id
+                      WHERE m.is_favorite = 0
+                        AND (
+                          image.id IS NOT NULL
+                          OR accessibility.id IS NOT NULL
+                          OR m.gop_segment_id IS NULL
+                          OR NOT EXISTS (
+                            SELECT 1 FROM moments favorite
+                             WHERE favorite.gop_segment_id = m.gop_segment_id
+                               AND favorite.is_favorite = 1
+                          )
+                        )
+                      ORDER BY m.captured_at_ms ASC, m.id ASC
+                      LIMIT ?2",
                 )?;
+                statement
+                    .query_map(
+                        params![ARTIFACT_FILE_OVERHEAD_BYTES, RETENTION_BATCH_SIZE],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut estimated_reclaim = 0_i64;
+            let mut candidates = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id, bytes) in candidate_pool {
+                candidates.push((moment_id, artifact_id, accessibility_artifact_id));
+                estimated_reclaim = estimated_reclaim.saturating_add(bytes.max(0));
+                if bytes <= 0 || estimated_reclaim >= excess {
+                    break;
+                }
             }
-        }
-        let empty_segments: Vec<(String, Option<String>)> = {
-            let mut statement = transaction.prepare(
-                "SELECT id, artifact_id FROM gop_segments
-                  WHERE id NOT IN (
-                    SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
-                  )
-                  AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
-            )?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &empty_segments {
-            transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
-            if let Some(artifact_id) = artifact_id {
+
+            let mut gop_artifact_ids = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE moment_id = ?1)",
+                    [moment_id],
+                )?;
+                transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
+                transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+                if let Some(artifact_id) = artifact_id {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                }
+                if let Some(accessibility_artifact_id) = accessibility_artifact_id {
+                    transaction.execute(
+                        "DELETE FROM artifacts WHERE id = ?1",
+                        [accessibility_artifact_id],
+                    )?;
+                }
+            }
+            let empty_segments: Vec<(String, Option<String>)> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, artifact_id FROM gop_segments
+                      WHERE id NOT IN (
+                        SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
+                      )
+                      AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &empty_segments {
+                transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+                if let Some(artifact_id) = artifact_id {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                    gop_artifact_ids.push(artifact_id.clone());
+                }
+            }
+            let audio_candidates = {
+                let mut statement = transaction.prepare(
+                    "SELECT audio.id, audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM moments m
+                         WHERE m.session_id = audio.session_id
+                           AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                      )",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &audio_candidates {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
+                    [segment_id],
+                )?;
+                transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
                 transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-                gop_artifact_ids.push(artifact_id.clone());
             }
-        }
-        let audio_candidates = {
-            let mut statement = transaction.prepare(
-                "SELECT audio.id, audio.audio_artifact_id
-                   FROM audio_segments audio
-                  WHERE NOT EXISTS (
-                    SELECT 1 FROM moments m
-                     WHERE m.session_id = audio.session_id
-                       AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                  )",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &audio_candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
-                [segment_id],
-            )?;
-            transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
-            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-        }
-        transaction.commit()?;
-        drop(connection);
-        for (_, artifact_id, accessibility_artifact_id) in candidates {
-            if let Some(artifact_id) = artifact_id {
+            let removed_anything = !candidates.is_empty()
+                || !gop_artifact_ids.is_empty()
+                || !audio_candidates.is_empty();
+            transaction.commit()?;
+            drop(connection);
+            for (_, artifact_id, accessibility_artifact_id) in candidates {
+                if let Some(artifact_id) = artifact_id {
+                    let _ = fs::remove_file(self.artifact_path(&artifact_id));
+                }
+                if let Some(accessibility_artifact_id) = accessibility_artifact_id {
+                    let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
+                }
+            }
+            for artifact_id in gop_artifact_ids {
                 let _ = fs::remove_file(self.artifact_path(&artifact_id));
             }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
+            for (_, artifact_id) in audio_candidates {
+                let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            }
+            if !removed_anything {
+                return Ok(());
             }
         }
-        for artifact_id in gop_artifact_ids {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        for (_, artifact_id) in audio_candidates {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        Ok(())
     }
 
     fn artifact_path(&self, id: &str) -> PathBuf {
@@ -2580,12 +2681,16 @@ mod pipeline_bench;
 mod tests {
     use super::*;
 
-    fn test_vault(max: usize) -> (tempfile::TempDir, Vault) {
+    fn test_vault(max_storage_gigabytes: u64) -> (tempfile::TempDir, Vault) {
+        test_vault_with_storage_limit(max_storage_gigabytes.saturating_mul(1_000_000_000))
+    }
+
+    fn test_vault_with_storage_limit(max_storage_bytes: u64) -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: max,
+                max_storage_bytes,
             },
             [7_u8; 32],
         )
@@ -2630,7 +2735,7 @@ mod tests {
         let result = Vault::open(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             &provider,
         );
@@ -2734,7 +2839,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             master_key,
         )
@@ -2758,7 +2863,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let master_key = [23_u8; 32];
         let vault = Vault::open_with_key(config.clone(), master_key).unwrap();
@@ -2912,8 +3017,8 @@ mod tests {
     }
 
     #[test]
-    fn retention_evicts_oldest_moments() {
-        let (_directory, vault) = test_vault(2);
+    fn storage_retention_evicts_oldest_moments() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
         let session = vault.create_session_sync(1).unwrap();
         let first = vault
             .insert_moment(&session.id, 1, "image/jpeg", b"one")
@@ -2936,6 +3041,156 @@ mod tests {
         assert!(!ids.contains(&second.id.as_str()));
         assert!(ids.contains(&third.id.as_str()));
         assert!(ids.contains(&fourth.id.as_str()));
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn lowering_storage_limit_prunes_immediately() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let third = vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+
+        vault.set_storage_limit_bytes(100).unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(ids.contains(&second.id));
+        assert!(ids.contains(&third.id));
+        assert_eq!(vault.storage_limit_bytes(), 100);
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn opening_vault_applies_persisted_storage_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: data_dir.clone(),
+                max_storage_bytes: 10_000,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+        drop(vault);
+
+        let reopened = Vault::open_with_key(
+            VaultConfig {
+                data_dir,
+                max_storage_bytes: 100,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let ids = reopened
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(reopened.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn storage_retention_keeps_favorites() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
+        let session = vault.create_session_sync(1).unwrap();
+        let favorite = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"favorite")
+            .unwrap();
+        vault.set_favorite(&favorite.id, true).unwrap();
+        let removable = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"temporary")
+            .unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&favorite.id));
+        assert!(!ids.contains(&removable.id));
+    }
+
+    #[test]
+    fn retention_keeps_unstarred_moments_when_their_shared_gop_is_pinned() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let ids = vec![first.id.clone(), second.id.clone()];
+        let frames = vec![
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 8,
+                content_hash: [1; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 8,
+                byte_length: 8,
+                content_hash: [2; 32],
+            },
+        ];
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                started_at_ms: 1,
+                ended_at_ms: 2,
+                content_hash: "shared",
+                frames: &frames,
+            })
+            .unwrap();
+        vault.mark_gop_ready(&segment).unwrap();
+        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 2);
+        vault.set_favorite(&first.id, true).unwrap();
+        let usage = vault.storage_usage_bytes().unwrap();
+
+        vault.set_storage_limit_bytes(usage - 1).unwrap();
+
+        let remaining = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|moment| moment.id == second.id));
+        assert!(vault.storage_usage_bytes().unwrap() > vault.storage_limit_bytes());
     }
 
     #[test]
@@ -3178,6 +3433,10 @@ mod tests {
             .unwrap();
         let live = vault.live_gop_frames(&segment).unwrap();
         assert_eq!(live.len(), 6);
+        let storage_before_new_moment = vault.storage_usage_bytes().unwrap();
+        vault
+            .set_storage_limit_bytes(storage_before_new_moment)
+            .unwrap();
         vault
             .insert_moment(&session.id, 80_000, "image/jpeg", &jpeg)
             .unwrap();
@@ -3805,7 +4064,7 @@ mod tests {
         let key = [7_u8; 32];
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let session_id = {
             let vault = Vault::open_with_key(config.clone(), key).unwrap();
