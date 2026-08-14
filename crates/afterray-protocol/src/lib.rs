@@ -384,6 +384,30 @@ pub enum HistoryScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Conversation {
+    pub id: String,
+    pub title: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub conversation_id: String,
+    /// `user` or `assistant`.
+    pub role: String,
+    pub content: String,
+    /// Which tools the assistant ran for this turn, as JSON. Kept so the UI
+    /// can show its work and a later session can tell what was already
+    /// looked up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_log: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Memory {
     pub id: String,
     pub start_ms: i64,

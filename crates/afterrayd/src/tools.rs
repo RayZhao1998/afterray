@@ -23,6 +23,9 @@ impl ToolHost<'_> {
             "search_evidence" => self.search_evidence(args).await,
             "list_activity" => self.list_activity(args),
             "list_memories" => self.list_memories(args),
+            "list_moments" => self.list_moments(args),
+            "get_transcript" => self.get_transcript(args),
+            "get_slot_card" => self.get_slot_card(args),
             "get_moment" => self.get_moment(args),
             "get_ocr" => self.get_ocr(args),
             "get_ax_digest" => self.get_ax_digest(args),
@@ -75,6 +78,54 @@ impl ToolHost<'_> {
             .memories(from_ms, to_ms, limit)
             .map_err(|e| e.to_string())?;
         Ok(serde_json::to_string_pretty(&memories).unwrap_or_else(|_| "[]".into()))
+    }
+
+    /// Moments in a window: the bridge from "three o'clock yesterday" to
+    /// the ids every other evidence tool needs.
+    fn list_moments(&self, args: &Value) -> Result<String, String> {
+        let (from_ms, to_ms, limit) = range_args(args, DEFAULT_LIST_LIMIT, 200)?;
+        let moments = self
+            .store
+            .moment_ids_in_range(from_ms, to_ms, limit)
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<Value> = moments
+            .into_iter()
+            .map(|(id, at_ms)| json!({"moment_id": id, "captured_at_ms": at_ms}))
+            .collect();
+        Ok(serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into()))
+    }
+
+    /// Speech in a window. Transcripts hang off audio segments rather than
+    /// moments, so without this a meeting is unreachable by time alone.
+    fn get_transcript(&self, args: &Value) -> Result<String, String> {
+        let (from_ms, to_ms, limit) = range_args(args, 60, 400)?;
+        let rows = self
+            .store
+            .transcripts_in_range(from_ms, to_ms, limit)
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok("[] // no speech was recorded in this window".to_owned());
+        }
+        let items: Vec<Value> = rows
+            .into_iter()
+            .map(|(at_ms, track, text)| json!({"at_ms": at_ms, "track": track, "text": text}))
+            .collect();
+        Ok(serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into()))
+    }
+
+    /// The deterministic 30-minute card: application time, the run
+    /// timeline with its deduplicated screen text, and revisits. One call
+    /// covers a half hour that would otherwise take dozens of frame reads.
+    fn get_slot_card(&self, args: &Value) -> Result<String, String> {
+        let at_ms = args
+            .get("at_ms")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "get_slot_card requires at_ms".to_owned())?;
+        let card = self
+            .store
+            .slot_card(at_ms, 10_000)
+            .map_err(|e| e.to_string())?;
+        Ok(afterray_store::render_t2_prompt(&card, &[], "the user's language"))
     }
 
     fn get_moment(&self, args: &Value) -> Result<String, String> {
@@ -230,14 +281,34 @@ fn truncate_tool_output(text: &str) -> String {
 /// Catalog shown to the LLM in agent prompts.
 #[must_use]
 pub fn tool_catalog_text() -> &'static str {
-    r#"Tools (call at most one per reply):
-- search_evidence: {"query":"…","from_ms":0,"to_ms":0,"limit":8}
+    r#"Tools (call at most one per reply). Timestamps are Unix milliseconds.
+
+Start wide, then narrow:
+- get_slot_card: {"at_ms":0}
+    A whole 30-minute window at once: which apps for how long, a timeline of
+    what was open, the screen text each stretch introduced, and what the
+    person kept returning to. Usually the cheapest way to answer "what was I
+    doing around <time>".
 - list_activity: {"from_ms":0,"to_ms":0,"limit":40}
+    Application and document spans over a range — good for spotting when
+    something started or stopped.
+- search_evidence: {"query":"…","from_ms":0,"to_ms":0,"limit":8}
+    Full-text and semantic search across captured screen text.
 - list_memories: {"from_ms":0,"to_ms":0,"limit":40}
-- get_moment: {"moment_id":"…"}
-- get_ocr: {"moment_id":"…"}  // screen text + bounding boxes
-- get_ax_digest: {"moment_id":"…"}  // compact accessibility summary
-- get_ax_tree: {"moment_id":"…"}  // full AX JSON (expensive; use rarely)
+    Short notes already written for each stretch of activity.
+- list_moments: {"from_ms":0,"to_ms":0,"limit":40}
+    Capture ids and their timestamps — use when you know a time but need an
+    id for the tools below.
+
+Then, for one captured instant:
+- get_moment: {"moment_id":"…"}       metadata, and transcript_text if any
+- get_ocr: {"moment_id":"…"}          text read off the screen, with boxes
+- get_ax_digest: {"moment_id":"…"}    compact accessibility summary
+- get_ax_tree: {"moment_id":"…"}      full accessibility JSON (large; rare)
+
+And for speech:
+- get_transcript: {"from_ms":0,"to_ms":0,"limit":60}
+    Everything said in a window, across microphone and system audio.
 
 Reply format (exactly one):
 TOOL <name>

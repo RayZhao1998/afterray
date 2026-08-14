@@ -8,8 +8,8 @@
 
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
-    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, DEFAULT_STORAGE_LIMIT_BYTES, Memory,
-    Moment, SearchHit, Session,
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Conversation, ConversationMessage,
+    DEFAULT_STORAGE_LIMIT_BYTES, Memory, Moment, SearchHit, Session,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -61,13 +61,20 @@ pub use memory::{
     AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
     parse_accessibility_digest,
 };
+/// One stretch of transcribed speech: when it started, which track it came
+/// from, and what was said.
+pub type TranscriptLine = (i64, String, String);
+
+/// A capture id paired with the instant it was taken.
+pub type MomentAt = (String, i64);
+
 pub use slot::{
     AppFact, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS, SlotCard, SlotEvidence,
     SlotFacts, SlotMomentRow, SlotState, T2_SYSTEM_PROMPT, TimelineEntry, build_slot_card,
     local_day_for, render_t2_prompt, shorten_place, slot_start_for,
 };
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -916,6 +923,64 @@ impl Vault {
         Ok(total.min(to_ms.saturating_sub(from_ms)))
     }
 
+    /// Speech transcribed in a window, oldest first.
+    ///
+    /// Meetings are otherwise unreachable to an agent: transcripts hang off
+    /// audio segments, not moments, so asking about "the call at three" has
+    /// no moment id to start from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn transcripts_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<TranscriptLine>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT te.started_at_ms, COALESCE(a.track, 'unknown'), te.text
+               FROM text_evidence te
+               LEFT JOIN audio_segments a ON a.id = te.audio_segment_id
+              WHERE te.source = 'transcript'
+                AND te.started_at_ms >= ?1 AND te.started_at_ms <= ?2
+              ORDER BY te.started_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Moments captured in a window, oldest first. Entry points for an agent
+    /// that knows a time but no ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_ids_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MomentAt>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms FROM moments
+              WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+              ORDER BY captured_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
     /// Nearest moment to `at_ms`, in either direction.
     ///
     /// # Errors
@@ -933,6 +998,133 @@ impl Vault {
             Some(row) => Some(row.get(0)?),
             None => None,
         })
+    }
+
+    /// Creates a conversation and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn create_conversation(&self, title: &str, now_ms: i64) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO conversations (id, title, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![id, title, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Conversations, most recently touched first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              ORDER BY c.updated_at_ms DESC
+              LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Appends a message and bumps the conversation's updated timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either write fails.
+    pub fn append_message(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        tool_log: Option<&str>,
+        now_ms: i64,
+    ) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO conversation_messages
+               (id, conversation_id, role, content, tool_log, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, conversation_id, role, content, tool_log, now_ms],
+        )?;
+        connection.execute(
+            "UPDATE conversations SET updated_at_ms = ?2 WHERE id = ?1",
+            params![conversation_id, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Messages of one conversation in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, conversation_id, role, content, tool_log, created_at_ms
+               FROM conversation_messages
+              WHERE conversation_id = ?1
+              ORDER BY created_at_ms, id",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            Ok(ConversationMessage {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_log: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Renames a conversation — used to replace the placeholder title with
+    /// one derived from the opening question.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a conversation and, by cascade, its messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_conversation(&self, id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {
@@ -2009,6 +2201,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_8(connection)?;
     migrate_schema_9(connection)?;
     migrate_schema_10(connection)?;
+    migrate_schema_11(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2314,6 +2507,34 @@ fn migrate_schema_10(connection: &Connection) -> Result<(), StoreError> {
     if !columns.iter().any(|name| name == "layout_json") {
         connection.execute("ALTER TABLE text_evidence ADD COLUMN layout_json TEXT", [])?;
     }
+    Ok(())
+}
+
+/// Chat lives in the vault like every other capture: encrypted at rest and
+/// removed by the same retention and clear-history paths. A conversation
+/// about what you did all day is as revealing as the recording it is about.
+fn migrate_schema_11(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversations (
+           id TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversations_updated
+           ON conversations(updated_at_ms DESC);
+         CREATE TABLE IF NOT EXISTS conversation_messages (
+           id TEXT PRIMARY KEY,
+           conversation_id TEXT NOT NULL
+             REFERENCES conversations(id) ON DELETE CASCADE,
+           role TEXT NOT NULL,
+           content TEXT NOT NULL,
+           tool_log TEXT,
+           created_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversation_messages_thread
+           ON conversation_messages(conversation_id, created_at_ms);",
+    )?;
     Ok(())
 }
 
@@ -4026,6 +4247,43 @@ mod tests {
         let stored = vault.ocr_layout_for_moment(&moment.id).unwrap();
         assert_eq!(stored.as_deref(), Some(layout));
         assert!(vault.ocr_layout_for_moment("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn conversations_round_trip_and_cascade_on_delete() {
+        let (_directory, vault) = test_vault(10);
+        let id = vault.create_conversation("Untitled", 1_000).unwrap();
+        vault
+            .append_message(&id, "user", "昨天下午我在干嘛？", None, 1_100)
+            .unwrap();
+        vault
+            .append_message(
+                &id,
+                "assistant",
+                "你在调 GOP 打包。",
+                Some(r#"[{"tool":"list_activity"}]"#),
+                1_200,
+            )
+            .unwrap();
+        vault.rename_conversation(&id, "昨天下午").unwrap();
+
+        let listed = vault.conversations(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "昨天下午");
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].updated_at_ms, 1_200, "append bumps updated_at");
+
+        let messages = vault.conversation_messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[1].tool_log.is_some(), "tool log survives");
+
+        vault.delete_conversation(&id).unwrap();
+        assert!(vault.conversations(10).unwrap().is_empty());
+        assert!(
+            vault.conversation_messages(&id).unwrap().is_empty(),
+            "messages cascade with the conversation"
+        );
     }
 
     #[test]
