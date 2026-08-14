@@ -88,6 +88,24 @@ for a third-party process or service after data has crossed that boundary.
 > still contains operational commands and is not yet the scoped, read-only
 > Context Gateway planned for the public release.
 
+## What works today
+
+- Automatic recording after the required macOS permissions are approved.
+- A native macOS timeline with horizontal drag-to-recall.
+- Screenshot previews, OCR text, transcripts, and audio playback by moment.
+- Full-text and local embedding search across captured evidence, including the
+  titles of the windows you had open.
+- A search result set you travel rather than read: pressing return lands on the
+  newest match, the matched words are highlighted in place on the frame, and a
+  filmstrip of matched frames replaces the timeline while the search is open.
+- Local session summaries through a built-in GGUF, local Ollama, or an
+  OpenAI-compatible endpoint.
+- Favorites that survive automatic retention cleanup.
+- An encrypted local vault backed by SQLCipher and XChaCha20-Poly1305.
+- A Rust CLI that exposes the same API used by the Swift app.
+- A standalone Visual Lab for iterating on recall UI with deterministic mock
+  data.
+
 ## Requirements
 
 - Apple Silicon Mac (M3 or newer recommended).

@@ -29,6 +29,11 @@ public protocol RecallDaemonServing: Sendable {
     func artifact(id: String) async throws -> ArtifactPayload
     func gopSegment(id: String) async throws -> ArtifactPayload
     func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload
+    /// Smallest pixels available for a moment. Usually a cached JPEG thumbnail,
+    /// but moments packed before thumbnails existed answer with the IVF frame —
+    /// always decode by `contentType`, never by assumption.
+    func thumbnail(momentID: String, maxEdge: Int?) async throws -> ArtifactPayload
+    func evidenceOcr(momentID: String) async throws -> OcrEvidence
     func setFavorite(momentID: String, favorite: Bool) async throws
 }
 
@@ -43,6 +48,14 @@ public extension RecallDaemonServing {
 
     func daySummary(dayMs _: Int64) async throws -> DaySummary {
         .empty
+    }
+
+    func thumbnail(momentID _: String, maxEdge _: Int?) async throws -> ArtifactPayload {
+        throw DaemonClientError.rejected("thumbnail reads are not available")
+    }
+
+    func evidenceOcr(momentID _: String) async throws -> OcrEvidence {
+        throw DaemonClientError.rejected("ocr evidence is not available")
     }
 }
 
@@ -121,7 +134,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 5
+    public static let protocolVersion = 6
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -332,6 +345,19 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
+    public func thumbnail(momentID: String, maxEdge: Int? = nil) async throws -> ArtifactPayload {
+        try await framed(
+            WireRequest(type: "read_thumbnail", momentID: momentID, maxEdge: maxEdge)
+        )
+    }
+
+    public func evidenceOcr(momentID: String) async throws -> OcrEvidence {
+        try await request(
+            WireRequest(type: "evidence_ocr", momentID: momentID),
+            as: OcrEvidence.self
+        )
+    }
+
     private func framed(_ request: WireRequest) async throws -> ArtifactPayload {
         let encoder = JSONEncoder()
         var payload = try encoder.encode(request)
@@ -405,6 +431,7 @@ struct WireRequest: Encodable, Equatable {
     var segmentID: String?
     var gopIndex: UInt16?
     var gopMode: String?
+    var maxEdge: Int?
     var excludedBundleIds: [String]?
     var historyScope: String?
     var llmProvider: String?
@@ -439,6 +466,7 @@ struct WireRequest: Encodable, Equatable {
         case segmentID = "segment_id"
         case gopIndex = "index"
         case gopMode = "mode"
+        case maxEdge = "max_edge"
         case excludedBundleIds = "excluded_bundle_ids"
         case historyScope = "scope"
         case llmProvider = "llm_provider"
@@ -475,6 +503,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(segmentID, forKey: .segmentID)
         try container.encodeIfPresent(gopIndex, forKey: .gopIndex)
         try container.encodeIfPresent(gopMode, forKey: .gopMode)
+        try container.encodeIfPresent(maxEdge, forKey: .maxEdge)
         try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
         try container.encodeIfPresent(historyScope, forKey: .historyScope)
         try container.encodeIfPresent(llmProvider, forKey: .llmProvider)

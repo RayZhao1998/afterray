@@ -62,7 +62,10 @@ final class ChatWireTests: XCTestCase {
 
     func testStreamEventDecodesDaemonEnvelope() throws {
         let line = Data(
-            #"{"protocol_version":5,"ok":true,"data":{"kind":"done","message_id":"m1","conversation_id":"c1"}}"#.utf8
+            """
+            {"protocol_version":\(UnixSocketDaemonClient.protocolVersion),"ok":true,\
+            "data":{"kind":"done","message_id":"m1","conversation_id":"c1"}}
+            """.utf8
         )
         let event = try XCTUnwrap(ChatStreamEventDecoder.decode(line: line))
         XCTAssertEqual(event, .done(messageId: "m1", conversationId: "c1"))
@@ -82,7 +85,12 @@ final class ChatWireTests: XCTestCase {
     }
 
     func testEnvelopeErrorBecomesStreamError() throws {
-        let line = Data(#"{"protocol_version":5,"ok":false,"error":"unknown request"}"#.utf8)
+        let line = Data(
+            """
+            {"protocol_version":\(UnixSocketDaemonClient.protocolVersion),"ok":false,\
+            "error":"unknown request"}
+            """.utf8
+        )
         XCTAssertEqual(
             try ChatStreamEventDecoder.decode(line: line),
             .error(message: "unknown request")

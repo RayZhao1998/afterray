@@ -48,6 +48,7 @@ private struct VisualLabView: View {
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
+    @State private var searchSession: RecallSearchSession?
     /// A lab-only store so tinkering never rebinds the shipping shortcut.
     @State private var labHotKeys: RecallHotKeyStore
     @State private var onboardingModel: AfterRayOnboardingModel
@@ -63,7 +64,7 @@ private struct VisualLabView: View {
     init() {
         let hotKeys = RecallHotKeyStore(storageKey: "dev.afterray.visual-lab.hotkey")
         _labHotKeys = State(initialValue: hotKeys)
-        _onboardingModel = State(initialValue: AfterRayOnboardingModel(hotKeys: hotKeys))
+        _onboardingModel = State(initialValue: Self.makeOnboardingModel(hotKeys: hotKeys))
     }
 
     private var moments: [RecallMoment] {
@@ -97,11 +98,30 @@ private struct VisualLabView: View {
                 onboardingLab
             }
         }
-        .onChange(of: scenario) { _, newScenario in
+        .onChange(of: scenario, initial: true) { _, newScenario in
             favoriteOverrides = []
+            searchSession = newScenario.searchSession
             let moments = newScenario.moments
+            // Search mode opens on its newest match, exactly as the app does.
+            if let frame = searchSession?.selectedFrame,
+               let match = moments.first(where: { $0.id == frame.momentId })
+            {
+                playheadMs = match.capturedAtMs
+                return
+            }
             let index = min(max(moments.count / 2, 0), max(moments.count - 1, 0))
             playheadMs = moments.indices.contains(index) ? moments[index].capturedAtMs : 0
+        }
+    }
+
+    /// Mirrors the app: selecting a filmstrip cell moves the playhead, which
+    /// re-runs the crossfade and re-arms the OCR highlight.
+    private func selectSearchFrame(_ index: Int) {
+        guard var session = searchSession, session.frames.indices.contains(index) else { return }
+        session.selectedIndex = index
+        searchSession = session
+        if let match = moments.first(where: { $0.id == session.frames[index].momentId }) {
+            playheadMs = match.capturedAtMs
         }
     }
 
@@ -115,7 +135,11 @@ private struct VisualLabView: View {
                 imageLoader: MockArtifactFactory.loader,
                 onToggleFavorite: toggleFavorite,
                 onToggleAudio: { _ in },
-                daySummary: labDaySummary
+                daySummary: labDaySummary,
+                searchSession: searchSession,
+                thumbnailLoader: MockSearchData.thumbnailLoader,
+                ocrLoader: MockSearchData.ocrLoader,
+                onSelectSearchFrame: selectSearchFrame
             )
             .frame(minWidth: 760)
 
@@ -152,7 +176,84 @@ private struct VisualLabView: View {
     private static let labGreetings = ["Good morning.", "Good afternoon.", "Good evening.", "Still up?"]
 
     private func replayOnboarding() {
-        onboardingModel = AfterRayOnboardingModel(hotKeys: labHotKeys)
+        onboardingModel = Self.makeOnboardingModel(hotKeys: labHotKeys)
+    }
+
+    @MainActor
+    private static func makeOnboardingModel(hotKeys: RecallHotKeyStore) -> AfterRayOnboardingModel {
+        let models = PreviewOnboardingModels()
+        return AfterRayOnboardingModel(
+            hotKeys: hotKeys,
+            cliActions: AfterRayOnboardingCliActions(
+                status: { "Preview CLI is ready." },
+                isInstalled: { true },
+                install: {}
+            ),
+            modelActions: AfterRayOnboardingModelActions(
+                status: { models.library },
+                download: { packID in models.install(packID) }
+            )
+        )
+    }
+
+    @MainActor
+    private final class PreviewOnboardingModels {
+        var library = ModelLibrary(
+            directory: "/Users/demo/Library/Application Support/AfterRay/Models",
+            packs: [
+                ModelPack(
+                    id: "asr",
+                    name: "Qwen3 ASR",
+                    capability: "asr",
+                    path: "/tmp/Qwen3-ASR-1.7B",
+                    present: false,
+                    bytes: 0,
+                    required: true,
+                    expectedBytes: 4_200_000_000
+                ),
+                ModelPack(
+                    id: "embedding",
+                    name: "Text embeddings",
+                    capability: "embedding",
+                    path: "/tmp/nomic.gguf",
+                    present: true,
+                    bytes: 274_000_000,
+                    required: true,
+                    expectedBytes: 274_000_000
+                ),
+                ModelPack(
+                    id: "llm",
+                    name: "Qwen3.6 27B",
+                    capability: "llm",
+                    path: "/tmp/qwen.gguf",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    expectedBytes: 16_817_244_384
+                ),
+            ]
+        )
+
+        func install(_ packID: String) -> ModelLibrary {
+            library = ModelLibrary(
+                directory: library.directory,
+                packs: library.packs.map { pack in
+                    guard pack.id == packID else { return pack }
+                    return ModelPack(
+                        id: pack.id,
+                        name: pack.name,
+                        capability: pack.capability,
+                        path: pack.path,
+                        present: true,
+                        bytes: pack.expectedBytes ?? pack.bytes,
+                        required: pack.required,
+                        note: pack.note,
+                        expectedBytes: pack.expectedBytes
+                    )
+                }
+            )
+            return library
+        }
     }
 
     private var chatLab: some View {
