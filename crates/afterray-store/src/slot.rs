@@ -8,7 +8,7 @@
 //! model's context whole. Everything here is pure and deterministic.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Wall-clock length of one slot.
 pub const SLOT_DURATION_MS: i64 = 30 * 60 * 1000;
@@ -127,7 +127,7 @@ pub enum SlotState {
     NoData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppFact {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,7 +135,7 @@ pub struct AppFact {
     pub ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotFacts {
     pub apps: Vec<AppFact>,
     /// Distinct window titles — kept for the Timeline UI's facts rendering.
@@ -267,6 +267,253 @@ pub fn local_day_for(at_ms: i64) -> String {
                 .to_string()
         },
     )
+}
+
+/// Version written into `slot_summaries.schema_version` for this card shape.
+pub const SLOT_SUMMARY_SCHEMA_VERSION: i64 = 1;
+
+/// Persisted / UI state for a slot row. Wider than T1's gate result:
+/// `degraded` is "T1 facts only", `done` means a T2 title is on the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotSummaryState {
+    Done,
+    SkippedIdle,
+    Paused,
+    Asleep,
+    NoData,
+    Failed,
+    Degraded,
+}
+
+impl SlotSummaryState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::SkippedIdle => "skipped_idle",
+            Self::Paused => "paused",
+            Self::Asleep => "asleep",
+            Self::NoData => "no_data",
+            Self::Failed => "failed",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "done" => Some(Self::Done),
+            "skipped_idle" => Some(Self::SkippedIdle),
+            "paused" => Some(Self::Paused),
+            "asleep" => Some(Self::Asleep),
+            "no_data" => Some(Self::NoData),
+            "failed" => Some(Self::Failed),
+            "degraded" => Some(Self::Degraded),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_t1(state: SlotState) -> Self {
+        match state {
+            SlotState::Ready => Self::Degraded,
+            SlotState::SkippedIdle => Self::SkippedIdle,
+            SlotState::NoData => Self::NoData,
+        }
+    }
+}
+
+/// Structured T2 card. Field names match the prompt contract in `T2_SYSTEM_PROMPT`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct T2Card {
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    pub title: String,
+    #[serde(default)]
+    pub bullets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+/// Stored T2 overlay merged onto a live T1 card.
+#[derive(Debug, Clone, Default)]
+pub struct StoredSlotOverlay {
+    pub state: Option<SlotSummaryState>,
+    pub title: Option<String>,
+    pub bullets: Option<Vec<String>>,
+    pub category: Option<String>,
+}
+
+/// One half-hour row on the day panel. T2 fields are absent until a model runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaySlot {
+    pub slot_start_ms: i64,
+    pub slot_end_ms: i64,
+    pub state: SlotSummaryState,
+    pub facts: SlotFacts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullets: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+/// Every occupied slot on a local calendar day. Empty `slots` is a real
+/// answer — the day had no recordings — not a missing payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaySummary {
+    pub day: String,
+    pub day_start_ms: i64,
+    pub day_end_ms: i64,
+    pub slots: Vec<DaySlot>,
+}
+
+/// Local midnight containing `at_ms` and the next local midnight, as UTC ms.
+///
+/// DST days are 23 or 25 hours; callers must not assume an 86400000 ms span.
+#[must_use]
+pub fn local_day_bounds(at_ms: i64) -> (i64, i64) {
+    use chrono::Local;
+
+    let Some(instant) = chrono::DateTime::from_timestamp_millis(at_ms) else {
+        let start = at_ms - at_ms.rem_euclid(86_400_000);
+        return (start, start.saturating_add(86_400_000));
+    };
+    let date = instant.with_timezone(&Local).date_naive();
+    let start = local_midnight_ms(date).unwrap_or(at_ms);
+    let end = date.succ_opt().map_or(start.saturating_add(86_400_000), |next| {
+        local_midnight_ms(next).unwrap_or(start.saturating_add(86_400_000))
+    });
+    (start, end)
+}
+
+fn local_midnight_ms(date: chrono::NaiveDate) -> Option<i64> {
+    use chrono::{Local, NaiveTime, TimeZone as _};
+
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0)?;
+    Local
+        .from_local_datetime(&date.and_time(midnight))
+        .earliest()
+        .or_else(|| {
+            let one = NaiveTime::from_hms_opt(1, 0, 0)?;
+            Local.from_local_datetime(&date.and_time(one)).earliest()
+        })
+        .map(|datetime| datetime.timestamp_millis())
+}
+
+/// Merges live T1 cards with any stored T2 titles. Slots the model has never
+/// touched stay in the list — that is the whole point of the two-layer card.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn assemble_day_summary(
+    day: String,
+    day_start_ms: i64,
+    day_end_ms: i64,
+    cards: &[SlotCard],
+    overlays: &HashMap<i64, StoredSlotOverlay>,
+) -> DaySummary {
+    let mut starts: BTreeSet<i64> = cards.iter().map(|card| card.slot_start_ms).collect();
+    starts.extend(overlays.keys().copied());
+
+    let cards_by_start: HashMap<i64, &SlotCard> = cards
+        .iter()
+        .map(|card| (card.slot_start_ms, card))
+        .collect();
+
+    let mut slots = Vec::new();
+    for start in starts {
+        let card = cards_by_start.get(&start).copied();
+        let overlay = overlays.get(&start);
+        let title = overlay
+            .and_then(|row| row.title.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(ToOwned::to_owned);
+        let has_moments = card.is_some_and(|card| {
+            card.state != SlotState::NoData && card.facts.moment_count > 0
+        });
+        if !has_moments && title.is_none() {
+            continue;
+        }
+        let facts = card.map_or_else(empty_facts, |card| card.facts.clone());
+        let state = if title.is_some() {
+            overlay
+                .and_then(|row| row.state)
+                .filter(|state| *state == SlotSummaryState::Done || *state == SlotSummaryState::Failed)
+                .unwrap_or(SlotSummaryState::Done)
+        } else if let Some(card) = card {
+            SlotSummaryState::from_t1(card.state)
+        } else {
+            overlay
+                .and_then(|row| row.state)
+                .unwrap_or(SlotSummaryState::Degraded)
+        };
+        slots.push(DaySlot {
+            slot_start_ms: start,
+            slot_end_ms: card.map_or(start + SLOT_DURATION_MS, |card| card.slot_end_ms),
+            state,
+            facts,
+            title,
+            bullets: overlay.and_then(|row| row.bullets.clone()),
+            category: overlay.and_then(|row| row.category.clone()),
+        });
+    }
+
+    DaySummary {
+        day,
+        day_start_ms,
+        day_end_ms,
+        slots,
+    }
+}
+
+/// First balanced `{…}` block, so a model that wraps JSON in prose or a
+/// fenced code block still parses.
+#[must_use]
+pub fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in text[start..].char_indices() {
+        if in_string {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parses a T2 completion into a card. Empty titles are rejected so we never
+/// persist a "successful" row that the panel cannot render as a title.
+#[must_use]
+pub fn parse_t2_card(raw: &str) -> Option<T2Card> {
+    let slice = extract_json_object(raw).unwrap_or(raw);
+    let card: T2Card = serde_json::from_str(slice).ok()?;
+    if card.title.trim().is_empty() {
+        return None;
+    }
+    Some(card)
 }
 
 // ---------------------------------------------------------------- dedup
@@ -966,6 +1213,11 @@ pub fn render_t2_prompt(card: &SlotCard, prev_cards: &[PrevCard], language: &str
     serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_owned())
 }
 
+#[must_use]
+pub fn slot_clock_label(at_ms: i64) -> String {
+    hhmm(at_ms)
+}
+
 fn hhmm(at_ms: i64) -> String {
     use chrono::Local;
 
@@ -1396,5 +1648,85 @@ mod tests {
         );
         assert!(shortened.contains("pr=3407"), "{shortened}");
         assert!(!shortened.contains("2786e718"), "{shortened}");
+    }
+
+    #[test]
+    fn local_day_bounds_contain_the_instant_and_start_at_midnight() {
+        let at = 1_786_698_000_000;
+        let (start, end) = local_day_bounds(at);
+        assert!(start <= at && at < end, "{start} {at} {end}");
+        assert_eq!(local_day_for(start), local_day_for(at));
+        assert_ne!(local_day_for(end), local_day_for(at));
+        let start_local = chrono::DateTime::from_timestamp_millis(start)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(start_local.time(), chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        // DST days are 23h or 25h; a normal day is 24h. Never assume 48 slots.
+        let span = end - start;
+        assert!(
+            (23 * 3_600_000..=25 * 3_600_000).contains(&span),
+            "day span {span}"
+        );
+    }
+
+    #[test]
+    fn assemble_keeps_t1_only_slots_and_overlays_t2_titles() {
+        let start = 1_800_000;
+        let t1_only = build_slot_card(
+            start,
+            &[
+                row("a", start + 1_000, "Xcode", "gop.rs", Some("fn pack")),
+                row("b", start + 20_000, "Xcode", "gop.rs", Some("header")),
+                row("c", start + 40_000, "Safari", "docs.rs", Some("Config")),
+            ],
+            0,
+            10_000,
+        );
+        let t2_slot = start + SLOT_DURATION_MS;
+        let with_t2 = build_slot_card(
+            t2_slot,
+            &[
+                row("d", t2_slot + 1_000, "Lody", "chat", Some("prompt")),
+                row("e", t2_slot + 20_000, "Lody", "chat", Some("reply")),
+                row("f", t2_slot + 40_000, "Terminal", "zsh", Some("cargo test")),
+            ],
+            0,
+            10_000,
+        );
+        let empty = build_slot_card(t2_slot + SLOT_DURATION_MS, &[], 0, 10_000);
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            t2_slot,
+            StoredSlotOverlay {
+                state: Some(SlotSummaryState::Done),
+                title: Some("GOP header still stuck".into()),
+                bullets: Some(vec!["still failing the IVF length check".into()]),
+                category: Some("coding".into()),
+            },
+        );
+        let summary = assemble_day_summary(
+            "2026-08-14".into(),
+            start,
+            start + 86_400_000,
+            &[t1_only, with_t2, empty],
+            &overlays,
+        );
+        assert_eq!(summary.slots.len(), 2, "empty slot stays off the panel");
+        assert_eq!(summary.slots[0].state, SlotSummaryState::Degraded);
+        assert!(summary.slots[0].title.is_none());
+        assert!(!summary.slots[0].facts.apps.is_empty());
+        assert_eq!(summary.slots[1].title.as_deref(), Some("GOP header still stuck"));
+        assert_eq!(summary.slots[1].state, SlotSummaryState::Done);
+        assert_eq!(summary.slots[1].category.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn parse_t2_card_accepts_fenced_json_and_rejects_blank_titles() {
+        let raw = "Sure.\n```json\n{\"title\":\"GOP header\",\"bullets\":[\"still stuck\"],\"category\":\"coding\",\"confidence\":0.8}\n```";
+        let card = parse_t2_card(raw).expect("fenced json");
+        assert_eq!(card.title, "GOP header");
+        assert_eq!(card.category.as_deref(), Some("coding"));
+        assert!(parse_t2_card("{\"title\":\"   \",\"bullets\":[]}").is_none());
+        assert!(parse_t2_card("not json at all").is_none());
     }
 }

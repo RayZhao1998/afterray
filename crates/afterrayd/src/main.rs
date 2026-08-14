@@ -490,6 +490,10 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         },
         Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
         Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
+        Request::DaySummary { day_ms } => {
+            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+            into_response(state.store.day_summary(day_ms, interval_ms))
+        }
         Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
             Ok(prompt) => Response::success(prompt),
             Err(error) => Response::failure(error.to_string()),
@@ -1502,15 +1506,13 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
                 .unwrap_or_else(|| "t2 job did not complete".to_owned()),
         );
     }
-    let raw = match snapshot.output {
-        Some(afterray_models::ModelOutput::Llm { text }) => text,
-        _ => return Response::failure("t2 job returned a non-text output"),
+    let Some(afterray_models::ModelOutput::Llm { text: raw }) = snapshot.output else {
+        return Response::failure("t2 job returned a non-text output");
     };
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let parsed = extract_json_object(&raw).and_then(|slice| {
-        serde_json::from_str::<serde_json::Value>(slice).ok()
-    });
+    let parsed = afterray_store::parse_t2_card(&raw);
+    let card_value = parsed.as_ref().and_then(|card| serde_json::to_value(card).ok());
     eprintln!(
         "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
          parsed={}",
@@ -1520,46 +1522,33 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
         parsed.is_some(),
     );
 
+    if let Some(t2) = parsed.as_ref() {
+        match slot_card_for(state, at_ms) {
+            Ok(card) => {
+                if let Err(error) = state.store.put_t2_summary(
+                    &card,
+                    t2,
+                    &snapshot.adapter,
+                    now_ms(),
+                    i64::try_from(latency_ms).ok(),
+                ) {
+                    eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}");
+            }
+        }
+    }
+
     Response::success(serde_json::json!({
         "slot_start_ms": slot_start_ms,
         "model": snapshot.adapter,
         "latency_ms": latency_ms,
         "prompt_chars": user.chars().count(),
-        "card": parsed,
+        "card": card_value,
         "raw": raw,
     }))
-}
-
-/// First balanced `{…}` block, so a model that wraps JSON in prose or a
-/// fenced code block still parses.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0_i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in text[start..].char_indices() {
-        if in_string {
-            match character {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=start + index]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
@@ -1643,7 +1632,11 @@ fn slot_prompt_for(
         .lock()
         .map_or_else(|_| default_language(), |langs| langs.1.clone());
     let language = resolve_summary_language(&stored);
-    let user = afterray_store::render_t2_prompt(&card, &[], &language);
+    let prev_cards = state
+        .store
+        .previous_slot_titles(card.slot_start_ms, 3)
+        .unwrap_or_default();
+    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language);
     eprintln!(
         "slot.prompt slot={} language={language} user_chars={}",
         card.slot_start_ms,

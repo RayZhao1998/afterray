@@ -193,6 +193,11 @@ enum SlotCommand {
         #[arg(long)]
         user_only: bool,
     },
+    /// The day panel payload: every occupied slot, T2 titles when they exist.
+    Day {
+        #[arg(long = "at-ms")]
+        at_ms: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,6 +305,9 @@ async fn request_from_command(
         Command::Slot {
             command: SlotCommand::Summarize { at_ms },
         } => Request::SlotSummarize { at_ms },
+        Command::Slot {
+            command: SlotCommand::Day { at_ms },
+        } => Request::DaySummary { day_ms: at_ms },
         Command::Slot {
             command: SlotCommand::Prompt { at_ms, user_only },
         } => {

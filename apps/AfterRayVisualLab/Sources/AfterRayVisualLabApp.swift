@@ -41,6 +41,7 @@ private struct VisualLabView: View {
     @State private var settingsPage: AfterRaySettingsPage = CommandLine.arguments.contains("--models") ? .models : .general
     @State private var settingsModel = SettingsPreviewModel()
     @State private var scenario: RecallScenario = .long
+    @State private var daySummaryKind: DaySummaryLabKind = .matching
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
@@ -102,7 +103,8 @@ private struct VisualLabView: View {
                 tuning: tuning,
                 imageLoader: MockArtifactFactory.loader,
                 onToggleFavorite: toggleFavorite,
-                onToggleAudio: { _ in }
+                onToggleAudio: { _ in },
+                daySummary: labDaySummary
             )
             .frame(minWidth: 760)
 
@@ -173,6 +175,13 @@ private struct VisualLabView: View {
                 }
                 .pickerStyle(.menu)
 
+                Picker("Day summary", selection: $daySummaryKind) {
+                    ForEach(DaySummaryLabKind.allCases) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .pickerStyle(.menu)
+
                 VStack(spacing: 18) {
                     TuneSlider(title: "Top scrim", value: $tuning.topScrimOpacity, range: 0...1)
                     TuneSlider(title: "Bottom scrim", value: $tuning.bottomScrimOpacity, range: 0...1)
@@ -190,11 +199,48 @@ private struct VisualLabView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
+    private var labDaySummary: DaySummary {
+        let origin = scenario.moments.first?.capturedAtMs ?? playheadMs
+        switch daySummaryKind {
+        case .matching:
+            scenario.daySummary
+        case .rich:
+            .mockRich(around: origin)
+        case .facts:
+            .mockFactsOnly(around: origin)
+        case .empty:
+            DaySummary(
+                day: DaySummaryLayout.localDayKey(ms: origin),
+                dayStartMs: DaySummaryLayout.dayBounds(ms: origin).start,
+                dayEndMs: DaySummaryLayout.dayBounds(ms: origin).end,
+                slots: []
+            )
+        }
+    }
+
     private func toggleFavorite() {
         guard let selected = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments) else { return }
         let id = selected.id
         if favoriteOverrides.contains(id) { favoriteOverrides.remove(id) }
         else { favoriteOverrides.insert(id) }
+    }
+}
+
+private enum DaySummaryLabKind: String, CaseIterable, Identifiable {
+    case matching
+    case rich
+    case facts
+    case empty
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .matching: "Match scene"
+        case .rich: "T2 titles"
+        case .facts: "Facts only"
+        case .empty: "Empty day"
+        }
     }
 }
 

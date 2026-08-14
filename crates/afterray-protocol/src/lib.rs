@@ -86,6 +86,11 @@ pub enum Request {
     SlotSummarize {
         at_ms: i64,
     },
+    /// Every occupied half-hour on the local day containing `day_ms`.
+    /// Slots the model has never touched are included with facts only.
+    DaySummary {
+        day_ms: i64,
+    },
     EvidenceOcr {
         moment_id: String,
     },
@@ -740,6 +745,12 @@ mod tests {
     fn timeline_cursor_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::TimelineSince { since_ms: 42 }).unwrap();
         assert_eq!(json, r#"{"type":"timeline_since","since_ms":42}"#);
+    }
+
+    #[test]
+    fn day_summary_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::DaySummary { day_ms: 42 }).unwrap();
+        assert_eq!(json, r#"{"type":"day_summary","day_ms":42}"#);
     }
 
     #[test]

@@ -7,9 +7,11 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var playheadMs: Int64 = 0
     @Published public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .ready
+    @Published public private(set) var daySummary: DaySummary = .empty
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
+    private var loadedDayKey: String?
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -27,6 +29,7 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             sessions = loadedSessions
             apply(loaded, preservingSelection: preservingSelection)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -34,6 +37,8 @@ public final class RecallStore: ObservableObject {
             }
             moments = []
             applyPlayhead(0)
+            daySummary = .empty
+            loadedDayKey = nil
             loadState = .failed(message: error.localizedDescription)
         }
     }
@@ -61,6 +66,7 @@ public final class RecallStore: ObservableObject {
             let existingOverlap = Array(moments.dropFirst(prefix.count))
             guard existingOverlap != updated else { return }
             apply(Array(prefix) + updated, preservingSelection: preservingSelection)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -80,6 +86,7 @@ public final class RecallStore: ObservableObject {
         let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
         guard sensitiveGeneration == requestGeneration else { return }
         apply(loaded, selecting: momentID, preservingSelection: preservingSelection)
+        await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
     private func apply(
@@ -116,6 +123,7 @@ public final class RecallStore: ObservableObject {
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
             guard sensitiveGeneration == requestGeneration else { return }
             apply(loaded, selecting: hit.momentId)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
@@ -125,6 +133,21 @@ public final class RecallStore: ObservableObject {
 
     public func select(playheadMs ms: Int64) {
         applyPlayhead(ms)
+    }
+
+    public func loadDaySummary(dayMs: Int64, force: Bool = false) async {
+        let key = DaySummaryLayout.localDayKey(ms: dayMs)
+        if !force, key == loadedDayKey { return }
+        let requestGeneration = sensitiveGeneration
+        do {
+            let loaded = try await daemon.daySummary(dayMs: dayMs)
+            guard sensitiveGeneration == requestGeneration else { return }
+            daySummary = loaded
+            loadedDayKey = key
+        } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
+            if Self.isDaemonConnectionError(error) { return }
+        }
     }
 
     public func select(index: Int) {
@@ -158,6 +181,8 @@ public final class RecallStore: ObservableObject {
         sessions = []
         moments = []
         applyPlayhead(0)
+        daySummary = .empty
+        loadedDayKey = nil
         loadState = .ready
     }
 

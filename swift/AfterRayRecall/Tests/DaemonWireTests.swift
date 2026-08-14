@@ -19,6 +19,14 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["since_ms"] as? Int, 42)
     }
 
+    func testDaySummaryRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "day_summary", dayMs: 1_786_698_000_000))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "day_summary")
+        XCTAssertEqual((json["day_ms"] as? NSNumber)?.int64Value, 1_786_698_000_000)
+    }
+
     func testRecallWindowRequestMatchesRustShape() throws {
         let request = WireRequest(type: "recall_window", sessionID: "session-1", centerMs: 42, limit: 120)
         let data = try JSONEncoder().encode(request)
