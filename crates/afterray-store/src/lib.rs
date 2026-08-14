@@ -46,6 +46,7 @@ mod activity;
 mod gop;
 mod jpeg;
 mod memory;
+mod slot;
 
 pub use gop::{
     GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
@@ -54,6 +55,12 @@ pub use gop::{
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
     AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
+};
+pub use slot::{
+    AppFact, CoverageKind, CoverageWindow, DwellEntry, Revisit, SLOT_DURATION_MS, SlotCard,
+    SlotEvidence, SlotFacts, SlotIndex, SlotMomentRow, SlotState, SwitchEntry, T2_SYSTEM_PROMPT,
+    ThreadHypothesis, build_slot_card, error_signatures, local_day_for, render_t2_prompt,
+    shorten_place, slot_start_for,
 };
 
 pub const SCHEMA_VERSION: u32 = 10;
@@ -763,6 +770,112 @@ impl Vault {
         drop(statement);
         drop(connection);
         Ok(activity::fold_activity_spans(&moments, limit))
+    }
+
+    /// Builds the deterministic T1 card for the slot containing `at_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn slot_card(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SlotCard, StoreError> {
+        let slot_start_ms = slot::slot_start_for(at_ms);
+        let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
+        let rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
+        Ok(slot::build_slot_card(
+            slot_start_ms,
+            &rows,
+            idle_ms,
+            capture_interval_ms,
+        ))
+    }
+
+    /// Moments in `[from_ms, to_ms)` joined with their OCR text and evidence flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn slot_moment_rows(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<slot::SlotMomentRow>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.captured_at_ms, m.application_name, m.bundle_identifier,
+                    m.window_title, m.url, m.document,
+                    (SELECT group_concat(te.text, '\n') FROM text_evidence te
+                      WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                    m.accessibility_artifact_id IS NOT NULL,
+                    EXISTS (SELECT 1 FROM audio_segments a
+                             WHERE m.captured_at_ms BETWEEN a.started_at_ms AND a.ended_at_ms)
+               FROM moments m
+              WHERE m.captured_at_ms >= ?1 AND m.captured_at_ms < ?2
+              ORDER BY m.captured_at_ms, m.id",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(slot::SlotMomentRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                application_name: row.get(2)?,
+                bundle_identifier: row.get(3)?,
+                window_title: row.get(4)?,
+                url: row.get(5)?,
+                document: row.get(6)?,
+                ocr_text: row.get(7)?,
+                ax_present: row.get(8)?,
+                has_audio: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Milliseconds of `[from_ms, to_ms)` covered by recorded idle spans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn idle_overlap_ms(&self, from_ms: i64, to_ms: i64) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT started_at_ms, ended_at_ms FROM idle_spans
+              WHERE started_at_ms < ?2 AND (ended_at_ms IS NULL OR ended_at_ms > ?1)",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            let started: i64 = row.get(0)?;
+            let ended: Option<i64> = row.get(1)?;
+            Ok((started, ended.unwrap_or(to_ms)))
+        })?;
+        let mut total = 0_i64;
+        for span in rows {
+            let (started, ended) = span?;
+            let overlap = ended.min(to_ms).saturating_sub(started.max(from_ms));
+            total += overlap.max(0);
+        }
+        Ok(total.min(to_ms.saturating_sub(from_ms)))
+    }
+
+    /// Nearest moment to `at_ms`, in either direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_nearest(&self, at_ms: i64) -> Result<Option<String>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id FROM moments
+              ORDER BY ABS(captured_at_ms - ?1), captured_at_ms
+              LIMIT 1",
+        )?;
+        let mut rows = statement.query(params![at_ms])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
     }
 
     pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {

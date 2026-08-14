@@ -437,6 +437,19 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
         },
+        Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
+            Ok(Some(moment_id)) => match tools::moment_detail(&state.store, &moment_id) {
+                Ok(moment) => Response::success(moment),
+                Err(error) => Response::failure(error),
+            },
+            Ok(None) => Response::failure("no moment has been captured yet"),
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
+        Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
+            Ok(prompt) => Response::success(prompt),
+            Err(error) => Response::failure(error.to_string()),
+        },
         Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
@@ -1360,6 +1373,80 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
         ),
         Err(error) => Response::failure(error.to_string()),
     }
+}
+
+/// Builds the T1 card and records what it was derived from.
+///
+/// The log line is the audit trail for the T1 half of a card: which slot, how
+/// many moments went in, what the gate decided, and which map entries a T2
+/// agent will see. Pair it with the `slot.t2` line emitted by the summariser
+/// to reconstruct a card's full history.
+fn slot_card_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<afterray_store::SlotCard, afterray_store::StoreError> {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let card = state.store.slot_card(at_ms, interval_ms)?;
+    eprintln!(
+        "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} apps={} switches={} \
+         idle={:.2} revisits={} dwells={} threads={} coverage={} theme={:?}",
+        card.slot_start_ms,
+        card.local_day,
+        card.state,
+        card.facts.moment_count,
+        card.facts.ocr_moment_count,
+        card.facts.ax_moment_count,
+        card.facts.apps.len(),
+        card.facts.switch_count,
+        card.facts.idle_ratio,
+        card.index.revisits.len(),
+        card.index.dwells.len(),
+        card.index.threads.len(),
+        card.index.coverage.len(),
+        card.theme_key.as_deref().unwrap_or("-"),
+    );
+    Ok(card)
+}
+
+/// Renders the full T2 prompt: system instructions plus the T1 map, with the
+/// episode notes and neighbouring card titles the agent needs for continuity.
+fn slot_prompt_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<serde_json::Value, afterray_store::StoreError> {
+    let card = slot_card_for(state, at_ms)?;
+    let episodes: Vec<(i64, String)> = state
+        .store
+        .memories(card.slot_start_ms, card.slot_end_ms, 24)?
+        .into_iter()
+        .map(|memory| (memory.start_ms, memory.summary))
+        .collect();
+    let neighbours: Vec<(i64, String)> = state
+        .store
+        .memories(
+            card.slot_start_ms - afterray_store::SLOT_DURATION_MS,
+            card.slot_start_ms,
+            4,
+        )?
+        .into_iter()
+        .map(|memory| (memory.start_ms, memory.summary))
+        .collect();
+    let user = afterray_store::render_t2_prompt(&card, &episodes, &neighbours);
+    eprintln!(
+        "slot.prompt slot={} episodes={} neighbours={} user_chars={}",
+        card.slot_start_ms,
+        episodes.len(),
+        neighbours.len(),
+        user.chars().count()
+    );
+    Ok(serde_json::json!({
+        "slot_start_ms": card.slot_start_ms,
+        "slot_end_ms": card.slot_end_ms,
+        "local_day": card.local_day,
+        "state": card.state,
+        "system": afterray_store::T2_SYSTEM_PROMPT,
+        "user": user,
+    }))
 }
 
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {

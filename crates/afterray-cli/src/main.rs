@@ -35,9 +35,28 @@ enum Command {
     Moments {
         session_id: String,
     },
-    /// Fetch one moment by id (agent-friendly).
+    /// Fetch one moment by id, or the nearest one to a timestamp.
     Moment {
-        moment_id: String,
+        #[arg(required_unless_present = "at_ms")]
+        moment_id: Option<String>,
+        /// Resolve the moment nearest this wall-clock instant instead.
+        #[arg(long = "at-ms", conflicts_with = "moment_id")]
+        at_ms: Option<i64>,
+    },
+    /// Deterministic T1 slot cards and the T2 prompt built from them.
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommand,
+    },
+    /// Write the captured frame nearest a timestamp to a file (for a vision model).
+    Frame {
+        #[arg(long = "at-ms")]
+        at_ms: Option<i64>,
+        #[arg(long, conflicts_with = "at_ms")]
+        moment_id: Option<String>,
+        /// Destination path. Defaults to ./frame-<moment_id>.jpg
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Timeline {
         #[arg(long)]
@@ -146,12 +165,37 @@ enum PackCommand {
 }
 
 #[derive(Subcommand)]
+enum SlotCommand {
+    /// The T1 card: facts plus the retrieval map handed to a T2 agent.
+    Card {
+        #[arg(long = "at-ms")]
+        at_ms: i64,
+    },
+    /// The rendered T2 prompt (system + user) for this slot.
+    Prompt {
+        #[arg(long = "at-ms")]
+        at_ms: i64,
+        /// Print only the user half, as plain text.
+        #[arg(long)]
+        user_only: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum EvidenceCommand {
-    /// OCR text and bounding boxes for a moment.
-    Ocr { moment_id: String },
+    /// OCR text and bounding boxes for a moment, or the one nearest a timestamp.
+    Ocr {
+        #[arg(required_unless_present = "at_ms")]
+        moment_id: Option<String>,
+        #[arg(long = "at-ms", conflicts_with = "moment_id")]
+        at_ms: Option<i64>,
+    },
     /// Accessibility digest (default) or full tree JSON.
     Ax {
-        moment_id: String,
+        #[arg(required_unless_present = "at_ms")]
+        moment_id: Option<String>,
+        #[arg(long = "at-ms", conflicts_with = "moment_id")]
+        at_ms: Option<i64>,
         /// Include the full accessibility tree JSON (large).
         #[arg(long)]
         full: bool,
@@ -228,7 +272,41 @@ async fn request_from_command(
             command: SessionsCommand::List,
         } => Request::SessionsList,
         Command::Moments { session_id } => Request::MomentsList { session_id },
-        Command::Moment { moment_id } => Request::MomentGet { moment_id },
+        Command::Moment {
+            moment_id: Some(moment_id),
+            ..
+        } => Request::MomentGet { moment_id },
+        Command::Moment {
+            at_ms: Some(at_ms), ..
+        } => Request::MomentAt { at_ms },
+        Command::Moment { .. } => anyhow::bail!("pass a moment id or --at-ms"),
+        Command::Slot {
+            command: SlotCommand::Card { at_ms },
+        } => Request::SlotCard { at_ms },
+        Command::Slot {
+            command: SlotCommand::Prompt { at_ms, user_only },
+        } => {
+            if user_only {
+                let response = send(socket, &Request::SlotPrompt { at_ms }).await?;
+                let user = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("user"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                println!("{user}");
+                return Ok(None);
+            }
+            Request::SlotPrompt { at_ms }
+        }
+        Command::Frame {
+            at_ms,
+            moment_id,
+            out,
+        } => {
+            save_frame(socket, at_ms, moment_id, out).await?;
+            return Ok(None);
+        }
         Command::Timeline { since_ms: None } => Request::TimelineList,
         Command::Timeline {
             since_ms: Some(since_ms),
@@ -245,12 +323,19 @@ async fn request_from_command(
             to_ms,
         },
         Command::Evidence {
-            command: EvidenceCommand::Ocr { moment_id },
-        } => Request::EvidenceOcr { moment_id },
+            command: EvidenceCommand::Ocr { moment_id, at_ms },
+        } => Request::EvidenceOcr {
+            moment_id: resolve_moment(socket, moment_id, at_ms).await?,
+        },
         Command::Evidence {
-            command: EvidenceCommand::Ax { moment_id, full },
+            command:
+                EvidenceCommand::Ax {
+                    moment_id,
+                    at_ms,
+                    full,
+                },
         } => Request::EvidenceAx {
-            moment_id,
+            moment_id: resolve_moment(socket, moment_id, at_ms).await?,
             digest_only: !full,
         },
         Command::Activity {
@@ -318,6 +403,111 @@ async fn request_from_command(
             command: PackCommand::Status,
         } => Request::PackStatus,
     }))
+}
+
+/// Accepts either an explicit moment id or a wall-clock instant.
+async fn resolve_moment(
+    socket: &PathBuf,
+    moment_id: Option<String>,
+    at_ms: Option<i64>,
+) -> anyhow::Result<String> {
+    if let Some(moment_id) = moment_id {
+        return Ok(moment_id);
+    }
+    let at_ms = at_ms.context("pass a moment id or --at-ms")?;
+    let response = send(socket, &Request::MomentAt { at_ms }).await?;
+    if !response.ok {
+        anyhow::bail!(
+            response
+                .error
+                .unwrap_or_else(|| "could not resolve a moment".to_owned())
+        );
+    }
+    response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .context("daemon returned a moment without an id")
+}
+
+/// Reads an artifact off the framed response (JSON header line, then raw bytes)
+/// and writes it to disk so a vision model can be pointed at the file.
+async fn save_frame(
+    socket: &PathBuf,
+    at_ms: Option<i64>,
+    moment_id: Option<String>,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let moment_id = resolve_moment(socket, moment_id, at_ms).await?;
+    let moment = send(socket, &Request::MomentGet {
+        moment_id: moment_id.clone(),
+    })
+    .await?;
+    let artifact_id = moment
+        .data
+        .as_ref()
+        .and_then(|data| data.get("image_artifact_id"))
+        .and_then(serde_json::Value::as_str)
+        .context("this moment has no stored image")?
+        .to_owned();
+
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect to afterrayd at {}", socket.display()))?;
+    let mut bytes = serde_json::to_vec(&Request::ReadArtifact {
+        artifact_id: artifact_id.clone(),
+    })?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut header_line = String::new();
+    reader.read_line(&mut header_line).await?;
+    let header: Response = serde_json::from_str(&header_line)?;
+    if !header.ok {
+        anyhow::bail!(
+            header
+                .error
+                .unwrap_or_else(|| "artifact read failed".to_owned())
+        );
+    }
+    let byte_length = header
+        .data
+        .as_ref()
+        .and_then(|data| data.get("byte_length"))
+        .and_then(serde_json::Value::as_u64)
+        .context("artifact header had no byte_length")?;
+    let content_type = header
+        .data
+        .as_ref()
+        .and_then(|data| data.get("content_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("image/jpeg")
+        .to_owned();
+
+    let mut payload = vec![0_u8; usize::try_from(byte_length)?];
+    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut payload).await?;
+
+    let extension = if content_type.contains("png") {
+        "png"
+    } else {
+        "jpg"
+    };
+    let path = out.unwrap_or_else(|| PathBuf::from(format!("frame-{moment_id}.{extension}")));
+    tokio::fs::write(&path, &payload).await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "moment_id": moment_id,
+            "artifact_id": artifact_id,
+            "content_type": content_type,
+            "bytes": payload.len(),
+            "path": path.display().to_string(),
+        })
+    );
+    Ok(())
 }
 
 async fn run_local_download(pack: Option<String>, dir: Option<PathBuf>) -> anyhow::Result<()> {

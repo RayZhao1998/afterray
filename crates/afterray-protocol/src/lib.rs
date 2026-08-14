@@ -67,6 +67,19 @@ pub enum Request {
     MomentGet {
         moment_id: String,
     },
+    /// Nearest moment to a wall-clock instant. Entry point for agent tools
+    /// that address evidence by time rather than by id.
+    MomentAt {
+        at_ms: i64,
+    },
+    /// Deterministic T1 card for the slot containing `at_ms`.
+    SlotCard {
+        at_ms: i64,
+    },
+    /// T1 card rendered as the prompt handed to a T2 agent.
+    SlotPrompt {
+        at_ms: i64,
+    },
     EvidenceOcr {
         moment_id: String,
     },
