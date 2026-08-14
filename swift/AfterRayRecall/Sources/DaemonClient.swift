@@ -57,7 +57,9 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
         llmBaseUrl: String?,
         llmModel: String?,
         llmApiKey: String?,
-        storageLimitBytes: UInt64?
+        storageLimitBytes: UInt64?,
+        uiLanguage: String?,
+        summaryLanguage: String?
     ) async throws -> AppSettings
     func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
     func downloadModels(packID: String?) async throws -> ModelLibrary
@@ -74,7 +76,9 @@ public extension AfterRayDaemonServing {
             llmBaseUrl: nil,
             llmModel: nil,
             llmApiKey: nil,
-            storageLimitBytes: nil
+            storageLimitBytes: nil,
+            uiLanguage: nil,
+            summaryLanguage: nil
         )
     }
 }
@@ -135,7 +139,9 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         llmBaseUrl: String? = nil,
         llmModel: String? = nil,
         llmApiKey: String? = nil,
-        storageLimitBytes: UInt64? = nil
+        storageLimitBytes: UInt64? = nil,
+        uiLanguage: String? = nil,
+        summaryLanguage: String? = nil
     ) async throws -> AppSettings {
         try await request(
             WireRequest(
@@ -146,7 +152,9 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 llmBaseUrl: llmBaseUrl,
                 llmModel: llmModel,
                 llmApiKey: llmApiKey,
-                storageLimitBytes: storageLimitBytes
+                storageLimitBytes: storageLimitBytes,
+                uiLanguage: uiLanguage,
+                summaryLanguage: summaryLanguage
             ),
             as: AppSettings.self
         )
@@ -295,6 +303,8 @@ struct WireRequest: Encodable, Equatable {
     var llmModel: String?
     var llmApiKey: String?
     var storageLimitBytes: UInt64?
+    var uiLanguage: String?
+    var summaryLanguage: String?
     var provider: String?
     var baseUrl: String?
 
@@ -324,6 +334,8 @@ struct WireRequest: Encodable, Equatable {
         case llmModel = "llm_model"
         case llmApiKey = "llm_api_key"
         case storageLimitBytes = "storage_limit_bytes"
+        case uiLanguage = "ui_language"
+        case summaryLanguage = "summary_language"
         case provider
         case baseUrl = "base_url"
     }
@@ -355,6 +367,8 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(llmModel, forKey: .llmModel)
         try container.encodeIfPresent(llmApiKey, forKey: .llmApiKey)
         try container.encodeIfPresent(storageLimitBytes, forKey: .storageLimitBytes)
+        try container.encodeIfPresent(uiLanguage, forKey: .uiLanguage)
+        try container.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
         try container.encodeIfPresent(provider, forKey: .provider)
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
     }

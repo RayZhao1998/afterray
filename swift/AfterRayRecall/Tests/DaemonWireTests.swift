@@ -143,6 +143,68 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
         XCTAssertEqual(settings.storageLimitBytes, AppSettings.defaultStorageLimitBytes)
         XCTAssertTrue(settings.excludedBundleIds.isEmpty)
+        XCTAssertEqual(settings.uiLanguage, AppSettings.defaultLanguage)
+        XCTAssertEqual(settings.summaryLanguage, AppSettings.defaultLanguage)
+        XCTAssertTrue(settings.languageOptions.isEmpty)
+    }
+
+    func testAppSettingsDefaultsLanguageWhenOldDaemonOmitsFields() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.uiLanguage, "auto")
+        XCTAssertEqual(settings.summaryLanguage, "auto")
+        XCTAssertTrue(settings.languageOptions.isEmpty)
+
+        let picker = settings.languagePickerOptions(selected: settings.uiLanguage)
+        XCTAssertEqual(picker.map(\.code), ["auto"])
+        XCTAssertEqual(picker.first?.menuTitle, "跟随系统")
+        XCTAssertEqual(picker.first?.englishName, "Follow system")
+    }
+
+    func testAppSettingsDecodesLanguageCatalogueFromDaemon() throws {
+        let json = """
+        {"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"ui_language":"en","summary_language":"ja","language_options":[{"code":"auto","native_name":"跟随系统 / System","english_name":"Follow system"},{"code":"en","native_name":"English","english_name":"English"},{"code":"ja","native_name":"日本語","english_name":"Japanese"}]}
+        """
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.uiLanguage, "en")
+        XCTAssertEqual(settings.summaryLanguage, "ja")
+        XCTAssertEqual(settings.languageOptions.count, 3)
+        XCTAssertEqual(settings.languageOptions[2].nativeName, "日本語")
+        XCTAssertEqual(settings.languageOptions[2].englishName, "Japanese")
+        XCTAssertEqual(settings.languageOptions[0].menuTitle, "跟随系统")
+        XCTAssertEqual(settings.languageOptions[2].menuTitle, "日本語")
+        XCTAssertEqual(
+            settings.languagePickerOptions(selected: settings.summaryLanguage).map(\.code),
+            ["auto", "en", "ja"]
+        )
+    }
+
+    func testLanguagePickerOptionsKeepsDaemonCatalogueAndUnknownSelection() throws {
+        let settings = AppSettings(
+            dataDir: "/tmp/data",
+            modelDir: "/tmp/models",
+            recordAudio: true,
+            captureIntervalSeconds: 10,
+            languageOptions: [
+                LanguageOption(code: "en", nativeName: "English", englishName: "English"),
+            ]
+        )
+        XCTAssertEqual(settings.languagePickerOptions(selected: "en").map(\.code), ["en"])
+        XCTAssertEqual(settings.languagePickerOptions(selected: "xx").map(\.code), ["en", "xx"])
+    }
+
+    func testUpdateSettingsRequestIncludesLanguageFields() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(
+                type: "update_settings",
+                uiLanguage: "zh-Hans",
+                summaryLanguage: "ja"
+            )
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["ui_language"] as? String, "zh-Hans")
+        XCTAssertEqual(json["summary_language"] as? String, "ja")
     }
 
     func testUpdateSettingsRequestIncludesStorageLimit() throws {
