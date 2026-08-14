@@ -4,7 +4,7 @@
 //! **not** linked into the capture shim.
 //!
 //! Recommended product settings (live-vault sim, 2026-08-14):
-//! rav1e speed=8, quantizer=100, tiles=4, keyint=12.
+//! rav1e speed=8, quantizer=100, tiles=4, keyint=30.
 
 #![allow(
     clippy::missing_errors_doc,
@@ -31,7 +31,7 @@ pub const CONTENT_TYPE_IVF_AV01: &str = "video/x-ivf; codec=av01";
 pub const RAV1E_SPEED: u8 = 8;
 pub const RAV1E_QUANTIZER: usize = 100;
 pub const RAV1E_TILES: usize = 4;
-pub const DEFAULT_KEYINT: u16 = 12;
+pub const DEFAULT_KEYINT: u16 = 30;
 
 /// Tightly packed 8-bit I420 length (`Y` then `U` then `V`).
 #[must_use]

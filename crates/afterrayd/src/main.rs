@@ -1972,7 +1972,7 @@ print(json.dumps({
         let pack: afterray_protocol::PackStatus =
             serde_json::from_value(pack.data.unwrap()).unwrap();
         assert!(!pack.keep_stills, "Dual keep_stills must stay off");
-        assert_eq!(pack.keyint, 12);
+        assert_eq!(pack.keyint, 30);
         assert_eq!(pack.hot_window_seconds, 7200);
 
         let timeline = daemon_rpc(&socket, afterray_protocol::Request::TimelineList);

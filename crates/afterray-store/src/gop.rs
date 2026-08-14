@@ -22,7 +22,7 @@ impl Default for PackPolicy {
             hot_window_ms: 7_200_000,
             hot_min_stills: 360,
             ocr_grace_ms: 600_000,
-            keyint: 12,
+            keyint: 30,
         }
     }
 }
@@ -104,66 +104,25 @@ pub struct GopPackJob {
 
 /// Fold pack candidates into closed-GOP runs.
 ///
-/// Frames are grouped by app + resolution first, then split only on that
-/// app's own timeline (idle gap / keyint). A↔B flicker therefore fills two
-/// GOPs instead of a pile of one-frame stills.
+/// Walk wall-clock order and close a run on idle gap, resolution change, or
+/// `keyint`. App switches stay in the same GOP so A↔B flicker does not
+/// collapse into one-frame stills.
 #[must_use]
 pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<PackCandidate>> {
     let keyint = usize::from(keyint.max(1));
-    let mut buckets: std::collections::HashMap<BucketKey, Vec<PackCandidate>> =
-        std::collections::HashMap::new();
-    let mut order: Vec<BucketKey> = Vec::new();
-    for candidate in candidates {
-        let key = bucket_key(candidate);
-        match buckets.get_mut(&key) {
-            Some(bucket) => bucket.push(candidate.clone()),
-            None => {
-                order.push(key.clone());
-                buckets.insert(key, vec![candidate.clone()]);
-            }
-        }
-    }
-    let mut runs = Vec::new();
-    for key in order {
-        let Some(bucket) = buckets.remove(&key) else {
-            continue;
-        };
-        runs.extend(fold_app_timeline(&bucket, keyint));
-    }
-    runs.sort_by(|left, right| {
-        let left = left
-            .first()
-            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
-        let right = right
-            .first()
-            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
-        left.cmp(&right)
-    });
-    runs
-}
-
-type BucketKey = (Option<String>, Option<String>, u32, u32);
-
-fn bucket_key(candidate: &PackCandidate) -> BucketKey {
-    (
-        candidate.bundle_identifier.clone(),
-        candidate.application_name.clone(),
-        candidate.width,
-        candidate.height,
-    )
-}
-
-fn fold_app_timeline(frames: &[PackCandidate], keyint: usize) -> Vec<Vec<PackCandidate>> {
     let mut runs = Vec::new();
     let mut current: Vec<PackCandidate> = Vec::new();
-    for candidate in frames {
-        if let Some(previous) = current.last()
-            && candidate
+    for candidate in candidates {
+        if let Some(previous) = current.last() {
+            let idle = candidate
                 .captured_at_ms
                 .saturating_sub(previous.captured_at_ms)
-                > IDLE_GAP_MS
-        {
-            runs.push(std::mem::take(&mut current));
+                > IDLE_GAP_MS;
+            let size_changed =
+                candidate.width != previous.width || candidate.height != previous.height;
+            if idle || size_changed {
+                runs.push(std::mem::take(&mut current));
+            }
         }
         current.push(candidate.clone());
         if current.len() >= keyint {
@@ -651,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_cuts_on_app_resolution_and_idle_gap() {
+    fn fold_cuts_on_resolution_not_app() {
         let frames = [
             candidate("a", 0, "Chrome", "chrome"),
             candidate("b", 10_000, "Chrome", "chrome"),
@@ -670,17 +629,22 @@ mod tests {
                 half
             },
         ];
-        let runs = fold_pack_runs(&frames, 12);
-        assert_eq!(runs.len(), 4);
-        assert_eq!(runs[0].len(), 3);
-        assert_eq!(runs[1].len(), 2);
+        let runs = fold_pack_runs(&frames, 30);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs[0]
+                .iter()
+                .map(|frame| frame.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(runs[1].len(), 1);
         assert_eq!(runs[2].len(), 1);
-        assert_eq!(runs[3].len(), 1);
     }
 
     #[test]
     fn fold_closes_at_keyint() {
-        let frames: Vec<_> = (0..13)
+        let frames: Vec<_> = (0..31)
             .map(|index| {
                 candidate(
                     &format!("m{index}"),
@@ -690,9 +654,9 @@ mod tests {
                 )
             })
             .collect();
-        let runs = fold_pack_runs(&frames, 12);
+        let runs = fold_pack_runs(&frames, 30);
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].len(), 12);
+        assert_eq!(runs[0].len(), 30);
         assert_eq!(runs[1].len(), 1);
     }
 
@@ -707,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_groups_interleaved_apps_into_per_app_gops() {
+    fn fold_keeps_interleaved_apps_in_one_timeline_gop() {
         let frames = [
             candidate("a1", 0, "Chrome", "chrome"),
             candidate("b1", 10_000, "Feishu", "feishu"),
@@ -716,21 +680,14 @@ mod tests {
             candidate("a3", 40_000, "Chrome", "chrome"),
             candidate("b3", 50_000, "Feishu", "feishu"),
         ];
-        let runs = fold_pack_runs(&frames, 12);
-        assert_eq!(runs.len(), 2);
+        let runs = fold_pack_runs(&frames, 30);
+        assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0]
                 .iter()
                 .map(|frame| frame.id.as_str())
                 .collect::<Vec<_>>(),
-            ["a1", "a2", "a3"]
-        );
-        assert_eq!(
-            runs[1]
-                .iter()
-                .map(|frame| frame.id.as_str())
-                .collect::<Vec<_>>(),
-            ["b1", "b2", "b3"]
+            ["a1", "b1", "a2", "b2", "a3", "b3"]
         );
     }
 }

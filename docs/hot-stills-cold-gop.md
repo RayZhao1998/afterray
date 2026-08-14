@@ -208,7 +208,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `AFTERRAY_GOP_HOT_WINDOW_SECONDS` | `7200` | 墙钟热窗口 2h；允许 3600–7200 |
 | `AFTERRAY_GOP_HOT_MIN_STILLS` | `360` | 至少保留这么多独立 still（1h × 10s 地板） |
-| `AFTERRAY_GOP_KEYINT` | `12` | closed GOP 最大帧数；允许 6 / 12 / 20 / 24 / 30 |
+| `AFTERRAY_GOP_KEYINT` | `30` | closed GOP 最大帧数；允许 6 / 12 / 20 / 24 / 30。按墙钟连续切，不按 App 分桶 |
 | `AFTERRAY_GOP_ARCHIVE` | `1` | 冷区默认归档。设 `0` 才停 packer |
 | `AFTERRAY_GOP_OCR_GRACE_SECONDS` | `600` | OCR 未完成也可 pack 的宽限 |
 | `AFTERRAY_GOP_REQUIRE_AC` | `0` | 设 `1` 时仅 AC 编码 |

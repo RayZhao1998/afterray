@@ -266,7 +266,7 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_SOCKET` | Unix socket shared by clients and daemon | Runner-generated temporary path |
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
 | `AFTERRAY_GOP_ARCHIVE` | Pack cold stills into closed-GOP AV1 | `1` |
-| `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `12` |
+| `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `30` |
 | `AFTERRAY_GOP_REQUIRE_AC` | Only encode while on AC power | `0` |
 | `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
 | `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
