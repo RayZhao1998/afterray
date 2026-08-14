@@ -238,6 +238,9 @@ make stop
 # Build everything without launching the app
 make v0-build
 
+# Build a local-only release-shaped DMG
+make release-local
+
 # Run the Rust test suite
 cargo test --workspace
 
@@ -257,6 +260,11 @@ swift/                        Reusable Recall UI and mock data
 scripts/download-models/      Thin wrapper around `afterray download`
 docs/                         Product specification and implementation notes
 ```
+
+Production distribution uses a Developer ID-signed, hardened, notarized DMG
+containing the Swift app and all bundled Rust/Swift helpers. See
+[Releasing AfterRay](docs/releasing.md) for certificate setup, commands,
+artifacts, and verification details.
 
 ## Configuration
 

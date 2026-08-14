@@ -5,6 +5,7 @@
 /DerivedData/
 /.afterray-dev/
 /.afterray/
+/dist/
 *.xcuserstate
 .DS_Store
 __pycache__/

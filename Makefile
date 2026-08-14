@@ -1,4 +1,4 @@
-.PHONY: check test build daemon status models visual-lab settings-lab dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app
+.PHONY: check test build daemon status models visual-lab settings-lab dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local
 
 check:
 	cargo check --workspace
@@ -52,3 +52,9 @@ v0-build:
 
 v0-daemon:
 	./scripts/run-v0.sh --daemon-only
+
+release:
+	./scripts/build-release.sh
+
+release-local:
+	./scripts/build-release.sh --local --allow-dirty
