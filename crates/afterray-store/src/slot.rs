@@ -803,16 +803,19 @@ the evidence cannot say what the person was doing, emit an honest broad
 title with low confidence — that is correct behaviour, not failure.
 
 LANGUAGE. Write "title" and "bullets" in the language named by
-"output_language" in the input. Write them in that language even when the
-observed screen text is in a different one. "artifacts" is the exception:
-copy those verbatim, never translated. Proper nouns — product names,
-repositories, file names, people — keep their original spelling inside
-prose too; transcribe, never re-spell.
+"output_language" in the input, even when the observed screen text is in a
+different one. Proper nouns are the exception: product names,
+repositories, file names, commands and people keep their original
+spelling inside that prose. Transcribe them, never translate or re-spell.
 
-Answer with one JSON object and nothing else, fields in this exact order:
+Name concrete things — file names, repositories, pull-request numbers,
+page titles, commands, error strings — wherever the input supports it; a
+card naming nothing is rarely worth reading. Every such name must be
+copied exactly as it appears in the input. Do not re-spell, pluralise,
+abbreviate or invent one.
 
-  artifacts   0-4 concrete nouns copied verbatim from the input or a tool
-              result (file names, page titles, commands, error strings).
+Answer with one JSON object and nothing else:
+
   title       <= 16 words. What you would write on a calendar block.
   bullets     1-4 strings. One per distinct thread of work, with where it
               ended up.

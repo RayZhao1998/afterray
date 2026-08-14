@@ -552,15 +552,17 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         } => {
             update_settings(
                 state,
-                record_audio,
-                ui_language,
-                summary_language,
-                storage_limit_bytes,
-                excluded_bundle_ids,
-                llm_provider,
-                llm_base_url,
-                llm_model,
-                llm_api_key,
+                SettingsPatch {
+                    record_audio,
+                    ui_language,
+                    summary_language,
+                    storage_limit_bytes,
+                    excluded_bundle_ids,
+                    llm_provider,
+                    llm_base_url,
+                    llm_model,
+                    llm_api_key,
+                },
             )
             .await
         }
@@ -823,13 +825,11 @@ fn current_settings(state: &AppState) -> AppSettings {
         ui_language: state
             .languages
             .lock()
-            .map(|langs| langs.0.clone())
-            .unwrap_or_else(|_| default_language()),
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
         summary_language: state
             .languages
             .lock()
-            .map(|langs| langs.1.clone())
-            .unwrap_or_else(|_| default_language()),
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
         language_options: afterray_protocol::summary_language_options(),
     }
 }
@@ -855,18 +855,17 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
         ui_language: state
             .languages
             .lock()
-            .map(|langs| langs.0.clone())
-            .unwrap_or_else(|_| default_language()),
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
         summary_language: state
             .languages
             .lock()
-            .map(|langs| langs.1.clone())
-            .unwrap_or_else(|_| default_language()),
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
     }
 }
 
-async fn update_settings(
-    state: &Arc<AppState>,
+/// Every field a settings update may carry. Grouped so the handler keeps
+/// one parameter as the surface grows.
+struct SettingsPatch {
     record_audio: Option<bool>,
     ui_language: Option<String>,
     summary_language: Option<String>,
@@ -876,7 +875,20 @@ async fn update_settings(
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
-) -> Response {
+}
+
+async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
+    let SettingsPatch {
+        record_audio,
+        ui_language,
+        summary_language,
+        storage_limit_bytes,
+        excluded_bundle_ids,
+        llm_provider,
+        llm_base_url,
+        llm_model,
+        llm_api_key,
+    } = patch;
     if ui_language.is_some() || summary_language.is_some() {
         let mut pending = persisted_settings(state);
         if let Some(value) = ui_language.clone() {
@@ -1499,32 +1511,13 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
     let parsed = extract_json_object(&raw).and_then(|slice| {
         serde_json::from_str::<serde_json::Value>(slice).ok()
     });
-    let anchors: Vec<String> = parsed
-        .as_ref()
-        .and_then(|card| card.get("artifacts"))
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let ungrounded: Vec<String> = anchors
-        .iter()
-        .filter(|anchor| !text_contains_loosely(&user, anchor))
-        .cloned()
-        .collect();
-
     eprintln!(
         "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
-         parsed={} anchors={} ungrounded={}",
+         parsed={}",
         snapshot.adapter,
         user.chars().count(),
         raw.chars().count(),
         parsed.is_some(),
-        anchors.len(),
-        ungrounded.len(),
     );
 
     Response::success(serde_json::json!({
@@ -1534,23 +1527,7 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
         "prompt_chars": user.chars().count(),
         "card": parsed,
         "raw": raw,
-        "ungrounded_anchors": ungrounded,
     }))
-}
-
-/// Anchor grounding: every noun a card claims must appear in what the model
-/// was shown. Compared with whitespace removed and case folded, because the
-/// model reformats spacing far more readily than it invents words.
-fn text_contains_loosely(haystack: &str, needle: &str) -> bool {
-    fn squash(value: &str) -> String {
-        value
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect()
-    }
-    let needle = squash(needle);
-    !needle.is_empty() && squash(haystack).contains(&needle)
 }
 
 /// First balanced `{…}` block, so a model that wraps JSON in prose or a
@@ -1664,8 +1641,7 @@ fn slot_prompt_for(
     let stored = state
         .languages
         .lock()
-        .map(|langs| langs.1.clone())
-        .unwrap_or_else(|_| default_language());
+        .map_or_else(|_| default_language(), |langs| langs.1.clone());
     let language = resolve_summary_language(&stored);
     let user = afterray_store::render_t2_prompt(&card, &[], &language);
     eprintln!(

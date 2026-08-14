@@ -146,28 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         match extract_json_object(&raw).and_then(|slice| serde_json::from_str(slice).ok()) {
             Some(serde_json::Value::Object(card_json)) => {
-                let anchors: Vec<String> = card_json
-                    .get("artifacts")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let ungrounded: Vec<&String> = anchors
-                    .iter()
-                    .filter(|anchor| !contains_loosely(&user, anchor))
-                    .collect();
-                println!(
-                    "  parsed ✓  anchors {} · ungrounded {}",
-                    anchors.len(),
-                    ungrounded.len()
-                );
-                if !ungrounded.is_empty() {
-                    println!("    UNGROUNDED: {ungrounded:?}");
-                }
+                println!("  parsed ✓");
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::Value::Object(card_json))?
@@ -178,20 +157,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         done += 1;
     }
     Ok(())
-}
-
-/// Anchors are compared with whitespace stripped and case folded: models
-/// reformat spacing far more readily than they invent words.
-fn contains_loosely(haystack: &str, needle: &str) -> bool {
-    fn squash(value: &str) -> String {
-        value
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect()
-    }
-    let needle = squash(needle);
-    !needle.is_empty() && squash(haystack).contains(&needle)
 }
 
 /// First balanced `{…}` block, so prose or a fenced block around the JSON

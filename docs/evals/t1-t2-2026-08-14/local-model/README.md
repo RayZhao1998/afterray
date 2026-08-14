@@ -14,7 +14,7 @@ cargo run -p afterrayd --example t2_eval -- \
 |---|---|---|
 | 延迟 | 51.8 s | 78.9 s |
 | JSON 解析 | ✓ | ✓ |
-| anchors 接地 | 3/3 | 4/4 |
+| JSON 字段 | 无 artifacts（已移除） | 同 |
 | category | `other`（错，应为 coding） | `coding` ✓ |
 | 专名 | `Loly`（错拼 Lody） | `Lody` ✓ |
 
@@ -34,10 +34,15 @@ cargo run -p afterrayd --example t2_eval -- \
 }
 ```
 
-## 已知未解
+## 后处理：已全部移除（2026-08-14）
 
-- **字段顺序无法靠 prompt 保证**：模型按字母序输出，`artifacts` 先于 `title`
-  的"强制接地"设计因此失效。只有约束解码能锁死顺序 —— builtin 走 GBNF，
-  Ollama 走原生 `format` 传 JSON schema。
-- **anchor 校验只覆盖 `artifacts`**：`title` / `bullets` 内的专名与编号无人核对，
-  第 1 轮的 `Loly` 与更早一轮 Claude 编的 "PR #1" 都从这个洞里漏出去。
+早先的 `artifacts` 字段与接地校验都已删除，不做任何模型输出的后处理。
+
+- `artifacts` 原本的理由是「字段排第一可强制模型先接地再表达」，实测证伪 ——
+  模型按字母序输出，排位纯属巧合。
+- 随后改成事后从 title/bullets 抽名词校验，同样撤销：静态匹配无法区分
+  「没见过的真词」与「编造的词」，实测每张卡 2–4 个误报。做成门禁会误杀好卡片，
+  做成告警则是给自己看的噪声。
+
+**结论：直接信任模型输出。** 要提高可靠性应在生成端（约束解码、prompt），
+不在输出端做字符串工程。
