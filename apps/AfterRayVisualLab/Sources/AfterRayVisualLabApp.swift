@@ -17,6 +17,7 @@ struct AfterRayVisualLabApp: App {
 private enum LabSurface: String, CaseIterable, Identifiable {
     case recall
     case settings
+    case chat
     case onboarding
 
     var id: String { rawValue }
@@ -25,6 +26,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
         switch self {
         case .recall: "Recall"
         case .settings: "Settings"
+        case .chat: "Chat"
         case .onboarding: "Welcome"
         }
     }
@@ -32,6 +34,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
     static var launchArgument: LabSurface {
         if CommandLine.arguments.contains("--onboarding") { return .onboarding }
         if CommandLine.arguments.contains("--settings") { return .settings }
+        if CommandLine.arguments.contains("--chat") { return .chat }
         return .recall
     }
 }
@@ -48,6 +51,12 @@ private struct VisualLabView: View {
     @State private var labHotKeys: RecallHotKeyStore
     @State private var onboardingModel: AfterRayOnboardingModel
     @State private var labGreeting = "Good evening."
+    @State private var chatScenario: ChatScenario = CommandLine.arguments.contains("--stream")
+        ? .streaming
+        : .markdown
+    @StateObject private var chat = ChatPreviewModel(scenario: CommandLine.arguments.contains("--stream")
+        ? .streaming
+        : .markdown)
 
     @MainActor
     init() {
@@ -81,6 +90,8 @@ private struct VisualLabView: View {
                 recallLab
             case .settings:
                 settingsLab
+            case .chat:
+                chatLab
             case .onboarding:
                 onboardingLab
             }
@@ -140,6 +151,65 @@ private struct VisualLabView: View {
 
     private func replayOnboarding() {
         onboardingModel = AfterRayOnboardingModel(hotKeys: labHotKeys)
+    }
+
+    private var chatLab: some View {
+        HSplitView {
+            ZStack {
+                Color(red: 0.025, green: 0.022, blue: 0.026).ignoresSafeArea()
+                AfterRayChatView(
+                    model: chat,
+                    onClose: {},
+                    fillsAvailableSpace: true
+                )
+                .padding(28)
+            }
+            .frame(minWidth: 760)
+
+            chatTuningPanel
+                .frame(minWidth: 250, idealWidth: 280, maxWidth: 320)
+        }
+        .task(id: chatScenario) {
+            chat.apply(chatScenario)
+            if chatScenario == .streaming {
+                await chat.simulateStream()
+            }
+        }
+    }
+
+    private var chatTuningPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("VISUAL LAB")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .tracking(2)
+                        .foregroundStyle(.red)
+                    Text("Chat fixtures")
+                        .font(.title2.weight(.semibold))
+                }
+
+                Picker("Scene", selection: $chatScenario) {
+                    ForEach(ChatScenario.allCases) { scene in
+                        Text(scene.title).tag(scene)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text("Mock conversations only. Send still streams a canned reply so you can watch markdown land line by line.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button("Replay stream") {
+                    Task { await chat.simulateStream() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(chatScenario == .empty)
+            }
+            .padding(22)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private var settingsLab: some View {

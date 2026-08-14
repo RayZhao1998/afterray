@@ -1,4 +1,4 @@
-.PHONY: check test build daemon status models visual-lab settings-lab dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local
+.PHONY: check test build daemon status models visual-lab settings-lab chat-lab dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local
 
 check:
 	cargo check --workspace
@@ -31,6 +31,9 @@ visual-lab:
 
 settings-lab:
 	swift run afterray-visual-lab -- --settings --models
+
+chat-lab:
+	swift run afterray-visual-lab -- --chat
 
 dev:
 	./scripts/dev.sh
