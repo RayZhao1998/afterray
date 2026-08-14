@@ -920,13 +920,7 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         HistoryScope::Today => local_calendar_day_bounds_ms(now),
         HistoryScope::All => (0, now),
     };
-    memory::flush(
-        &state.store,
-        &state.models,
-        &state.memories,
-        llm_is_ready(state),
-    )
-    .await;
+    memory::flush(&state.store, &state.memories);
     match state.store.delete_history(from_ms, to_ms) {
         Ok(deleted) => Response::success(serde_json::json!({
             "scope": scope,
@@ -958,7 +952,7 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    memory::flush(&state.store, &state.models, &state.memories, llm_is_ready(state)).await;
+    memory::flush(&state.store, &state.memories);
     let _ = state
         .store
         .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
@@ -1206,14 +1200,11 @@ async fn import_artifact(
                 {
                     memory::observe_and_maybe_commit(
                         &state.store,
-                        &state.models,
                         &state.memories,
                         started_at_ms,
                         &moment_id,
                         &bytes,
-                        llm_is_ready(state),
-                    )
-                    .await;
+                    );
                 }
             } else {
                 eprintln!(
@@ -1387,56 +1378,42 @@ fn slot_card_for(
 ) -> Result<afterray_store::SlotCard, afterray_store::StoreError> {
     let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
     let card = state.store.slot_card(at_ms, interval_ms)?;
+    let (run_count, gap_count, dedup_chars) = card.timeline.iter().fold(
+        (0_usize, 0_usize, 0_usize),
+        |(runs, gaps, chars), entry| match entry {
+            afterray_store::TimelineEntry::Run(run) => (runs + 1, gaps, chars + run.total_chars),
+            afterray_store::TimelineEntry::Gap(_) => (runs, gaps + 1, chars),
+        },
+    );
     eprintln!(
-        "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} apps={} switches={} \
-         idle={:.2} revisits={} dwells={} threads={} coverage={} theme={:?}",
+        "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} switches={} idle={:.2} \
+         runs={run_count} gaps={gap_count} revisits={} dedup_chars={dedup_chars} theme={:?}",
         card.slot_start_ms,
         card.local_day,
         card.state,
         card.facts.moment_count,
         card.facts.ocr_moment_count,
         card.facts.ax_moment_count,
-        card.facts.apps.len(),
         card.facts.switch_count,
         card.facts.idle_ratio,
-        card.index.revisits.len(),
-        card.index.dwells.len(),
-        card.index.threads.len(),
-        card.index.coverage.len(),
+        card.revisits.len(),
         card.theme_key.as_deref().unwrap_or("-"),
     );
     Ok(card)
 }
 
-/// Renders the full T2 prompt: system instructions plus the T1 map, with the
-/// episode notes and neighbouring card titles the agent needs for continuity.
+/// Renders the full T2 prompt: system instructions plus the JSON card view.
+/// `prev_cards` will carry neighbouring T2 titles once slot summaries are
+/// persisted; until then it is empty.
 fn slot_prompt_for(
     state: &AppState,
     at_ms: i64,
 ) -> Result<serde_json::Value, afterray_store::StoreError> {
     let card = slot_card_for(state, at_ms)?;
-    let episodes: Vec<(i64, String)> = state
-        .store
-        .memories(card.slot_start_ms, card.slot_end_ms, 24)?
-        .into_iter()
-        .map(|memory| (memory.start_ms, memory.summary))
-        .collect();
-    let neighbours: Vec<(i64, String)> = state
-        .store
-        .memories(
-            card.slot_start_ms - afterray_store::SLOT_DURATION_MS,
-            card.slot_start_ms,
-            4,
-        )?
-        .into_iter()
-        .map(|memory| (memory.start_ms, memory.summary))
-        .collect();
-    let user = afterray_store::render_t2_prompt(&card, &episodes, &neighbours);
+    let user = afterray_store::render_t2_prompt(&card, &[]);
     eprintln!(
-        "slot.prompt slot={} episodes={} neighbours={} user_chars={}",
+        "slot.prompt slot={} user_chars={}",
         card.slot_start_ms,
-        episodes.len(),
-        neighbours.len(),
         user.chars().count()
     );
     Ok(serde_json::json!({

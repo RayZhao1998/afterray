@@ -57,10 +57,9 @@ pub use memory::{
     AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
 };
 pub use slot::{
-    AppFact, CoverageKind, CoverageWindow, DwellEntry, Revisit, SLOT_DURATION_MS, SlotCard,
-    SlotEvidence, SlotFacts, SlotIndex, SlotMomentRow, SlotState, SwitchEntry, T2_SYSTEM_PROMPT,
-    ThreadHypothesis, build_slot_card, error_signatures, local_day_for, render_t2_prompt,
-    shorten_place, slot_start_for,
+    AppFact, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS, SlotCard, SlotEvidence,
+    SlotFacts, SlotMomentRow, SlotState, T2_SYSTEM_PROMPT, TimelineEntry, build_slot_card,
+    local_day_for, render_t2_prompt, shorten_place, slot_start_for,
 };
 
 pub const SCHEMA_VERSION: u32 = 10;
@@ -784,7 +783,21 @@ impl Vault {
     ) -> Result<slot::SlotCard, StoreError> {
         let slot_start_ms = slot::slot_start_for(at_ms);
         let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
-        let rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        // Selected text and the focused value live in the encrypted AX
+        // artifact, not in the moments table. One decrypt+parse per frame at
+        // T1 build time (once per half hour) is the price of surfacing the
+        // two strongest intent signals the digest carries.
+        for row in &mut rows {
+            if !row.ax_present {
+                continue;
+            }
+            if let Ok(Some(bytes)) = self.accessibility_bytes_for_moment(&row.id) {
+                let digest = parse_accessibility_digest(&bytes);
+                row.selected_text = digest.selected_text;
+                row.focused_value = digest.focused_value;
+            }
+        }
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
         Ok(slot::build_slot_card(
             slot_start_ms,
@@ -827,6 +840,8 @@ impl Vault {
                 url: row.get(5)?,
                 document: row.get(6)?,
                 ocr_text: row.get(7)?,
+                selected_text: None,
+                focused_value: None,
                 ax_present: row.get(8)?,
                 has_audio: row.get(9)?,
             })
