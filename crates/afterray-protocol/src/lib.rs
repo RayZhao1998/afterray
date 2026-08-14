@@ -116,6 +116,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_ms: Option<i64>,
     },
+    /// NDJSON event stream for one chat turn. The daemon writes event lines
+    /// until `done` or `error` instead of a single [`Response`].
+    ChatStream {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        message: String,
+    },
     Settings,
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -678,6 +685,47 @@ pub struct AskAnswer {
     pub model_missing: bool,
 }
 
+/// One line of a [`Request::ChatStream`] response.
+///
+/// Tokens are optional: adapters that cannot stream omit them until the
+/// finished answer is known, then emit a single `token` so clients can
+/// treat every turn the same way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    ToolCall {
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        name: String,
+        chars: usize,
+    },
+    Token {
+        text: String,
+    },
+    Done {
+        message_id: String,
+        conversation_id: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl ChatStreamEvent {
+    /// Encodes one NDJSON line, including the trailing newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be serialized.
+    pub fn to_ndjson_line(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut line = serde_json::to_vec(self)?;
+        line.push(b'\n');
+        Ok(line)
+    }
+}
+
 /// Inclusive local-calendar day bounds containing `now_ms`.
 ///
 /// Used when an [`Request::Ask`] omits `from_ms` / `to_ms`.
@@ -860,6 +908,81 @@ mod tests {
                 limit: 100
             }
         ));
+    }
+
+    #[test]
+    fn chat_stream_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ChatStream {
+                conversation_id: None,
+                message: "我今天下午在干嘛".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_stream","message":"我今天下午在干嘛"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatStream {
+                conversation_id: Some("c1".into()),
+                message: "那第三件呢".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_stream","conversation_id":"c1","message":"那第三件呢"}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"chat_stream","message":"hello"}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::ChatStream {
+                ref message,
+                conversation_id: None
+            } if message == "hello"
+        ));
+    }
+
+    #[test]
+    fn chat_stream_event_wire_shape_is_stable() {
+        let tool = ChatStreamEvent::ToolCall {
+            name: "get_slot_card".into(),
+            args: serde_json::json!({"at_ms": 1}),
+        };
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            r#"{"kind":"tool_call","name":"get_slot_card","args":{"at_ms":1}}"#
+        );
+        let result = ChatStreamEvent::ToolResult {
+            name: "get_slot_card".into(),
+            chars: 2480,
+        };
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480}"#
+        );
+        let token = ChatStreamEvent::Token {
+            text: "你今天下午".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&token).unwrap(),
+            r#"{"kind":"token","text":"你今天下午"}"#
+        );
+        let done = ChatStreamEvent::Done {
+            message_id: "m1".into(),
+            conversation_id: "c1".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&done).unwrap(),
+            r#"{"kind":"done","message_id":"m1","conversation_id":"c1"}"#
+        );
+        let error = ChatStreamEvent::Error {
+            message: "boom".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#"{"kind":"error","message":"boom"}"#
+        );
+        let line = token.to_ndjson_line().unwrap();
+        assert!(line.ends_with(b"\n"));
+        let parsed: ChatStreamEvent = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+        assert_eq!(parsed, token);
     }
 
     #[test]

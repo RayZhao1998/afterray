@@ -1,3 +1,5 @@
+mod chat;
+
 use afterray_models::{download_packs, library_in, model_directory, specs_for_download_in};
 use afterray_protocol::{Request, Response};
 use anyhow::Context;
@@ -130,6 +132,10 @@ enum Command {
         #[arg(long = "to-ms")]
         to_ms: Option<i64>,
     },
+    Chat {
+        #[command(subcommand)]
+        command: chat::ChatCommand,
+    },
     Gop {
         segment_id: String,
     },
@@ -237,6 +243,9 @@ async fn main() -> anyhow::Result<()> {
     let socket = cli
         .socket
         .unwrap_or_else(|| std::env::temp_dir().join("afterray-v0.sock"));
+    if let Command::Chat { command } = cli.command {
+        return chat::run(&socket, command, cli.json).await;
+    }
     let Some(request) = request_from_command(cli.command, &socket).await? else {
         return Ok(());
     };
@@ -433,6 +442,9 @@ async fn request_from_command(
             from_ms,
             to_ms,
         },
+        Command::Chat { .. } => {
+            anyhow::bail!("chat stream is handled before the one-line request path")
+        }
         Command::Gop { segment_id } => Request::GopShow { segment_id },
         Command::Pack {
             command: PackCommand::Status,

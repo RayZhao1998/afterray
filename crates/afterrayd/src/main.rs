@@ -2,13 +2,14 @@ mod agent;
 mod ask;
 mod gop_packer;
 mod memory;
+mod stream;
 mod tools;
 
 use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_models::{
-    JobState, LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput,
-    ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig, download_packs,
-    library, model_directory, probe_llm, specs_for_download,
+    JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
+    ModelInput, ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
+    download_packs, library, model_directory, probe_llm, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
@@ -103,10 +104,9 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from(".build/release/afterray-native-model-worker"),
         PathBuf::from,
     );
-    let models = ModelQueue::new(
-        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config)),
-        QueueConfig::default(),
-    )?;
+    let (adapters, llm_token_sink) =
+        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config));
+    let models = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
             persisted.summary_language.clone(),
         )),
         llm_config,
+        llm_token_sink,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -213,33 +214,37 @@ fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
-) -> Vec<Arc<dyn ModelAdapter>> {
-    let llm = Arc::new(LlmRouterAdapter::new(
+) -> (Vec<Arc<dyn ModelAdapter>>, LlmTokenSink) {
+    let llm = LlmRouterAdapter::new(
         ProcessAdapter::new(ProcessAdapterConfig::new(
             "llama-llm",
             ModelCapability::Llm,
             general_worker.clone(),
         )),
         llm_config,
-    ));
-    vec![
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "vision-ocr",
-            ModelCapability::Ocr,
-            native_worker,
-        ))) as Arc<dyn ModelAdapter>,
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "qwen3-asr",
-            ModelCapability::Asr,
-            general_worker.clone(),
-        ))),
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "llama-embedding",
-            ModelCapability::Embedding,
-            general_worker,
-        ))),
-        llm,
-    ]
+    );
+    let token_sink = llm.token_sink();
+    (
+        vec![
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "vision-ocr",
+                ModelCapability::Ocr,
+                native_worker,
+            ))) as Arc<dyn ModelAdapter>,
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "qwen3-asr",
+                ModelCapability::Asr,
+                general_worker.clone(),
+            ))),
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "llama-embedding",
+                ModelCapability::Embedding,
+                general_worker,
+            ))),
+            Arc::new(llm),
+        ],
+        token_sink,
+    )
 }
 
 struct AppState {
@@ -261,6 +266,7 @@ struct AppState {
     /// the user picks, resolved against the system locale at prompt time.
     languages: std::sync::Mutex<(String, String)>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
+    llm_token_sink: LlmTokenSink,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -376,6 +382,12 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 )
                 .await?;
             }
+            Ok(Request::ChatStream {
+                conversation_id,
+                message,
+            }) => {
+                stream::handle_chat_stream(&mut write, &state, conversation_id, message).await?;
+            }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
             }
@@ -455,6 +467,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         | Request::ReadGopSegment { .. }
         | Request::ReadGopFrame { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
+        ),
+        Request::ChatStream { .. } => Response::failure(
+            "chat streams are framed as NDJSON events and are handled separately",
         ),
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
