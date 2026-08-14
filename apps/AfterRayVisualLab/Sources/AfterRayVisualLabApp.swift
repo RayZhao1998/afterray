@@ -271,13 +271,16 @@ private struct VisualLabView: View {
 
     private var labDaySummary: DaySummary {
         let origin = scenario.moments.first?.capturedAtMs ?? playheadMs
-        switch daySummaryKind {
+        // A getter with a preceding statement does not treat the switch as an
+        // implicit return, so both the keyword and the explicit type are
+        // needed for the branches to type-check.
+        return switch daySummaryKind {
         case .matching:
             scenario.daySummary
         case .rich:
-            .mockRich(around: origin)
+            DaySummary.mockRich(around: origin)
         case .facts:
-            .mockFactsOnly(around: origin)
+            DaySummary.mockFactsOnly(around: origin)
         case .empty:
             DaySummary(
                 day: DaySummaryLayout.localDayKey(ms: origin),
