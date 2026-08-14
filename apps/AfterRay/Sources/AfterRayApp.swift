@@ -309,17 +309,14 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
+        button.alphaValue = isRecording ? 1 : 0.46
         let state = isRecording ? "AfterRay is recording" : "AfterRay is paused"
         button.toolTip = "\(state) · press \(shortcut.displayString) to open"
         pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
     }
 
     private static func icon() -> NSImage {
-        let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "AfterRay")
-            ?? NSImage(size: NSSize(width: 18, height: 18))
-        image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = true
-        return image
+        AfterRayMenuBarIcon.make()
     }
 }
 
