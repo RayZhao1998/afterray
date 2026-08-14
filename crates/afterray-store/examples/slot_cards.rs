@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut slots = 1_usize;
     let mut at_ms: Option<i64> = None;
     let mut as_json = false;
+    let mut language = "English".to_owned();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--slots" => slots = args.next().unwrap_or_default().parse().unwrap_or(1),
             "--at-ms" => at_ms = args.next().and_then(|value| value.parse().ok()),
             "--json" => as_json = true,
+            "--language" => language = args.next().unwrap_or_default(),
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
@@ -58,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if card.facts.moment_count == 0 {
             continue;
         }
-        let user = render_t2_prompt(&card, &[]);
+        let user = render_t2_prompt(&card, &[], &language);
         if as_json {
             let record = serde_json::json!({
                 "card": card,

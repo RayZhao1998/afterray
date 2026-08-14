@@ -136,6 +136,10 @@ async fn main() -> anyhow::Result<()> {
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
+        languages: std::sync::Mutex::new((
+            persisted.ui_language.clone(),
+            persisted.summary_language.clone(),
+        )),
         llm_config,
     });
     println!("afterrayd listening on {}", socket.display());
@@ -253,6 +257,9 @@ struct AppState {
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
+    /// (ui_language, summary_language) as stored preferences; `auto` until
+    /// the user picks, resolved against the system locale at prompt time.
+    languages: std::sync::Mutex<(String, String)>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
 }
 
@@ -272,6 +279,35 @@ struct PersistedSettings {
     llm_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     llm_api_key: String,
+    #[serde(default = "default_language")]
+    ui_language: String,
+    #[serde(default = "default_language")]
+    summary_language: String,
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
+}
+
+/// Resolves a stored language preference to the English name a model should
+/// be told to write in. `auto` follows the system language, defaulting to
+/// English when the locale is unset or unrecognised.
+fn resolve_summary_language(stored: &str) -> String {
+    if !stored.eq_ignore_ascii_case("auto") {
+        return afterray_protocol::language_display_name(stored);
+    }
+    let locale = std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .unwrap_or_default();
+    let tag = locale.split(['.', '_']).next().unwrap_or("").to_lowercase();
+    let region = locale.split('.').next().unwrap_or("").to_lowercase();
+    let code = match (tag.as_str(), region.as_str()) {
+        ("zh", region) if region.contains("tw") || region.contains("hk") => "zh-Hant",
+        ("zh", _) => "zh-Hans",
+        (other, _) if !other.is_empty() => other,
+        _ => "en",
+    };
+    afterray_protocol::language_display_name(code)
 }
 
 const fn default_record_audio() -> bool {
@@ -292,6 +328,8 @@ impl Default for PersistedSettings {
             llm_base_url: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
+            ui_language: default_language(),
+            summary_language: default_language(),
         }
     }
 }
@@ -451,6 +489,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Err(error) => Response::failure(error.to_string()),
         },
         Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
+        Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
         Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
             Ok(prompt) => Response::success(prompt),
             Err(error) => Response::failure(error.to_string()),
@@ -502,6 +541,8 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
             record_audio,
+            ui_language,
+            summary_language,
             storage_limit_bytes,
             excluded_bundle_ids,
             llm_provider,
@@ -512,6 +553,8 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             update_settings(
                 state,
                 record_audio,
+                ui_language,
+                summary_language,
                 storage_limit_bytes,
                 excluded_bundle_ids,
                 llm_provider,
@@ -777,6 +820,17 @@ fn current_settings(state: &AppState) -> AppSettings {
             .api_key
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
+        ui_language: state
+            .languages
+            .lock()
+            .map(|langs| langs.0.clone())
+            .unwrap_or_else(|_| default_language()),
+        summary_language: state
+            .languages
+            .lock()
+            .map(|langs| langs.1.clone())
+            .unwrap_or_else(|_| default_language()),
+        language_options: afterray_protocol::summary_language_options(),
     }
 }
 
@@ -798,12 +852,24 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
         llm_base_url: llm.base_url,
         llm_model: llm.model,
         llm_api_key: llm.api_key.unwrap_or_default(),
+        ui_language: state
+            .languages
+            .lock()
+            .map(|langs| langs.0.clone())
+            .unwrap_or_else(|_| default_language()),
+        summary_language: state
+            .languages
+            .lock()
+            .map(|langs| langs.1.clone())
+            .unwrap_or_else(|_| default_language()),
     }
 }
 
 async fn update_settings(
     state: &Arc<AppState>,
     record_audio: Option<bool>,
+    ui_language: Option<String>,
+    summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
@@ -811,6 +877,20 @@ async fn update_settings(
     llm_model: Option<String>,
     llm_api_key: Option<String>,
 ) -> Response {
+    if ui_language.is_some() || summary_language.is_some() {
+        let mut pending = persisted_settings(state);
+        if let Some(value) = ui_language.clone() {
+            pending.ui_language = value;
+        }
+        if let Some(value) = summary_language.clone() {
+            pending.summary_language = value;
+        }
+        if let Ok(mut langs) = state.languages.lock() {
+            langs.0 = pending.ui_language.clone();
+            langs.1 = pending.summary_language.clone();
+        }
+        let _ = save_persisted_settings(&state.data_dir, &pending);
+    }
     if let Some(bytes) = storage_limit_bytes {
         let previous = state.store.storage_limit_bytes();
         let mut pending = persisted_settings(state);
@@ -1359,6 +1439,152 @@ fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     hits
 }
 
+/// Runs the T2 pass: T1 card → configured model → parsed card.
+///
+/// Goes through `ModelQueue` like every other inference, so the builtin
+/// GGUF worker, Ollama and any OpenAI-compatible endpoint are all reachable
+/// by switching settings alone. Emits `slot.t2` carrying the same
+/// `slot_start_ms` as the `slot.t1` line, so a card's full history is
+/// recoverable from the log.
+async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
+    let started = std::time::Instant::now();
+    let prompt = match slot_prompt_for(state, at_ms) {
+        Ok(value) => value,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    let slot_start_ms = prompt
+        .get("slot_start_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(at_ms);
+    let user = prompt
+        .get("user")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let system = prompt
+        .get("system")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    ensure_remote_llm_model(state).await;
+    let job_id = match state
+        .models
+        .submit(ModelInput::Llm {
+            prompt: user.clone(),
+            system: Some(system),
+        })
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    let snapshot = match state.models.wait(&job_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    if snapshot.state != JobState::Done {
+        return Response::failure(
+            snapshot
+                .last_error
+                .unwrap_or_else(|| "t2 job did not complete".to_owned()),
+        );
+    }
+    let raw = match snapshot.output {
+        Some(afterray_models::ModelOutput::Llm { text }) => text,
+        _ => return Response::failure("t2 job returned a non-text output"),
+    };
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let parsed = extract_json_object(&raw).and_then(|slice| {
+        serde_json::from_str::<serde_json::Value>(slice).ok()
+    });
+    let anchors: Vec<String> = parsed
+        .as_ref()
+        .and_then(|card| card.get("artifacts"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ungrounded: Vec<String> = anchors
+        .iter()
+        .filter(|anchor| !text_contains_loosely(&user, anchor))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
+         parsed={} anchors={} ungrounded={}",
+        snapshot.adapter,
+        user.chars().count(),
+        raw.chars().count(),
+        parsed.is_some(),
+        anchors.len(),
+        ungrounded.len(),
+    );
+
+    Response::success(serde_json::json!({
+        "slot_start_ms": slot_start_ms,
+        "model": snapshot.adapter,
+        "latency_ms": latency_ms,
+        "prompt_chars": user.chars().count(),
+        "card": parsed,
+        "raw": raw,
+        "ungrounded_anchors": ungrounded,
+    }))
+}
+
+/// Anchor grounding: every noun a card claims must appear in what the model
+/// was shown. Compared with whitespace removed and case folded, because the
+/// model reformats spacing far more readily than it invents words.
+fn text_contains_loosely(haystack: &str, needle: &str) -> bool {
+    fn squash(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    let needle = squash(needle);
+    !needle.is_empty() && squash(haystack).contains(&needle)
+}
+
+/// First balanced `{…}` block, so a model that wraps JSON in prose or a
+/// fenced code block still parses.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in text[start..].char_indices() {
+        if in_string {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     let text = match state.store.session_text(session_id) {
         Ok(text) if !text.is_empty() => text,
@@ -1435,9 +1661,15 @@ fn slot_prompt_for(
     at_ms: i64,
 ) -> Result<serde_json::Value, afterray_store::StoreError> {
     let card = slot_card_for(state, at_ms)?;
-    let user = afterray_store::render_t2_prompt(&card, &[]);
+    let stored = state
+        .languages
+        .lock()
+        .map(|langs| langs.1.clone())
+        .unwrap_or_else(|_| default_language());
+    let language = resolve_summary_language(&stored);
+    let user = afterray_store::render_t2_prompt(&card, &[], &language);
     eprintln!(
-        "slot.prompt slot={} user_chars={}",
+        "slot.prompt slot={} language={language} user_chars={}",
         card.slot_start_ms,
         user.chars().count()
     );

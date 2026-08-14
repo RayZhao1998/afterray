@@ -81,6 +81,11 @@ pub enum Request {
     SlotPrompt {
         at_ms: i64,
     },
+    /// Runs the T2 pass for a slot through the configured model and returns
+    /// the parsed card alongside timing and the raw completion.
+    SlotSummarize {
+        at_ms: i64,
+    },
     EvidenceOcr {
         moment_id: String,
     },
@@ -115,6 +120,10 @@ pub enum Request {
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_language: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_limit_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,6 +298,77 @@ pub struct AppSettings {
     pub llm_model: String,
     #[serde(default)]
     pub llm_api_key_set: bool,
+    /// Language for the application's own interface.
+    #[serde(default = "default_language")]
+    pub ui_language: String,
+    /// Language the summarising agent writes cards in. Independent of the
+    /// interface: reading a UI in English while wanting summaries in your
+    /// own language is a normal combination.
+    #[serde(default = "default_language")]
+    pub summary_language: String,
+    /// The catalogue the settings UI renders, so one list serves every client.
+    #[serde(default = "summary_language_options")]
+    pub language_options: Vec<LanguageOption>,
+}
+
+/// A language a summary can be written in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguageOption {
+    /// BCP-47 tag, or `auto` to follow the system language.
+    pub code: String,
+    /// Name in the language itself — a Japanese speaker scanning the list
+    /// looks for 日本語, not "Japanese".
+    pub native_name: String,
+    /// English name, for accessibility labels and search.
+    pub english_name: String,
+}
+
+/// Languages offered for summary output. `auto` first, then the sixteen
+/// most widely used, ordered by global speaker count.
+#[must_use]
+pub fn summary_language_options() -> Vec<LanguageOption> {
+    const ENTRIES: &[(&str, &str, &str)] = &[
+        ("auto", "跟随系统 / System", "Follow system"),
+        ("en", "English", "English"),
+        ("zh-Hans", "简体中文", "Chinese (Simplified)"),
+        ("zh-Hant", "繁體中文", "Chinese (Traditional)"),
+        ("es", "Español", "Spanish"),
+        ("hi", "हिन्दी", "Hindi"),
+        ("ar", "العربية", "Arabic"),
+        ("pt", "Português", "Portuguese"),
+        ("ru", "Русский", "Russian"),
+        ("ja", "日本語", "Japanese"),
+        ("de", "Deutsch", "German"),
+        ("fr", "Français", "French"),
+        ("ko", "한국어", "Korean"),
+        ("it", "Italiano", "Italian"),
+        ("tr", "Türkçe", "Turkish"),
+        ("vi", "Tiếng Việt", "Vietnamese"),
+        ("id", "Bahasa Indonesia", "Indonesian"),
+    ];
+    ENTRIES
+        .iter()
+        .map(|(code, native_name, english_name)| LanguageOption {
+            code: (*code).to_owned(),
+            native_name: (*native_name).to_owned(),
+            english_name: (*english_name).to_owned(),
+        })
+        .collect()
+}
+
+/// The name a model should be told to write in, for a stored language code.
+/// Falls back to English for anything unrecognised, including `auto` — the
+/// caller resolves `auto` against the system language before calling.
+#[must_use]
+pub fn language_display_name(code: &str) -> String {
+    summary_language_options()
+        .into_iter()
+        .find(|option| option.code.eq_ignore_ascii_case(code))
+        .map_or_else(|| "English".to_owned(), |option| option.english_name)
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
 }
 
 const fn default_storage_limit_bytes() -> u64 {
@@ -647,6 +727,8 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: Some(false),
+                ui_language: None,
+                summary_language: None,
                 storage_limit_bytes: None,
                 excluded_bundle_ids: None,
                 llm_provider: None,
@@ -684,6 +766,8 @@ mod tests {
     fn storage_limit_update_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::UpdateSettings {
             record_audio: None,
+            ui_language: None,
+            summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
             excluded_bundle_ids: None,
             llm_provider: None,

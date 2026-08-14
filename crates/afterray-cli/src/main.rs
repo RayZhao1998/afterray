@@ -100,6 +100,15 @@ enum Command {
         #[command(subcommand)]
         command: FavoriteCommand,
     },
+    /// Read or change daemon settings.
+    Settings {
+        /// Interface language (BCP-47 code, or `auto`).
+        #[arg(long = "ui-language")]
+        ui_language: Option<String>,
+        /// Language the summarising agent writes cards in.
+        #[arg(long = "summary-language")]
+        summary_language: Option<String>,
+    },
     Models,
     Download {
         #[arg(long)]
@@ -168,6 +177,11 @@ enum PackCommand {
 enum SlotCommand {
     /// The T1 card: facts plus the retrieval map handed to a T2 agent.
     Card {
+        #[arg(long = "at-ms")]
+        at_ms: i64,
+    },
+    /// Run the T2 pass through the configured model and print the card.
+    Summarize {
         #[arg(long = "at-ms")]
         at_ms: i64,
     },
@@ -284,6 +298,9 @@ async fn request_from_command(
             command: SlotCommand::Card { at_ms },
         } => Request::SlotCard { at_ms },
         Command::Slot {
+            command: SlotCommand::Summarize { at_ms },
+        } => Request::SlotSummarize { at_ms },
+        Command::Slot {
             command: SlotCommand::Prompt { at_ms, user_only },
         } => {
             if user_only {
@@ -381,6 +398,24 @@ async fn request_from_command(
             run_local_download(pack, dir).await?;
             return Ok(None);
         }
+        Command::Settings {
+            ui_language: None,
+            summary_language: None,
+        } => Request::Settings,
+        Command::Settings {
+            ui_language,
+            summary_language,
+        } => Request::UpdateSettings {
+            record_audio: None,
+            ui_language,
+            summary_language,
+            storage_limit_bytes: None,
+            excluded_bundle_ids: None,
+            llm_provider: None,
+            llm_base_url: None,
+            llm_model: None,
+            llm_api_key: None,
+        },
         Command::Models => Request::ModelsStatus,
         Command::Jobs {
             command: JobsCommand::List,
