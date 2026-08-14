@@ -109,6 +109,37 @@ afterray chat list && afterray chat history <id>
 
 **验收**：改完设置后，`afterray settings` 能读到新值；总结语言影响 T2 输出。
 
+### E. 当日总结面板（Rust + Swift）
+
+**产出**：Recall 界面左下、设置按钮上方的一块可折叠面板，展示指针所在那一天的总结。
+
+**数据缺口先补**：T2 产出目前只在内存里跑完就丢，没有落库。本任务负责补上：
+
+- `slot_summaries` 表（schema 12），字段见本文件顶部引用的
+  `docs/slot-summaries-and-ax-pipeline.md` §4：`slot_start_ms` 唯一索引、
+  `local_day`、`state`、`facts_json`、`title`、`bullets_json`、`category`、
+  `confidence`、`generation`、`producer`、`produced_at_ms`
+- `DaySummary { day_ms }` 请求：返回那一天所有 slot 的
+  `{slot_start_ms, state, facts, title?, bullets?, category?}`，**T2 未跑过的槽
+  也要返回**，只是没有 title —— 面板永远有内容是硬要求
+- `delete_history` 要级联删除 slot_summaries
+
+**面板要求**：
+
+- 位置：左下角，**设置按钮正上方**，与底部 chrome 条同一竖列
+- 内容：指针指向那一天的当日总结 —— 按半小时分段列出，每段一行；
+  有 T2 卡片时显示标题，没有时显示确定性事实（应用 + 时长）
+- 折叠：设置按钮**旁边**加一个按钮控制展开/收起；收起时只剩那个按钮，
+  展开后面板才出现。状态要记住（`@AppStorage` 或等价）
+- 拖动时间轴切换到另一天时，面板内容跟着换
+- 当前指针所在的那个半小时要有明显高亮
+- 视觉：沿用 `RecallGlass` 系列材质与 `RecallGeometry` 的间距常量，
+  深色空间 + 暖红高光，不要用默认蓝
+- 空态：那一天没有记录时给出明确说明，不要空白面板
+
+**验收**：拖时间轴跨天面板跟随切换；折叠状态重启后保持；
+无模型时面板仍显示事实行；`swift test` 与 `cargo test` 全绿。
+
 ---
 
 ## 约定
