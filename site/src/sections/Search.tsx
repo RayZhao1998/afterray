@@ -8,7 +8,12 @@ export default function Search() {
       <Reveal className="feature-mock" delay={150}>
         <div className="mock search-mock">
           <div className="search-box">
-            <span className="search-icon">⌕</span>
+            <span className="search-icon" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.8-3.8" />
+              </svg>
+            </span>
             <span className="search-query">{t.mock.query}</span>
             <span className="search-caret" />
           </div>
