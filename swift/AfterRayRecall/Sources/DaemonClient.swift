@@ -41,7 +41,39 @@ public extension RecallDaemonServing {
     }
 }
 
-public protocol AfterRayDaemonServing: RecallDaemonServing {
+public protocol AfterRayChatServing: Sendable {
+    func chatList() async throws -> [ChatConversation]
+    func chatHistory(conversationID: String) async throws -> [ChatMessage]
+    func chatDelete(conversationID: String) async throws
+    func chatSend(conversationID: String?, message: String) async throws -> ChatSendResult
+    func chatStream(conversationID: String?, message: String) -> AsyncThrowingStream<ChatStreamEvent, Error>
+}
+
+public extension AfterRayChatServing {
+    func chatList() async throws -> [ChatConversation] {
+        throw DaemonClientError.rejected("chat is not available")
+    }
+
+    func chatHistory(conversationID _: String) async throws -> [ChatMessage] {
+        throw DaemonClientError.rejected("chat is not available")
+    }
+
+    func chatDelete(conversationID _: String) async throws {
+        throw DaemonClientError.rejected("chat is not available")
+    }
+
+    func chatSend(conversationID _: String?, message _: String) async throws -> ChatSendResult {
+        throw DaemonClientError.rejected("chat is not available")
+    }
+
+    func chatStream(conversationID _: String?, message _: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: DaemonClientError.rejected("chat is not available"))
+        }
+    }
+}
+
+public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing {
     func status() async throws -> DaemonStatus
     func recordStart() async throws -> RecordStartResult
     func recordStop(reason: String?) async throws -> RecordStopResult
@@ -85,7 +117,7 @@ public extension AfterRayDaemonServing {
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public static let protocolVersion = 5
-    public let socketPath: String
+    public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
         self.socketPath = socketPath
@@ -199,6 +231,73 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
+    public func chatList() async throws -> [ChatConversation] {
+        try await request(WireRequest(type: "chat_list"), as: ChatListPayload.self).conversations
+    }
+
+    public func chatHistory(conversationID: String) async throws -> [ChatMessage] {
+        try await request(
+            WireRequest(type: "chat_history", conversationID: conversationID),
+            as: ChatHistoryPayload.self
+        ).messages
+    }
+
+    public func chatDelete(conversationID: String) async throws {
+        let _: EmptyResponse = try await request(
+            WireRequest(type: "chat_delete", conversationID: conversationID),
+            as: EmptyResponse.self,
+            allowEmptyObject: true
+        )
+    }
+
+    public func chatSend(conversationID: String?, message: String) async throws -> ChatSendResult {
+        try await request(
+            WireRequest(type: "chat_send", conversationID: conversationID, message: message),
+            as: ChatSendResult.self
+        )
+    }
+
+    public nonisolated func chatStream(conversationID: String?, message: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        let encoded: Data
+        do {
+            var payload = try JSONEncoder().encode(
+                WireRequest(type: "chat_stream", conversationID: conversationID, message: message)
+            )
+            payload.append(0x0A)
+            encoded = payload
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+        let path = socketPath
+        return AsyncThrowingStream { continuation in
+            let socket = StreamSocket()
+            let task = Task.detached(priority: .userInitiated) {
+                do {
+                    try UnixLineTransport.stream(
+                        path: path,
+                        payload: encoded,
+                        socket: socket,
+                        isCancelled: { Task.isCancelled },
+                        onLine: { line in
+                            guard let event = try ChatStreamEventDecoder.decode(line: line) else {
+                                return true
+                            }
+                            continuation.yield(event)
+                            return !event.isTerminal
+                        }
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                socket.interrupt()
+                task.cancel()
+            }
+        }
+    }
+
     public func moments(sessionID: String) async throws -> [RecallMoment] {
         try await request(WireRequest(type: "moments_list", sessionID: sessionID), as: [RecallMoment].self)
     }
@@ -307,6 +406,8 @@ struct WireRequest: Encodable, Equatable {
     var summaryLanguage: String?
     var provider: String?
     var baseUrl: String?
+    var conversationID: String? = nil
+    var message: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -338,6 +439,8 @@ struct WireRequest: Encodable, Equatable {
         case summaryLanguage = "summary_language"
         case provider
         case baseUrl = "base_url"
+        case conversationID = "conversation_id"
+        case message
     }
 
     func encode(to encoder: Encoder) throws {
@@ -371,14 +474,36 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
         try container.encodeIfPresent(provider, forKey: .provider)
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
+        try container.encodeIfPresent(conversationID, forKey: .conversationID)
+        try container.encodeIfPresent(message, forKey: .message)
     }
 }
 
-private struct EmptyResponse: Codable {
+struct EmptyResponse: Codable {
     init() {}
 }
 
-private enum UnixLineTransport {
+final class StreamSocket: @unchecked Sendable {
+    private let lock = NSLock()
+    private var descriptor: Int32 = -1
+
+    func attach(_ descriptor: Int32) {
+        lock.lock()
+        self.descriptor = descriptor
+        lock.unlock()
+    }
+
+    func interrupt() {
+        lock.lock()
+        let descriptor = self.descriptor
+        lock.unlock()
+        if descriptor >= 0 {
+            Darwin.shutdown(descriptor, SHUT_RDWR)
+        }
+    }
+}
+
+enum UnixLineTransport {
     static func exchange(path: String, payload: Data) throws -> Data {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
@@ -412,6 +537,58 @@ private enum UnixLineTransport {
             prefix: framed.leftover
         )
         return ArtifactPayload(id: meta.id, contentType: meta.contentType, bytes: bytes)
+    }
+
+    static func stream(
+        path: String,
+        payload: Data,
+        socket: StreamSocket? = nil,
+        isCancelled: @escaping () -> Bool,
+        onLine: (Data) throws -> Bool
+    ) throws {
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw posixError("open socket") }
+        socket?.attach(descriptor)
+        defer { Darwin.close(descriptor) }
+        try connect(descriptor: descriptor, path: path)
+        try writeAll(descriptor: descriptor, payload: payload)
+        try readLines(descriptor: descriptor, isCancelled: isCancelled, onLine: onLine)
+    }
+
+    static func readLines(
+        descriptor: Int32,
+        isCancelled: () -> Bool,
+        onLine: (Data) throws -> Bool
+    ) throws {
+        let maximumResponseBytes = 64 * 1_024 * 1_024
+        var leftover = Data()
+        leftover.reserveCapacity(256)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while !isCancelled() {
+            while let newline = leftover.firstIndex(of: 0x0A) {
+                let line = leftover[..<newline]
+                leftover.removeSubrange(...newline)
+                let keepReading = try onLine(Data(line))
+                if !keepReading { return }
+            }
+            if leftover.count > maximumResponseBytes {
+                throw DaemonClientError.invalidResponse
+            }
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                leftover.append(contentsOf: buffer[..<count])
+                continue
+            }
+            if count == 0 {
+                if !leftover.isEmpty {
+                    _ = try onLine(leftover)
+                }
+                return
+            }
+            if errno == EINTR { continue }
+            if isCancelled() { return }
+            throw posixError("read")
+        }
     }
 
     private static func connect(descriptor: Int32, path: String) throws {
