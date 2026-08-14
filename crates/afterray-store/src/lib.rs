@@ -69,12 +69,14 @@ pub type TranscriptLine = (i64, String, String);
 pub type MomentAt = (String, i64);
 
 pub use slot::{
-    AppFact, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS, SlotCard, SlotEvidence,
-    SlotFacts, SlotMomentRow, SlotState, T2_SYSTEM_PROMPT, TimelineEntry, build_slot_card,
-    local_day_for, render_t2_prompt, shorten_place, slot_start_for,
+    AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
+    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
+    SlotSummaryState, StoredSlotOverlay, T2Card, T2_SYSTEM_PROMPT, TimelineEntry,
+    assemble_day_summary, build_slot_card, extract_json_object, local_day_bounds, local_day_for,
+    parse_t2_card, render_t2_prompt, shorten_place, slot_clock_label, slot_start_for,
 };
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -855,6 +857,186 @@ impl Vault {
         ))
     }
 
+    /// Persists a successful T2 card. Re-running the same slot increments
+    /// `generation` so a later model swap can tell the row is stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2Card,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let facts_json = serde_json::to_string(&card.facts).unwrap_or_else(|_| "{}".to_owned());
+        let artifacts_json = serde_json::to_string(&t2.artifacts).ok();
+        let bullets_json = serde_json::to_string(&t2.bullets).ok();
+        let evidence_json =
+            serde_json::to_string(&card.evidence).unwrap_or_else(|_| "{}".to_owned());
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO slot_summaries (
+                id, slot_start_ms, slot_end_ms, local_day, state, generation, schema_version,
+                facts_json, theme_key, artifacts_json, title, bullets_json, category, confidence,
+                evidence_json, producer, produced_at_ms, latency_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, 'done', 1, ?5,
+                ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+             )
+             ON CONFLICT(slot_start_ms) DO UPDATE SET
+                slot_end_ms = excluded.slot_end_ms,
+                local_day = excluded.local_day,
+                state = excluded.state,
+                generation = slot_summaries.generation + 1,
+                schema_version = excluded.schema_version,
+                facts_json = excluded.facts_json,
+                theme_key = excluded.theme_key,
+                artifacts_json = excluded.artifacts_json,
+                title = excluded.title,
+                bullets_json = excluded.bullets_json,
+                category = excluded.category,
+                confidence = excluded.confidence,
+                evidence_json = excluded.evidence_json,
+                producer = excluded.producer,
+                produced_at_ms = excluded.produced_at_ms,
+                latency_ms = excluded.latency_ms",
+            params![
+                id,
+                card.slot_start_ms,
+                card.slot_end_ms,
+                card.local_day,
+                SLOT_SUMMARY_SCHEMA_VERSION,
+                facts_json,
+                card.theme_key,
+                artifacts_json,
+                t2.title.trim(),
+                bullets_json,
+                t2.category.as_deref(),
+                t2.confidence,
+                evidence_json,
+                producer,
+                produced_at_ms,
+                latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Neighbouring T2 titles, oldest first. Fed to the next T2 pass as a
+    /// negative constraint so adjacent cards do not copy each other's wording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn previous_slot_titles(
+        &self,
+        before_start_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<slot::PrevCard>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, title FROM slot_summaries
+              WHERE title IS NOT NULL AND TRIM(title) != '' AND slot_start_ms < ?1
+              ORDER BY slot_start_ms DESC
+              LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![before_start_ms, limit], |row| {
+            let start_ms: i64 = row.get(0)?;
+            let title: String = row.get(1)?;
+            Ok(slot::PrevCard {
+                from_label: slot::slot_clock_label(start_ms),
+                title,
+            })
+        })?;
+        let mut cards = rows.collect::<Result<Vec<_>, _>>()?;
+        cards.reverse();
+        Ok(cards)
+    }
+
+    /// The day panel payload: every occupied slot that day, with T2 titles
+    /// when they exist and T1 facts otherwise.
+    ///
+    /// AX is not decrypted here. Facts only need app names and durations;
+    /// walking every tree on a 48-slot day would stall the overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn day_summary(
+        &self,
+        day_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::DaySummary, StoreError> {
+        let day = slot::local_day_for(day_ms);
+        let (day_start_ms, day_end_ms) = slot::local_day_bounds(day_ms);
+        let rows = self.slot_moment_rows(day_start_ms, day_end_ms)?;
+        let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(slot::slot_start_for(row.captured_at_ms))
+                .or_default()
+                .push(row);
+        }
+        let mut cards = Vec::new();
+        let mut starts: Vec<i64> = grouped.keys().copied().collect();
+        starts.sort_unstable();
+        for start in starts {
+            let slot_rows = grouped.remove(&start).unwrap_or_default();
+            let idle_ms = self.idle_overlap_ms(start, start + slot::SLOT_DURATION_MS)?;
+            cards.push(slot::build_slot_card(
+                start,
+                &slot_rows,
+                idle_ms,
+                capture_interval_ms,
+            ));
+        }
+        let overlays = self.slot_overlays_for_day(&day)?;
+        Ok(slot::assemble_day_summary(
+            day,
+            day_start_ms,
+            day_end_ms,
+            &cards,
+            &overlays,
+        ))
+    }
+
+    fn slot_overlays_for_day(
+        &self,
+        local_day: &str,
+    ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, state, title, bullets_json, category
+               FROM slot_summaries
+              WHERE local_day = ?1
+              ORDER BY slot_start_ms",
+        )?;
+        let rows = statement.query_map(params![local_day], |row| {
+            let start: i64 = row.get(0)?;
+            let state_raw: String = row.get(1)?;
+            let title: Option<String> = row.get(2)?;
+            let bullets_json: Option<String> = row.get(3)?;
+            let category: Option<String> = row.get(4)?;
+            let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
+            Ok((
+                start,
+                slot::StoredSlotOverlay {
+                    state: slot::SlotSummaryState::parse(&state_raw),
+                    title,
+                    bullets,
+                    category,
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Moments in `[from_ms, to_ms)` joined with their OCR text and evidence flags.
     ///
     /// # Errors
@@ -1297,6 +1479,13 @@ impl Vault {
         }
         self.connection.lock().unwrap().execute(
             "DELETE FROM memories WHERE start_ms <= ?2 AND end_ms >= ?1",
+            params![from_ms, to_ms],
+        )?;
+        // A leftover card after the evidence is gone is both a privacy leak
+        // and a hallucination source for the next T2 pass.
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM slot_summaries
+              WHERE slot_start_ms <= ?2 AND slot_end_ms > ?1",
             params![from_ms, to_ms],
         )?;
         Ok(count)
@@ -2229,6 +2418,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_9(connection)?;
     migrate_schema_10(connection)?;
     migrate_schema_11(connection)?;
+    migrate_schema_12(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2561,6 +2751,40 @@ fn migrate_schema_11(connection: &Connection) -> Result<(), StoreError> {
          );
          CREATE INDEX IF NOT EXISTS conversation_messages_thread
            ON conversation_messages(conversation_id, created_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// Slot cards persist independently of the live T1 compute path. T2 output
+/// used to vanish when the process exited; the day panel needs it to survive.
+fn migrate_schema_12(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slot_summaries (
+           id              TEXT PRIMARY KEY,
+           slot_start_ms   INTEGER NOT NULL,
+           slot_end_ms     INTEGER NOT NULL,
+           local_day       TEXT NOT NULL,
+           state           TEXT NOT NULL,
+           generation      INTEGER NOT NULL DEFAULT 1,
+           schema_version  INTEGER NOT NULL,
+           facts_json      TEXT NOT NULL,
+           theme_key       TEXT,
+           artifacts_json  TEXT,
+           title           TEXT,
+           bullets_json    TEXT,
+           category        TEXT,
+           confidence      REAL,
+           evidence_json   TEXT NOT NULL,
+           producer        TEXT,
+           produced_at_ms  INTEGER,
+           input_tokens    INTEGER,
+           output_tokens   INTEGER,
+           latency_ms      INTEGER
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS slot_summaries_slot
+           ON slot_summaries(slot_start_ms);
+         CREATE INDEX IF NOT EXISTS slot_summaries_day
+           ON slot_summaries(local_day, slot_start_ms);",
     )?;
     Ok(())
 }
@@ -4385,6 +4609,222 @@ mod tests {
         assert!(columns.iter().any(|column| column == "window_title"));
         assert!(columns.iter().any(|column| column == "url"));
         assert!(columns.iter().any(|column| column == "document"));
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+    }
+
+    fn stamp_app(vault: &Vault, moment_id: &str, app: &str, bundle: &str, title: &str) {
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments
+                    SET application_name = ?2,
+                        bundle_identifier = ?3,
+                        window_title = ?4
+                  WHERE id = ?1",
+                params![moment_id, app, bundle, title],
+            )
+            .unwrap();
+    }
+
+    fn insert_named_moment(
+        vault: &Vault,
+        session_id: &str,
+        at_ms: i64,
+        app: &str,
+        bundle: &str,
+        title: &str,
+    ) -> Moment {
+        let moment = vault
+            .insert_moment(session_id, at_ms, "image/jpeg", b"screen")
+            .unwrap();
+        stamp_app(vault, &moment.id, app, bundle, title);
+        moment
+    }
+
+    #[test]
+    fn slot_summaries_round_trip_and_day_summary_keeps_t1_only_slots() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+        let first_slot = slot_start_for(day_start + 10 * 3_600_000);
+        let second_slot = first_slot + SLOT_DURATION_MS;
+        for (offset, title) in [(0_i64, "gop.rs"), (20_000, "encoder.rs"), (40_000, "ivf.rs")] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                first_slot + offset,
+                "Xcode",
+                "com.apple.dt.Xcode",
+                title,
+            );
+        }
+        for offset in [0_i64, 20_000, 40_000] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                second_slot + offset,
+                "Safari",
+                "com.apple.Safari",
+                "docs.rs",
+            );
+        }
+
+        let second_card = vault.slot_card(second_slot + 1_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Reading rav1e Config".into(),
+                    bullets: vec!["docs.rs for the IVF header".into()],
+                    category: Some("reading".into()),
+                    confidence: Some(0.7),
+                },
+                "ollama:qwen",
+                second_slot,
+                Some(1_200),
+            )
+            .unwrap();
+
+        let summary = vault.day_summary(first_slot + 1_000, 10_000).unwrap();
+        assert_eq!(summary.slots.len(), 2);
+        let t1 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == first_slot)
+            .unwrap();
+        assert!(t1.title.is_none(), "T2 never ran on this slot");
+        assert!(!t1.facts.apps.is_empty());
+        assert_eq!(t1.state, SlotSummaryState::Degraded);
+        let t2 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == second_slot)
+            .unwrap();
+        assert_eq!(t2.title.as_deref(), Some("Reading rav1e Config"));
+        assert_eq!(t2.state, SlotSummaryState::Done);
+        assert_eq!(t2.category.as_deref(), Some("reading"));
+
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Second pass".into(),
+                    bullets: vec![],
+                    category: Some("reading".into()),
+                    confidence: Some(0.8),
+                },
+                "ollama:qwen",
+                second_slot + 1,
+                Some(800),
+            )
+            .unwrap();
+        let generation: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM slot_summaries WHERE slot_start_ms = ?1",
+                [second_slot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+
+        let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
+        assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+    }
+
+    #[test]
+    fn delete_history_removes_slot_summaries_with_the_evidence() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let at = 1_786_698_000_000;
+        let slot = slot_start_for(at);
+        insert_named_moment(
+            &vault,
+            &session.id,
+            slot + 5_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "gop.rs",
+        );
+        let card = vault.slot_card(slot + 5_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Should vanish".into(),
+                    bullets: vec![],
+                    category: None,
+                    confidence: None,
+                },
+                "test",
+                slot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap(), 1);
+        let remaining: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM slot_summaries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(vault.day_summary(slot, 10_000).unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn schema_12_adds_slot_summaries_without_resetting_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [7_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP TABLE slot_summaries;
+                     DROP INDEX IF EXISTS slot_summaries_slot;
+                     DROP INDEX IF EXISTS slot_summaries_day;
+                     UPDATE schema_meta SET version = 11;",
+                )
+                .unwrap();
+            session.id
+        };
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let has_table: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'slot_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_table, 1);
         let version: i64 = vault
             .connection
             .lock()

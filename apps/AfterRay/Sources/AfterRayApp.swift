@@ -906,7 +906,11 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
-            chromeTopPadding: controlBarTopPadding
+            chromeTopPadding: controlBarTopPadding,
+            daySummary: store.daySummary,
+            onVisibleDayChange: { dayMs in
+                Task { await store.loadDaySummary(dayMs: dayMs) }
+            }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(permissions.allGranted ? 1 : 0)

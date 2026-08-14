@@ -745,6 +745,10 @@ public enum RecallGeometry {
     public static let overlayChromeMargin: CGFloat = 26
     /// Space between sibling buttons inside one chrome cluster.
     public static let overlayChromeItemGap: CGFloat = 10
+    public static let daySummaryPanelWidth: CGFloat = 308
+    public static let daySummaryMaxHeight: CGFloat = 304
+    public static let daySummaryListMaxHeight: CGFloat = 248
+    public static let daySummaryCornerRadius: CGFloat = 16
 
     public static func controlBarTopPadding(
         safeAreaTop: CGFloat,

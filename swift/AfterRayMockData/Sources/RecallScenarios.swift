@@ -35,12 +35,26 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
         self == .processing ? .processing(message: "OCR and transcript are catching up") : .ready
     }
 
+    public var daySummary: DaySummary {
+        switch self {
+        case .empty:
+            let bounds = DaySummaryLayout.dayBounds(ms: Self.baseMs)
+            return DaySummary(day: DaySummaryLayout.localDayKey(ms: Self.baseMs), dayStartMs: bounds.start, dayEndMs: bounds.end, slots: [])
+        case .short:
+            return .mockFactsOnly(around: Self.baseMs)
+        case .long, .processing, .favorites:
+            return .mockRich(around: Self.baseMs)
+        }
+    }
+
+    static let baseMs: Int64 = 1_786_483_800_000
+
     private static func makeMoments(
         count: Int,
         processing: Bool = false,
         favoriteEvery: Int? = nil
     ) -> [RecallMoment] {
-        let base = Int64(1_786_483_800_000)
+        let base = Self.baseMs
         let screenCopy = [
             "Reviewing the capture pipeline and its retry policy.",
             "Timeline interaction: drag horizontally to move through the day.",
@@ -74,6 +88,87 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
                 bundleIdentifier: app.1
             )
         }
+    }
+}
+
+public extension DaySummary {
+    static func mockRich(around playheadMs: Int64) -> DaySummary {
+        let bounds = DaySummaryLayout.dayBounds(ms: playheadMs)
+        let current = DaySummaryLayout.slotStartMs(atMs: playheadMs)
+        let slot = DaySummaryLayout.slotDurationMs
+        let rows: [(Int64, String?, String, [DayAppFact])] = [
+            (current - 5 * slot, "Morning review of the capture retry policy", "coding", [
+                DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 1_380_000),
+                DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 240_000),
+            ]),
+            (current - 4 * slot, nil, "degraded", [
+                DayAppFact(name: "Slack", bundleIdentifier: "com.tinyspeck.slackmacgap", ms: 720_000),
+                DayAppFact(name: "Mail", bundleIdentifier: "com.apple.mail", ms: 180_000),
+            ]),
+            (current - 3 * slot, "Design doc: slot cards vs day filmstrip", "reading", [
+                DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 1_500_000),
+            ]),
+            (current - 2 * slot, "GOP header still failing the IVF length check", "coding", [
+                DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 1_320_000),
+                DayAppFact(name: "Terminal", bundleIdentifier: "com.apple.Terminal", ms: 360_000),
+            ]),
+            (current - slot, nil, "degraded", [
+                DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 900_000),
+                DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 600_000),
+            ]),
+            (current, "Long design conversation about T1/T2", "comms", [
+                DayAppFact(name: "Lody", bundleIdentifier: "ai.lody.app", ms: 1_680_000),
+            ]),
+            (current + slot, "cargo test after the prompt rewrite", "coding", [
+                DayAppFact(name: "Terminal", bundleIdentifier: "com.apple.Terminal", ms: 840_000),
+                DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 720_000),
+            ]),
+            (current + 2 * slot, nil, "degraded", [
+                DayAppFact(name: "Figma", bundleIdentifier: "com.figma.Desktop", ms: 1_200_000),
+            ]),
+            (current + 3 * slot, "Visual Lab pass on the day panel", "other", [
+                DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 1_080_000),
+                DayAppFact(name: "Figma", bundleIdentifier: "com.figma.Desktop", ms: 480_000),
+            ]),
+            (current + 4 * slot, nil, "degraded", [
+                DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 540_000),
+            ]),
+        ]
+        let slots = rows
+            .filter { start, _, _, _ in start >= bounds.start && start < bounds.end }
+            .map { start, title, category, apps in
+            DaySlotSummary(
+                slotStartMs: start,
+                slotEndMs: start + slot,
+                state: title == nil ? "degraded" : "done",
+                facts: DaySlotFacts(apps: apps, momentCount: 12),
+                title: title,
+                bullets: title.map { ["\($0)"] },
+                category: title == nil ? nil : category
+            )
+        }
+        return DaySummary(
+            day: DaySummaryLayout.localDayKey(ms: playheadMs),
+            dayStartMs: bounds.start,
+            dayEndMs: bounds.end,
+            slots: slots
+        )
+    }
+
+    static func mockFactsOnly(around playheadMs: Int64) -> DaySummary {
+        let rich = mockRich(around: playheadMs)
+        let slots = rich.slots.map { row in
+            DaySlotSummary(
+                slotStartMs: row.slotStartMs,
+                slotEndMs: row.slotEndMs,
+                state: "degraded",
+                facts: row.facts,
+                title: nil,
+                bullets: nil,
+                category: nil
+            )
+        }
+        return DaySummary(day: rich.day, dayStartMs: rich.dayStartMs, dayEndMs: rich.dayEndMs, slots: Array(slots.prefix(4)))
     }
 }
 

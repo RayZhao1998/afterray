@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut slots = 1_usize;
     let mut at_ms: Option<i64> = None;
     let mut as_json = false;
+    let mut as_day = false;
     let mut language = "English".to_owned();
 
     let mut args = std::env::args().skip(1);
@@ -27,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--slots" => slots = args.next().unwrap_or_default().parse().unwrap_or(1),
             "--at-ms" => at_ms = args.next().and_then(|value| value.parse().ok()),
             "--json" => as_json = true,
+            "--day" => as_day = true,
             "--language" => language = args.next().unwrap_or_default(),
             other => eprintln!("ignoring unknown argument {other}"),
         }
@@ -49,6 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .unwrap_or_default()
     });
+
+    if as_day {
+        let summary = vault.day_summary(now_ms, 10_000)?;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
 
     let newest_start = slot_start_for(now_ms);
     let mut emitted = 0_usize;
