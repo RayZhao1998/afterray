@@ -1,36 +1,92 @@
-# AfterRay
+<p align="center">
+  <img src="apps/AfterRay/Resources/AppIcon.png" width="180" height="180" alt="AfterRay app icon">
+</p>
 
-**AfterRay** — a ray that persists after the day is gone.
+<h1 align="center">AfterRay</h1>
 
-**A private timeline for everything you saw and heard on your Mac.**
+<p align="center">
+  <strong>Your Mac's private, searchable memory.</strong><br>
+  Recall what you saw, heard, and worked on — then let agents query only the
+  history you choose to share.
+</p>
 
-AfterRay continuously captures your screen, system audio, microphone audio,
-and the foreground app's Accessibility tree. Local OCR and speech recognition turn those
-captures into searchable context. A native recall timeline lets you drag back
-through the day, recover the exact screen you saw, and play the audio around
-that moment.
+AfterRay is a local-first computer-history app for macOS. It captures your
+screen and, when enabled, system and microphone audio plus foreground-app
+Accessibility context. Local OCR, speech recognition, and search turn that
+recording into a timeline you can return to: the exact screen, words, app, and
+audio around a moment.
 
-Everything runs on your Mac. Captures, indexes, model inputs, and model outputs
-stay local.
+AfterRay is designed to be useful on its own and to act as a user-owned memory
+layer for AI agents. The vault stays under the user's control, and every
+agent-facing tool is intended to be read-only.
+
+## What AfterRay does
+
+- **Recall visually.** Drag through a native macOS timeline and return to the
+  screen and audio around any captured moment.
+- **Search what happened.** Search OCR, transcripts, Accessibility context, and
+  local embeddings by words or meaning.
+- **Preserve useful evidence.** Favorite important moments so retention cleanup
+  does not remove them.
+- **Ask questions with citations.** The built-in conversational agent retrieves
+  evidence through a fixed set of read-only tools and answers from that
+  evidence.
+- **Work with external agents.** A CLI today, and a scoped CLI/MCP Context
+  Gateway for the public release, let tools such as Codex and Claude query
+  history that the user explicitly authorizes.
+- **Keep the primary record local.** Captures, indexes, model outputs, and vault
+  encryption keys live on the Mac.
+
+## From capture to recall
+
+```text
+Screen + optional audio + Accessibility context
+                         │
+                         ▼
+              local OCR / ASR / embeddings
+                         │
+                         ▼
+                  encrypted local vault
+                         │
+                 ┌───────┴────────┐
+                 ▼                ▼
+          Timeline + search   read-only Agent tools
+```
+
+The app provides pause controls, capture indicators, retention settings, and
+App exclusions. The UI and external tools request typed views from the daemon;
+they do not open the database or receive the vault key.
+
+## Privacy and Agent boundaries
+
+The local-first boundary applies to capture, storage, OCR, transcription,
+embeddings, and search. Model choice and external Agent access can extend that
+boundary only when the user opts in:
+
+| Path | What AfterRay does | Where data can go |
+| --- | --- | --- |
+| Built-in model | Runs the conversational model on the Mac | Model prompts and retrieved evidence stay on the Mac |
+| Local Ollama | Sends model requests to the user-configured Ollama endpoint | Normally the local Ollama process; the user controls its address and configuration |
+| OpenAI-compatible URL | Sends the request prompt and retrieved context needed for that request | The URL and provider chosen by the user; their storage, logging, and training policies apply |
+| External Agent through CLI/MCP | Returns only evidence allowed by the AfterRay interface and the user's authorization | The external process and any model provider it uses; AfterRay cannot control later use after returning the data |
+
+The built-in Agent is deliberately not a general-purpose computer Agent. Its
+registered tools can search and read moments, activity, memories, OCR, and
+Accessibility evidence. It has no AfterRay tool for shell execution, editing
+files, changing settings, controlling capture, deleting history, or writing
+back to the vault.
+
+Choosing an OpenAI-compatible endpoint, or authorizing Codex, Claude, or
+another external Agent to receive CLI/MCP results, is an explicit user action.
+AfterRay controls the local query boundary; it cannot make privacy guarantees
+for a third-party process or service after data has crossed that boundary.
 
 > [!IMPORTANT]
 > AfterRay is currently a developer V0, built to prove the complete local
 > capture → understanding → recall loop on one Mac. It is not yet packaged or
-> hardened for general distribution.
-
-## What works today
-
-- Automatic recording after the required macOS permissions are approved.
-- A native macOS timeline with horizontal drag-to-recall.
-- Screenshot previews, OCR text, transcripts, and audio playback by moment.
-- Full-text and local embedding search across captured evidence.
-- Local session summaries through a built-in GGUF, local Ollama, or an
-  OpenAI-compatible endpoint.
-- Favorites that survive automatic retention cleanup.
-- An encrypted local vault backed by SQLCipher and XChaCha20-Poly1305.
-- A Rust CLI that exposes the same API used by the Swift app.
-- A standalone Visual Lab for iterating on recall UI with deterministic mock
-  data.
+> hardened for general distribution. In particular, the current developer CLI
+> still contains operational commands and is not yet the scoped, read-only
+> Context Gateway planned for the public release.
 
 ## Requirements
 
@@ -96,7 +152,7 @@ Stop AfterRay by pressing `Control-C` in the terminal that launched it.
 Screenshots are captured every 10 seconds in V0. The interval can be changed
 with `AFTERRAY_CAPTURE_INTERVAL_SECONDS`.
 
-## Local models
+## Models
 
 AfterRay downloads ASR and embedding weights into `.afterray/models` and owns
 those inference processes. Overlay Q&A can use one of three assistant sources,
@@ -108,10 +164,14 @@ chosen in **Settings → AI Models**:
   models, and sends OpenAI-compatible `/v1/chat/completions` requests. Prefer
   a local `qwen3.6` tag when one is installed.
 - **OpenAI compatible** — any `/v1` chat-completions URL, optional API key,
-  and model name. This is the path for hosted Qwen 3.7 (no open weights).
+  and model name. Prompts and the retrieved context needed for the request are
+  sent to that endpoint. This is the path for hosted Qwen 3.7 (no open
+  weights).
 
 Rust still owns scheduling, retries, cancellation, and result storage.
-Capture, OCR, and search keep working if no assistant is configured.
+Capture, OCR, and search keep working if no assistant is configured. Selecting
+an external endpoint changes the data boundary for model requests; it does not
+upload or relocate the encrypted vault itself.
 
 Qwen 3.7 Max is API-only as of August 2026. Do not expect `ollama pull
 qwen3.7` or a local GGUF to exist. Use a hosted OpenAI-compatible endpoint, or
@@ -152,7 +212,7 @@ The accepted threat model, key hierarchy, runtime locking rules, and V0 versus
 release requirements are documented in the
 [Vault encryption design](docs/vault-encryption-design.md).
 
-## CLI and daemon
+## Developer CLI and daemon
 
 Run only the daemon when developing the CLI:
 
@@ -161,12 +221,10 @@ make v0-daemon
 ```
 
 The runner prints the temporary socket path and ready-to-copy commands for a
-second terminal. With `AFTERRAY_SOCKET` set to that path, the main commands are:
+second terminal. With `AFTERRAY_SOCKET` set to that path, read commands include:
 
 ```sh
 afterray status --json
-afterray record start
-afterray record stop
 afterray sessions list --json
 afterray moments <session-id> --json
 afterray moment <moment-id> --json
@@ -176,14 +234,17 @@ afterray evidence ocr <moment-id> --json
 afterray evidence ax <moment-id> --json
 afterray activity --from-ms … --to-ms … --json
 afterray memories --from-ms … --to-ms … --json
-afterray favorite add <moment-id>
-afterray favorite remove <moment-id>
-afterray summarize <session-id> --json
 afterray models --json
 afterray jobs list --json
 ```
 
-### PATH install for external agents
+The V0 developer binary also contains operational commands for development and
+direct user actions, including starting or stopping capture, changing settings,
+managing favorites, clearing history, downloading models, retrying jobs, and
+requesting summaries. Those commands are not part of the planned public Agent
+API.
+
+### Experimental PATH access for external Agents
 
 AfterRay can copy the bundled CLI to `~/.local/bin/afterray` so Claude Code,
 Codex, Cursor, and similar tools can query local history without MCP.
@@ -196,9 +257,18 @@ Codex, Cursor, and similar tools can query local history without MCP.
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The CLI is read-mostly agent surface (search, moment detail, OCR boxes, AX
-digest/tree, activity spans, memories). The vault key stays in the daemon;
-external tools never open the database.
+The current V0 install copies the complete developer CLI, including its
+operational commands. Treat it as trusted local developer access, not as a
+security boundary, and do not expose it to an Agent you do not trust.
+
+Before public distribution, external Agent access will move behind a
+server-enforced, read-only Context Gateway with per-client scopes, explicit
+approval, revocation, result limits, and a local access log. The vault key will
+stay in the daemon; external tools will never open the database directly.
+
+Anything returned through the CLI becomes visible to the external Agent. If
+that Agent uses a hosted model, the external Agent—not AfterRay—determines what
+is sent to its provider.
 
 When running from the repository, replace `afterray` with
 `target/debug/afterray`.
@@ -328,8 +398,9 @@ This does not modify the persistent vault at `.afterray/v0-data`.
 
 V0 intentionally does not include activity-triggered capture, meeting
 detection, subscriptions, production App Store packaging, multi-device sync,
-third-party agent access, or Windows support. Model setup is still a developer
-script rather than the final in-app download experience.
+the scoped public Context Gateway for third-party Agents, or Windows support.
+Model setup is still a developer script rather than the final in-app download
+experience.
 
 The next product milestone is focused on the recall experience itself: making
 navigation through hours, days, and eventually months feel immediate and
@@ -338,8 +409,23 @@ visually distinctive.
 For the frozen V0 scope and technical decisions, read the
 [V0 implementation plan](docs/afterray-v0-implementation-plan.md).
 
-## Project status
+## License
 
-AfterRay is currently a private development project. External contributions are
-not being accepted during V0, and no public source license has been selected in
-this repository yet.
+AfterRay is source-available, not currently OSI Open Source:
+
+- Unless a file or subdirectory says otherwise, the application is licensed
+  under [FSL-1.1-ALv2](LICENSE). You may inspect, build, run, modify, and
+  redistribute it for permitted purposes. You may not make the current source
+  available to others as a competing commercial product or service.
+- Each version becomes available under Apache-2.0 on the second anniversary of
+  the date that version was first made available.
+- [`afterray-protocol`](crates/afterray-protocol/LICENSE) is available now under
+  Apache-2.0 so clients can implement and verify the integration boundary.
+- Public SDKs will use Apache-2.0. Official AfterRay Agent Skills will use MIT
+  and will carry their own license when published.
+- The licenses do not grant rights to use the AfterRay name, logo, or other
+  marks to present a derivative build as an official release.
+
+AfterRay is still in developer preview, and external contributions are not yet
+being accepted. The source license nevertheless applies to the code in this
+repository today.
