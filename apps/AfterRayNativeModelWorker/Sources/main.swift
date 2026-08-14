@@ -38,9 +38,21 @@ private struct WorkerResponse: Encodable {
     }
 }
 
+/// One recognized line. Geometry is Apple Vision's normalized bounding box:
+/// origin at the **bottom-left**, unit square relative to the image.
+private struct OcrRegion: Encodable {
+    let text: String
+    let confidence: Float
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
 private struct Output: Encodable {
     let type = "ocr"
     let text: String
+    let regions: [OcrRegion]
 }
 
 private enum WorkerFailure: LocalizedError {
@@ -55,7 +67,7 @@ private enum WorkerFailure: LocalizedError {
     }
 }
 
-private func recognizeText(at path: String) throws -> String {
+private func recognizeText(at path: String) throws -> (text: String, regions: [OcrRegion]) {
     let url = URL(fileURLWithPath: path) as CFURL
     guard
         let source = CGImageSourceCreateWithURL(url, nil),
@@ -68,9 +80,24 @@ private func recognizeText(at path: String) throws -> String {
     request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
     try VNImageRequestHandler(cgImage: image).perform([request])
 
-    return (request.results ?? [])
-        .compactMap { $0.topCandidates(1).first?.string }
-        .joined(separator: "\n")
+    var regions: [OcrRegion] = []
+    regions.reserveCapacity(request.results?.count ?? 0)
+    for observation in request.results ?? [] {
+        guard let candidate = observation.topCandidates(1).first else { continue }
+        let box = observation.boundingBox
+        regions.append(
+            OcrRegion(
+                text: candidate.string,
+                confidence: candidate.confidence,
+                x: box.origin.x,
+                y: box.origin.y,
+                width: box.size.width,
+                height: box.size.height
+            )
+        )
+    }
+    let text = regions.map(\.text).joined(separator: "\n")
+    return (text, regions)
 }
 
 private func execute(_ request: WorkerRequest) throws -> Output {
@@ -83,7 +110,8 @@ private func execute(_ request: WorkerRequest) throws -> Output {
     guard let path = request.input.imagePath, !path.isEmpty else {
         throw WorkerFailure.invalidRequest("OCR input is missing image_path")
     }
-    return try Output(text: recognizeText(at: path))
+    let result = try recognizeText(at: path)
+    return Output(text: result.text, regions: result.regions)
 }
 
 do {

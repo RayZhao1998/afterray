@@ -631,6 +631,7 @@ mod tests {
                 1_000,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
 

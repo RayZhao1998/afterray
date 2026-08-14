@@ -437,7 +437,13 @@ async fn finish_failed(inner: &QueueInner, id: &str, generation: u64, error: Str
 
 fn output_summary(output: &ModelOutput) -> String {
     match output {
-        ModelOutput::Ocr { text } => format!("ocr, {} chars", text.chars().count()),
+        ModelOutput::Ocr { text, regions } => {
+            format!(
+                "ocr, {} chars, {} regions",
+                text.chars().count(),
+                regions.len()
+            )
+        }
         ModelOutput::Asr { text, language } => match language {
             Some(language) if !language.is_empty() => {
                 format!("asr/{language}, {} chars", text.chars().count())

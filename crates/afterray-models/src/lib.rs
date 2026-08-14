@@ -84,12 +84,30 @@ impl ModelInput {
     }
 }
 
+/// One OCR line/region with Vision-normalized geometry.
+///
+/// Coordinates are in the unit square with **origin at the bottom-left**
+/// (Apple Vision `boundingBox` convention): `x`/`y` are the minimum corner,
+/// `width`/`height` extend up and right in normalized image space.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OcrRegion {
+    pub text: String,
+    pub confidence: f32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// Typed output returned by model adapters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelOutput {
     Ocr {
         text: String,
+        /// Per-line boxes. Empty when a worker only returned flat text.
+        #[serde(default)]
+        regions: Vec<OcrRegion>,
     },
     Asr {
         text: String,

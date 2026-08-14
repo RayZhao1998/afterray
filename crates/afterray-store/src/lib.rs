@@ -56,7 +56,7 @@ pub use memory::{
     AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
 };
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -462,7 +462,7 @@ impl Vault {
                     m.window_title,
                     m.url,
                     m.document,
-                    m.gop_segment_id,
+                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
                     m.gop_index,
                     m.still_origin,
                     (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
@@ -505,7 +505,7 @@ impl Vault {
                     m.window_title,
                     m.url,
                     m.document,
-                    m.gop_segment_id,
+                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
                     m.gop_index,
                     m.still_origin,
                     (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
@@ -548,7 +548,7 @@ impl Vault {
                     m.window_title,
                     m.url,
                     m.document,
-                    m.gop_segment_id,
+                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
                     m.gop_index,
                     m.still_origin,
                     (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
@@ -851,7 +851,12 @@ impl Vault {
         Ok(())
     }
 
-    pub fn memories(&self, from_ms: i64, to_ms: i64, limit: usize) -> Result<Vec<Memory>, StoreError> {
+    pub fn memories(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, StoreError> {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
@@ -953,13 +958,16 @@ impl Vault {
         started_at_ms: i64,
         ended_at_ms: Option<i64>,
         model_version: &str,
+        // Optional JSON array of OCR regions (Vision-normalized boxes).
+        layout_json: Option<&str>,
     ) -> Result<String, StoreError> {
         let id = Uuid::now_v7().to_string();
         let connection = self.connection.lock().unwrap();
         connection.execute(
             "INSERT INTO text_evidence
-             (id, session_id, moment_id, audio_segment_id, source, text, started_at_ms, ended_at_ms, model_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, session_id, moment_id, audio_segment_id, source, text, started_at_ms, ended_at_ms,
+              model_version, layout_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 session_id,
@@ -969,7 +977,8 @@ impl Vault {
                 text,
                 started_at_ms,
                 ended_at_ms,
-                model_version
+                model_version,
+                layout_json
             ],
         )?;
         connection.execute(
@@ -977,6 +986,22 @@ impl Vault {
             params![id, text],
         )?;
         Ok(id)
+    }
+
+    /// Returns OCR layout JSON for a moment, if an OCR evidence row stored boxes.
+    pub fn ocr_layout_for_moment(&self, moment_id: &str) -> Result<Option<String>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT layout_json FROM text_evidence
+                  WHERE moment_id = ?1 AND source = 'ocr' AND layout_json IS NOT NULL
+                  ORDER BY started_at_ms DESC, id DESC
+                  LIMIT 1",
+                [moment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
@@ -1167,7 +1192,8 @@ impl Vault {
     }
 
     fn put_artifact(&self, content_type: &str, bytes: &[u8]) -> Result<String, StoreError> {
-        let staged = self.stage_artifact(content_type, bytes)?;
+        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let staged = self.stage_artifact_unlocked(content_type, bytes)?;
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO artifacts (
                  id, content_type, byte_length, format_version, wrapped_key, wrapping_nonce
@@ -1190,7 +1216,7 @@ impl Vault {
 
     /// Encrypt and write the artifact file. The DEK is not in SQL until the
     /// caller inserts `artifacts` in the same transaction as the claim.
-    pub(crate) fn stage_artifact(
+    fn stage_artifact_unlocked(
         &self,
         content_type: &str,
         bytes: &[u8],
@@ -1198,7 +1224,6 @@ impl Vault {
         let id = Uuid::now_v7().to_string();
         let encrypted = encrypt_artifact(&self.artifact_wrap_key, &id, content_type, bytes)?;
         let final_path = self.artifact_path(&id);
-        let _artifact_guard = self.artifact_io.lock().unwrap();
         atomic_write_private(&final_path, &encrypted.bytes)?;
         Ok(StagedArtifact {
             id,
@@ -1358,11 +1383,8 @@ impl Vault {
     fn enforce_retention(&self) -> Result<(), StoreError> {
         let max = i64::try_from(self.max_unstarred_moments).unwrap_or(i64::MAX);
         let mut connection = self.connection.lock().unwrap();
-        let count: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM moments WHERE is_favorite = 0",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM moments", [], |row| row.get(0))?;
         let excess = count.saturating_sub(max).max(0);
         if excess == 0 {
             return Ok(());
@@ -1371,7 +1393,7 @@ impl Vault {
         let candidates = {
             let mut statement = transaction.prepare(
                 "SELECT id, image_artifact_id, accessibility_artifact_id
-                   FROM moments WHERE is_favorite = 0
+                   FROM moments
                  ORDER BY captured_at_ms ASC LIMIT ?1",
             )?;
             statement
@@ -1678,6 +1700,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_legacy_moment_columns(connection)?;
     migrate_schema_8(connection)?;
     migrate_schema_9(connection)?;
+    migrate_schema_10(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -1972,6 +1995,17 @@ fn migrate_schema_9(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS memories_time ON memories(start_ms, end_ms);
          CREATE INDEX IF NOT EXISTS memories_fingerprint ON memories(fingerprint);",
     )?;
+    Ok(())
+}
+
+fn migrate_schema_10(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(text_evidence)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|name| name == "layout_json") {
+        connection.execute("ALTER TABLE text_evidence ADD COLUMN layout_json TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -2671,13 +2705,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_skips_favorites() {
+    fn retention_evicts_oldest_moments() {
         let (_directory, vault) = test_vault(2);
         let session = vault.create_session_sync(1).unwrap();
         let first = vault
             .insert_moment(&session.id, 1, "image/jpeg", b"one")
             .unwrap();
-        vault.set_favorite(&first.id, true).unwrap();
         let second = vault
             .insert_moment(&session.id, 2, "image/jpeg", b"two")
             .unwrap();
@@ -2692,7 +2725,7 @@ mod tests {
             .iter()
             .map(|moment| moment.id.as_str())
             .collect::<Vec<_>>();
-        assert!(ids.contains(&first.id.as_str()));
+        assert!(!ids.contains(&first.id.as_str()));
         assert!(!ids.contains(&second.id.as_str()));
         assert!(ids.contains(&third.id.as_str()));
         assert!(ids.contains(&fourth.id.as_str()));
@@ -2718,6 +2751,7 @@ mod tests {
                 10,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
         let second_evidence = vault
@@ -2730,6 +2764,7 @@ mod tests {
                 20,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
         vault
@@ -2758,7 +2793,7 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
         let evidence = vault
-            .insert_text_evidence(&session.id, None, None, "ocr", "test", 1, None, "ocr-model")
+            .insert_text_evidence(&session.id, None, None, "ocr", "test", 1, None, "ocr-model", None)
             .unwrap();
         assert!(matches!(
             vault.insert_embedding(&evidence, &[], "embedding-model"),
@@ -2903,7 +2938,8 @@ mod tests {
                     10_000 * i64::from(index),
                     None,
                     "ocr",
-                )
+                None,
+            )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -2944,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_unpinned_stills_nulls_jpeg_and_keeps_favorites() {
+    fn drop_unpinned_stills_nulls_every_packed_jpeg() {
         let (_directory, vault) = test_vault(20);
         let session = vault.create_session_sync(1).unwrap();
         let jpeg = [
@@ -2958,7 +2994,6 @@ mod tests {
                 .unwrap();
             ids.push(moment.id);
         }
-        vault.set_favorite(&ids[1], true).unwrap();
         let frames: Vec<GopCommitFrame> = (0..3)
             .map(|index| GopCommitFrame {
                 index,
@@ -2984,14 +3019,15 @@ mod tests {
                 frames: &frames,
             })
             .unwrap();
-        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 2);
+        vault.mark_gop_ready(&segment).unwrap();
+        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 3);
         let moments = vault.moments_sync(&session.id).unwrap();
         let by_id: std::collections::HashMap<_, _> = moments
             .into_iter()
             .map(|moment| (moment.id.clone(), moment))
             .collect();
         assert!(by_id[&ids[0]].image_artifact_id.is_none());
-        assert!(by_id[&ids[1]].image_artifact_id.is_some());
+        assert!(by_id[&ids[1]].image_artifact_id.is_none());
         assert!(by_id[&ids[2]].image_artifact_id.is_none());
         assert!(by_id[&ids[0]].gop.is_some());
     }
@@ -3071,7 +3107,7 @@ mod tests {
                 content_hash: [index as u8; 32],
             })
             .collect();
-        vault
+        let segment = vault
             .commit_gop(GopCommitRequest {
                 moment_ids: &ids,
                 ivf: b"DKIF-fake",
@@ -3087,6 +3123,12 @@ mod tests {
                 frames: &frames,
             })
             .unwrap();
+        assert_eq!(
+            vault.reconcile_packed_stills().unwrap(),
+            0,
+            "writing GOP must not drop stills"
+        );
+        vault.mark_gop_ready(&segment).unwrap();
         assert_eq!(vault.reconcile_packed_stills().unwrap(), 2);
         let moments = vault.moments_sync(&session.id).unwrap();
         assert!(
@@ -3136,7 +3178,8 @@ mod tests {
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                )
+                None,
+            )
                 .unwrap();
         }
         let policy = PackPolicy {
@@ -3491,6 +3534,32 @@ mod tests {
         );
         assert_eq!(spans[1].moment_ids, [fourth.id]);
         assert!(vault.activity_spans(2_000_000, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ocr_layout_json_is_stored_and_readable() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        let layout = r#"[{"text":"Hello","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#;
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                "Hello",
+                1_000,
+                None,
+                "vision-ocr",
+                Some(layout),
+            )
+            .unwrap();
+        let stored = vault.ocr_layout_for_moment(&moment.id).unwrap();
+        assert_eq!(stored.as_deref(), Some(layout));
+        assert!(vault.ocr_layout_for_moment("missing").unwrap().is_none());
     }
 
     #[test]

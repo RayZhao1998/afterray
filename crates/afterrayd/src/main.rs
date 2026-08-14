@@ -10,6 +10,7 @@ use afterray_models::{
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
+    apply_background_qos,
 };
 use afterray_protocol::{
     AppSettings, ArtifactPayload, HistoryScope, ModelDownloadProgress, PROTOCOL_VERSION,
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let capture_busy = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
+    let recording_active = Arc::new(AtomicBool::new(false));
     let state = Arc::new(AppState {
         store,
         capture,
@@ -129,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         packer,
         capture_busy,
         last_capture_ms,
+        recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
     });
@@ -234,6 +237,7 @@ struct AppState {
     packer: Arc<gop_packer::GopPacker>,
     capture_busy: Arc<AtomicBool>,
     last_capture_ms: Arc<AtomicI64>,
+    recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
 }
@@ -262,8 +266,19 @@ impl Default for PersistedSettings {
 #[derive(Default)]
 struct RecordingRuntime {
     active_session_id: Option<String>,
+    captured_frame: bool,
     scheduler: Option<JoinHandle<()>>,
     event_consumer: Option<JoinHandle<()>>,
+}
+
+fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
+    if runtime.active_session_id.is_none() {
+        RecordingState::Idle
+    } else if runtime.captured_frame {
+        RecordingState::Recording
+    } else {
+        RecordingState::Waiting
+    }
 }
 
 async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> {
@@ -335,17 +350,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
     match request {
         Request::Ping => Response::success(serde_json::json!({"pong": true})),
         Request::Status => {
-            let active_session_id = state.recording.lock().await.active_session_id.clone();
+            let recording = state.recording.lock().await;
             Response::success(Status {
                 daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
                 protocol_version: PROTOCOL_VERSION,
                 schema_version: afterray_store::SCHEMA_VERSION,
-                recording_state: if active_session_id.is_some() {
-                    RecordingState::Recording
-                } else {
-                    RecordingState::Idle
-                },
-                active_session_id,
+                recording_state: recording_state_of(&recording),
+                active_session_id: recording.active_session_id.clone(),
             })
         }
         Request::RecordStart => record_start(state).await,
@@ -376,15 +387,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         ),
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
-        Request::FavoriteSet {
-            moment_id,
-            favorite,
-        } => match state.store.set_favorite(&moment_id, favorite) {
-            Ok(()) => Response::success(
-                serde_json::json!({"moment_id": moment_id, "is_favorite": favorite}),
-            ),
-            Err(error) => Response::failure(error.to_string()),
-        },
+        Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
         Request::Search { query, limit } => {
             match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
                 Ok(hits) => Response::success(hits),
@@ -466,6 +469,8 @@ async fn record_start(state: &Arc<AppState>) -> Response {
         state.capture.record_audio()
     );
     recording.active_session_id = Some(session.id.clone());
+    recording.captured_frame = false;
+    state.recording_active.store(true, Ordering::SeqCst);
     drop(recording);
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         eprintln!("record_start: capture runtime failed: {error}");
@@ -474,6 +479,7 @@ async fn record_start(state: &Arc<AppState>) -> Response {
         if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
             recording.active_session_id = None;
         }
+        state.recording_active.store(false, Ordering::SeqCst);
         return Response::failure(error);
     }
     eprintln!("record_start: session {} is recording", session.id);
@@ -482,7 +488,9 @@ async fn record_start(state: &Arc<AppState>) -> Response {
 
 async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Result<(), String> {
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
+    state.capture_busy.store(true, Ordering::SeqCst);
     if let Err(error) = state.capture.start_capture().await {
+        state.capture_busy.store(false, Ordering::SeqCst);
         eprintln!("capture runtime: start_capture failed: {error}");
         return Err(error.to_string());
     }
@@ -499,28 +507,34 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
             eprintln!("capture runtime: shim ready display={display_id} {width}x{height}");
         }
         Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
+            state.capture_busy.store(false, Ordering::SeqCst);
             let _ = state.capture.stop_capture().await;
             return Err(format!("capture startup failed [{code}]: {message}"));
         }
         Ok(Some(Ok(event))) => {
+            state.capture_busy.store(false, Ordering::SeqCst);
             let _ = state.capture.stop_capture().await;
             return Err(format!(
                 "capture helper returned {event:?} before it was ready"
             ));
         }
         Ok(Some(Err(error))) => {
+            state.capture_busy.store(false, Ordering::SeqCst);
             let _ = state.capture.stop_capture().await;
             return Err(error.to_string());
         }
         Ok(None) => {
+            state.capture_busy.store(false, Ordering::SeqCst);
             let _ = state.capture.stop_capture().await;
             return Err("capture helper exited before it was ready".to_owned());
         }
         Err(_) => {
+            state.capture_busy.store(false, Ordering::SeqCst);
             let _ = state.capture.stop_capture().await;
             return Err("capture helper did not become ready within 30 seconds".to_owned());
         }
     }
+    state.capture_busy.store(false, Ordering::SeqCst);
 
     let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
@@ -721,6 +735,7 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
             return Response::success(serde_json::json!({"already_stopped": true}));
         };
         state.last_capture_ms.store(0, Ordering::SeqCst);
+        state.recording_active.store(false, Ordering::SeqCst);
         (
             session_id,
             recording.scheduler.take(),
@@ -799,8 +814,11 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
             return;
         }
         recording.active_session_id = None;
+        recording.captured_frame = false;
         recording.scheduler.take()
     };
+    state.recording_active.store(false, Ordering::SeqCst);
+    state.last_capture_ms.store(0, Ordering::SeqCst);
     if let Some(scheduler) = scheduler {
         scheduler.abort();
     }
@@ -823,6 +841,12 @@ async fn import_artifact(
                 state
                     .store
                     .insert_moment(session_id, started_at_ms, content_type, &bytes)?;
+            {
+                let mut recording = state.recording.lock().await;
+                if recording.active_session_id.as_deref() == Some(session_id) {
+                    recording.captured_frame = true;
+                }
+            }
             let job = state
                 .models
                 .submit(ModelInput::Ocr {
@@ -835,8 +859,14 @@ async fn import_artifact(
             tokio::spawn(async move {
                 let snapshot = model_state.models.wait(&job).await;
                 if let Ok(snapshot) = snapshot
-                    && let Some(ModelOutput::Ocr { text }) = snapshot.output
-                    && let Ok(evidence_id) = model_state.store.insert_text_evidence(
+                    && let Some(ModelOutput::Ocr { text, regions }) = snapshot.output
+                {
+                    let layout_json = if regions.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&regions).ok()
+                    };
+                    if let Ok(evidence_id) = model_state.store.insert_text_evidence(
                         &moment.session_id,
                         Some(&moment.id),
                         None,
@@ -845,9 +875,10 @@ async fn import_artifact(
                         moment.captured_at_ms,
                         None,
                         &snapshot.adapter,
-                    )
-                {
-                    submit_embedding(&model_state, evidence_id, text).await;
+                        layout_json.as_deref(),
+                    ) {
+                        submit_embedding(&model_state, evidence_id, text).await;
+                    }
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
@@ -895,6 +926,7 @@ async fn import_artifact(
                                 segment.started_at_ms,
                                 Some(segment.ended_at_ms),
                                 &snapshot.adapter,
+                                None,
                             ) {
                                 submit_embedding(&model_state, evidence_id, text).await;
                             }
@@ -919,9 +951,11 @@ async fn import_artifact(
             });
         }
         ArtifactKind::Accessibility => {
-            let metadata = serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
+            let metadata =
+                serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
             if is_excluded_bundle(state, metadata.bundle_identifier.as_deref()) {
-                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms) {
+                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
+                {
                     let _ = state.store.delete_moment_and_artifacts(&moment_id);
                 }
                 tokio::fs::remove_file(path).await?;
@@ -1160,48 +1194,51 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
 
 fn spawn_gop_packer(state: Arc<AppState>) {
     if !state.packer.config.archive {
-        eprintln!("gop packer: AFTERRAY_GOP_ARCHIVE=0 (idle)");
+        eprintln!("gop packer: AFTERRAY_GOP_ARCHIVE=0 (idle, cold stills stay JPEG)");
         return;
     }
     eprintln!(
         "gop packer: enabled keyint={} cold_gop_only require_ac={}",
         state.packer.config.policy.keyint, state.packer.config.require_ac
     );
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            timer.tick().await;
-            let recording = match state.recording.try_lock() {
-                Ok(runtime) => runtime.active_session_id.is_some(),
-                Err(_) => true,
-            };
-            if state.capture_busy.load(Ordering::SeqCst)
-                || state.packer.encode_busy()
-                || state.models.ocr_in_flight()
-                || gop_packer::should_yield_to_capture(
-                    false,
-                    recording,
-                    state.last_capture_ms.load(Ordering::SeqCst),
-                    now_ms(),
-                    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
-                )
-            {
-                continue;
-            }
-            let vault = Arc::clone(&state.store);
-            let packer = Arc::clone(&state.packer);
-            let now = now_ms();
-            let outcome = tokio::task::spawn_blocking(move || packer.pack_one(&vault, now)).await;
-            match outcome {
-                Ok(Ok(Some(segment_id))) => {
-                    eprintln!("gop packer: committed {segment_id}");
+    let shutdown = state.shutdown.subscribe();
+    if let Err(error) = std::thread::Builder::new()
+        .name("gop-packer".into())
+        .spawn(move || {
+            apply_background_qos();
+            eprintln!("gop packer: background thread started");
+            std::thread::sleep(Duration::from_secs(15));
+            loop {
+                if *shutdown.borrow() {
+                    break;
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => eprintln!("gop packer: {error:#}"),
-                Err(error) => eprintln!("gop packer: join failed: {error}"),
+                if state.capture_busy.load(Ordering::SeqCst)
+                    || state.packer.encode_busy()
+                    || state.models.ocr_in_flight()
+                    || gop_packer::should_yield_to_capture(
+                        false,
+                        state.recording_active.load(Ordering::SeqCst),
+                        state.last_capture_ms.load(Ordering::SeqCst),
+                        now_ms(),
+                        i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
+                    )
+                {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                match state.packer.pack_one(&state.store, now_ms()) {
+                    Ok(Some(segment_id)) => {
+                        eprintln!("gop packer: committed {segment_id}");
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("gop packer: {error:#}"),
+                }
+                std::thread::sleep(Duration::from_secs(5));
             }
-        }
-    });
+        })
+    {
+        eprintln!("gop packer: failed to spawn background thread: {error}");
+    }
 }
 
 fn read_still_artifact(state: &AppState, artifact_id: &str) -> Result<ArtifactPayload, StoreError> {
@@ -1299,6 +1336,7 @@ mod tests {
                 1,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
 
@@ -1323,6 +1361,7 @@ mod tests {
                 1,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
         let semantic_id = vault
@@ -1335,6 +1374,7 @@ mod tests {
                 2,
                 None,
                 "ocr-model",
+                None,
             )
             .unwrap();
         vault
@@ -1497,7 +1537,8 @@ print(json.dumps({
                     captured,
                     None,
                     "ocr",
-                )
+                None,
+            )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -1601,6 +1642,7 @@ print(json.dumps({
                 1_000,
                 None,
                 "ocr",
+                None,
             )
             .unwrap();
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
@@ -1842,7 +1884,8 @@ print(json.dumps({
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                )
+                None,
+            )
                 .unwrap();
         }
         eprintln!("imported {want} JPEG bytes into an isolated vault");
