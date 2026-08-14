@@ -8,7 +8,9 @@
 
 mod power;
 
-pub use power::{apply_background_qos, on_ac_power};
+pub use power::{
+    apply_background_qos, battery_fraction, load_per_core, on_ac_power, seconds_since_user_input,
+};
 
 use afterray_core::{CaptureBackend, CoreError};
 use async_trait::async_trait;

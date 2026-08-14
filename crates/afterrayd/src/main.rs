@@ -1629,6 +1629,74 @@ const T2_MAX_ATTEMPTS: u32 = 3;
 /// Slots summarised per tick. The queue is shared with OCR, so a backlog drains
 /// gradually instead of monopolising the model for minutes at a time.
 const T2_PER_TICK: usize = 2;
+/// Charge below which T2 waits even on AC — a laptop plugged in at 8% is still
+/// recovering, and a local model is the last thing it needs.
+const T2_MIN_BATTERY: f64 = 0.30;
+/// How long the machine must have been untouched. Long enough that it is not a
+/// pause mid-sentence, short enough to catch a coffee break.
+const T2_MIN_IDLE_SECONDS: f64 = 120.0;
+/// One-minute load average per core. Above this something else already wants
+/// the machine, and the user will feel a local model piling on.
+const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
+
+/// What the machine looked like when the sweeper woke up.
+#[derive(Debug, Clone, Copy)]
+struct MachineConditions {
+    on_ac: bool,
+    /// `None` on a desktop, which has no battery to conserve.
+    battery: Option<f64>,
+    idle_seconds: f64,
+    /// `None` when the load average could not be read.
+    load_per_core: Option<f64>,
+}
+
+impl MachineConditions {
+    fn probe() -> Self {
+        Self {
+            on_ac: afterray_platform_macos::on_ac_power(),
+            battery: afterray_platform_macos::battery_fraction(),
+            idle_seconds: afterray_platform_macos::seconds_since_user_input(),
+            load_per_core: afterray_platform_macos::load_per_core(),
+        }
+    }
+}
+
+/// Whether a T2 pass may run now, or the reason it may not.
+///
+/// T2 is the most expensive thing this daemon does — a local model over a
+/// 16k-character prompt — and it is never urgent. Every check here fails
+/// closed: an unreadable probe means wait, because the cost of waiting is a
+/// summary arriving late and the cost of guessing wrong is the user's machine
+/// stuttering while they work.
+fn t2_may_run(conditions: MachineConditions) -> Result<(), String> {
+    if !conditions.on_ac {
+        return Err("on battery".to_owned());
+    }
+    // A desktop reports no battery; nothing to conserve, so nothing to check.
+    if let Some(battery) = conditions.battery
+        && battery < T2_MIN_BATTERY
+    {
+        return Err(format!(
+            "battery at {:.0}% is below {:.0}%",
+            battery * 100.0,
+            T2_MIN_BATTERY * 100.0
+        ));
+    }
+    if conditions.idle_seconds < T2_MIN_IDLE_SECONDS {
+        return Err(format!(
+            "in use {:.0}s ago, needs {T2_MIN_IDLE_SECONDS:.0}s",
+            conditions.idle_seconds
+        ));
+    }
+    match conditions.load_per_core {
+        Some(load) if load > T2_MAX_LOAD_PER_CORE => {
+            Err(format!("load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"))
+        }
+        // An unreadable load average is not permission to add to it.
+        None => Err("load average unavailable".to_owned()),
+        Some(_) => Ok(()),
+    }
+}
 
 /// Every occupied slot that T1 marked ready, has closed and settled, and has no
 /// T2 card yet — oldest first, so a backlog fills in the order it happened.
@@ -1707,6 +1775,9 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
         // just burns an attempt on every slot.
         tokio::time::sleep(Duration::from_secs(45)).await;
         let mut attempts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+        // Logged on change only. At one tick every five minutes, a machine in
+        // use all day would otherwise write the same line hundreds of times.
+        let mut blocked_reason: Option<String> = None;
         let mut timer = tokio::time::interval(period);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -1724,6 +1795,18 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             // not. Yield the queue and pick the backlog up next tick.
             if state.models.ocr_in_flight() {
                 continue;
+            }
+
+            // Cheap to check, so check before touching the vault at all.
+            if let Err(reason) = t2_may_run(MachineConditions::probe()) {
+                if blocked_reason.as_deref() != Some(reason.as_str()) {
+                    eprintln!("slot.t2 sweeper: holding off — {reason}");
+                    blocked_reason = Some(reason);
+                }
+                continue;
+            }
+            if blocked_reason.take().is_some() {
+                eprintln!("slot.t2 sweeper: conditions met, resuming");
             }
 
             let due = slots_awaiting_t2(&state, now_ms(), T2_LOOKBACK_DAYS);
@@ -2051,6 +2134,88 @@ mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
+
+    /// A machine that should be summarising: plugged in, charged, untouched,
+    /// quiet. Each test spoils exactly one of those.
+    const IDEAL: MachineConditions = MachineConditions {
+        on_ac: true,
+        battery: Some(0.9),
+        idle_seconds: 600.0,
+        load_per_core: Some(0.1),
+    };
+
+    #[test]
+    fn ideal_conditions_allow_t2() {
+        assert!(t2_may_run(IDEAL).is_ok());
+    }
+
+    #[test]
+    fn each_condition_alone_blocks_t2() {
+        let cases = [
+            ("battery", MachineConditions { on_ac: false, ..IDEAL }),
+            ("low charge", MachineConditions { battery: Some(0.1), ..IDEAL }),
+            ("in use", MachineConditions { idle_seconds: 5.0, ..IDEAL }),
+            ("busy", MachineConditions { load_per_core: Some(3.0), ..IDEAL }),
+        ];
+        for (label, conditions) in cases {
+            assert!(
+                t2_may_run(conditions).is_err(),
+                "{label} should have blocked the sweep"
+            );
+        }
+    }
+
+    /// A desktop has no battery to conserve, so a missing reading is not a
+    /// reason to never summarise on one.
+    #[test]
+    fn a_machine_without_a_battery_is_not_blocked_by_charge() {
+        assert!(t2_may_run(MachineConditions { battery: None, ..IDEAL }).is_ok());
+    }
+
+    /// An unreadable load average is not permission to add to it. Every other
+    /// probe fails closed and this one must too, or a machine that cannot
+    /// report load would run T2 while pinned.
+    #[test]
+    fn an_unreadable_load_average_blocks_t2() {
+        assert!(t2_may_run(MachineConditions { load_per_core: None, ..IDEAL }).is_err());
+    }
+
+    /// The thresholds are boundaries, not approximations: exactly at the limit
+    /// counts as acceptable, one step past does not.
+    #[test]
+    fn thresholds_are_exact() {
+        assert!(t2_may_run(MachineConditions { battery: Some(T2_MIN_BATTERY), ..IDEAL }).is_ok());
+        assert!(
+            t2_may_run(MachineConditions {
+                idle_seconds: T2_MIN_IDLE_SECONDS,
+                ..IDEAL
+            })
+            .is_ok()
+        );
+        assert!(
+            t2_may_run(MachineConditions {
+                idle_seconds: T2_MIN_IDLE_SECONDS - 0.1,
+                ..IDEAL
+            })
+            .is_err()
+        );
+        assert!(
+            t2_may_run(MachineConditions {
+                load_per_core: Some(T2_MAX_LOAD_PER_CORE),
+                ..IDEAL
+            })
+            .is_ok()
+        );
+    }
+
+    /// The reason reaches the log, so it has to name the thing that is wrong.
+    #[test]
+    fn the_block_reason_names_the_condition() {
+        let reason = t2_may_run(MachineConditions { on_ac: false, ..IDEAL }).unwrap_err();
+        assert!(reason.contains("battery"), "{reason}");
+        let reason = t2_may_run(MachineConditions { idle_seconds: 3.0, ..IDEAL }).unwrap_err();
+        assert!(reason.contains("in use"), "{reason}");
+    }
 
     fn day_slot(start_ms: i64, state: SlotSummaryState) -> afterray_store::DaySlot {
         afterray_store::DaySlot {
