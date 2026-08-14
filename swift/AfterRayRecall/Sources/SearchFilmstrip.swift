@@ -19,8 +19,6 @@ struct SearchFilmstrip: View {
 
     var body: some View {
         VStack(spacing: 9) {
-            PlayheadTimestamp(date: selectedDate, isLive: false)
-
             // Captions are relative ("5M"), so they have to be recomputed as
             // time passes, not just when the selection changes.
             TimelineView(.periodic(from: .now, by: 30)) { context in

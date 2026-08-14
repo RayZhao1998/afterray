@@ -778,7 +778,7 @@ public struct RecallVisualTuning: Equatable, Sendable {
 
     public init(
         topScrimOpacity: Double = 0.29,
-        bottomScrimOpacity: Double = 0.46,
+        bottomScrimOpacity: Double = 0.5,
         timelineDensity: Double = 0.12,
         timelineSegmentHeight: Double = 48,
         timelineSegmentGap: Double = 2,

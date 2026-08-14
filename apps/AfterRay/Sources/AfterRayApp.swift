@@ -871,6 +871,7 @@ private struct AfterRayRootView: View {
     @StateObject private var chat: AfterRayChatModel
     @State private var isLive = true
     @State private var isChatPresented = false
+    @State private var queryMode = ImmersiveQueryMode.search
     private let images: RecallImageRepository
 
     init() {
@@ -906,6 +907,9 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
+            recordingState: control.status?.recordingState,
+            isChangingRecording: control.isChangingRecording,
+            onToggleRecording: toggleRecording,
             chromeTopPadding: controlBarTopPadding,
             daySummary: store.daySummary,
             onVisibleDayChange: { dayMs in
@@ -929,29 +933,22 @@ private struct AfterRayRootView: View {
         )
         .overlay(alignment: .top) {
             VStack(spacing: 8) {
-                ImmersiveControlBar(
+                ImmersiveQueryBar(
                     model: control,
-                    onToggleRecording: toggleRecording,
-                    onSearch: submitSearch,
+                    mode: $queryMode,
+                    onSubmit: submitQuery,
+                    onOpenChat: { openChat() },
                     onStepResult: { delta in
                         guard let session = control.searchSession else { return }
                         selectSearchFrame(session.steppedIndex(by: delta))
                     },
                     onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
                 )
-                ChatLaunchBar(action: openChat)
                 if let message = control.message, !control.isRecording {
                     CaptureFailureBanner(message: message, onRetry: toggleRecording)
                 }
             }
             .padding(.top, controlBarTopPadding)
-        }
-        .overlay(alignment: .topTrailing) {
-            if isLive {
-                OverlaySettingsButton(action: { AfterRaySettingsController.shared.show() })
-                    .padding(.top, controlBarTopPadding)
-                    .padding(.trailing, RecallGeometry.overlayChromeMargin)
-            }
         }
         .overlay {
             if !permissions.allGranted {
@@ -1168,10 +1165,31 @@ private struct AfterRayRootView: View {
         }
     }
 
-    private func openChat() {
+    /// One input, two destinations. Search stays inline; a question hands the
+    /// text to the chat model and opens the full panel, because an answer needs
+    /// room the single line does not have.
+    private func submitQuery() {
+        switch queryMode {
+        case .search:
+            submitSearch()
+        case .ask:
+            let question = control.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !question.isEmpty else { return }
+            control.searchQuery = ""
+            openChat(draft: question, send: true)
+        }
+    }
+
+    private func openChat(draft: String = "", send: Bool = false) {
         control.dismissSearch()
         isChatPresented = true
-        Task { await chat.refresh() }
+        if !draft.isEmpty {
+            chat.draft = draft
+        }
+        Task {
+            await chat.refresh()
+            if send { chat.send() }
+        }
     }
 
     private func openChatMoment(_ momentID: String) {
@@ -1320,74 +1338,79 @@ private struct AfterRaySettingsOverlay: View {
     }
 }
 
-private struct OverlaySettingsButton: View {
-    let action: () -> Void
 
-    var body: some View {
-        RecallChromeIconButton(
-            symbol: "gearshape",
-            help: "Settings",
-            action: action
-        )
-    }
-}
-
-private struct ImmersiveControlBar: View {
+/// One line for both ways of asking the vault a question. It stays one line in
+/// either mode — the chat panel is where an answer goes, and it opens on send
+/// or on the chat button, never merely because you pressed Tab.
+private struct ImmersiveQueryBar: View {
     @ObservedObject var model: AfterRayControlModel
-    let onToggleRecording: () -> Void
-    let onSearch: () -> Void
+    @Binding var mode: ImmersiveQueryMode
+    let onSubmit: () -> Void
+    let onOpenChat: () -> Void
     let onStepResult: (Int) -> Void
     let onClose: () -> Void
-    @FocusState private var isSearchFocused: Bool
+    @FocusState private var isInputFocused: Bool
 
     var body: some View {
         HStack(spacing: 10) {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(statusDotColor)
-                    .frame(width: 6, height: 6)
-                    .shadow(color: model.isRecording ? .red.opacity(0.8) : .clear, radius: 5)
-                Text(statusLabel)
+            Button(action: toggleMode) {
+                Label(mode.title, systemImage: mode.symbol)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.72))
-            }
-
-            Button(action: onToggleRecording) {
-                Image(systemName: model.isCaptureSessionActive ? "pause.fill" : "record.circle")
-                    .frame(width: 26, height: 26)
+                    .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.76))
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(.white.opacity(0.08), in: Capsule())
+                    .contentShape(Capsule())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.82))
-            .disabled(!model.canToggleRecording)
-            .help(model.isCaptureSessionActive ? "Pause capture" : "Resume capture")
+            .help("\(mode.toggleHelp) (Tab)")
+            .accessibilityLabel("Input mode")
+            .accessibilityValue(mode.title)
+            .accessibilityHint(mode.toggleHelp)
 
             Rectangle()
                 .fill(.white.opacity(0.12))
                 .frame(width: 1, height: 18)
 
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.56))
-                TextField("Search your day", text: $model.searchQuery)
+                TextField(mode.placeholder, text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .focused($isSearchFocused)
-                    .onSubmit(onSearch)
+                    .focused($isInputFocused)
+                    .onSubmit(onSubmit)
+                    .onKeyPress(keys: [.tab], phases: .down) { _ in
+                        toggleMode()
+                        return .handled
+                    }
                 if model.isSearching {
                     ProgressView().controlSize(.small)
                 } else if !model.searchQuery.isEmpty {
-                    Button(action: model.dismissSearch) {
+                    Button(action: clearInput) {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .help("Clear")
                 }
             }
-            .frame(width: 224)
+            .frame(width: 268)
 
             if let session = model.searchSession {
                 searchTally(session)
             }
+
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+
+            Button(action: onOpenChat) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Open chat")
+            .accessibilityLabel("Open chat")
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -1401,6 +1424,16 @@ private struct ImmersiveControlBar: View {
         .padding(.horizontal, 14)
         .frame(height: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
+    }
+
+    private func toggleMode() {
+        mode.toggle()
+        isInputFocused = true
+    }
+
+    private func clearInput() {
+        model.searchQuery = ""
+        model.dismissSearch()
     }
 
     /// Where you are in the result set, and how big it is. Two numbers because
@@ -1442,28 +1475,6 @@ private struct ImmersiveControlBar: View {
         .help(help)
     }
 
-    private var statusDotColor: Color {
-        if model.isRecording { return .red }
-        if model.isWaitingToRecord || model.isChangingRecording { return .orange }
-        return Color.secondary.opacity(0.55)
-    }
-
-    private var statusLabel: String {
-        if let message = model.message, !model.isCaptureSessionActive {
-            return "Capture failed"
-        }
-        if model.isChangingRecording, model.status?.recordingState == .idle || model.status == nil {
-            return "Waiting"
-        }
-        guard let status = model.status else { return "Daemon offline" }
-        switch status.recordingState {
-        case .idle: return "Ready"
-        case .waiting: return "Waiting"
-        case .recording: return "Recording"
-        case .stopping: return "Stopping"
-        case .failed: return "Capture failed"
-        }
-    }
 }
 
 private struct CaptureFailureBanner: View {

@@ -21,6 +21,11 @@ public struct RecallView: View {
     public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
+    /// Capture state shown as a word next to the gear. Nil `onToggleRecording`
+    /// hides the control entirely — the Visual Lab drives scenes without a daemon.
+    public var recordingState: DaemonRecordingState?
+    public var isChangingRecording: Bool
+    public var onToggleRecording: (() -> Void)?
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
     public var daySummary: DaySummary
@@ -63,6 +68,9 @@ public struct RecallView: View {
         playingAudioArtifactID: String? = nil,
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
+        recordingState: DaemonRecordingState? = nil,
+        isChangingRecording: Bool = false,
+        onToggleRecording: (() -> Void)? = nil,
         chromeTopPadding: CGFloat = 22,
         trailingChromeInset: CGFloat = 0,
         daySummary: DaySummary = .empty,
@@ -86,6 +94,9 @@ public struct RecallView: View {
         self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
+        self.recordingState = recordingState
+        self.isChangingRecording = isChangingRecording
+        self.onToggleRecording = onToggleRecording
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
         self.daySummary = daySummary
@@ -146,9 +157,7 @@ public struct RecallView: View {
                 )
             }
 
-            if !isLive {
-                chromeGradients
-            }
+            chromeGradients
 
             // Above the scrims: a dimmed highlight defeats the purpose.
             if !isLive, let still = settledStill, still.id == selectedMoment?.displayCacheKey {
@@ -169,21 +178,6 @@ public struct RecallView: View {
 
                 Spacer(minLength: 100)
 
-                if !isLive, daySummaryExpanded {
-                    HStack(alignment: .bottom, spacing: 0) {
-                        DaySummaryPanel(
-                            summary: daySummary,
-                            playheadMs: playheadMs,
-                            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
-                            onSelectSlot: { selectPlayhead(playheadMs: $0) }
-                        )
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                    .padding(.bottom, 10)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
-
                 if !isLive {
                     TranscriptCaption(
                         text: selectedMoment?.transcriptText,
@@ -200,6 +194,24 @@ public struct RecallView: View {
                     .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                     .padding(.bottom, 12)
                 }
+
+                if daySummaryExpanded {
+                    HStack(alignment: .bottom, spacing: 0) {
+                        DaySummaryPanel(
+                            summary: daySummary,
+                            playheadMs: playheadMs,
+                            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                            onSelectSlot: { selectPlayhead(playheadMs: $0) }
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
+                timelineChromeRow
+                    .padding(.bottom, 9)
 
                 if let searchSession, let thumbnailLoader {
                     SearchFilmstrip(
@@ -328,13 +340,25 @@ public struct RecallView: View {
         RecallThumbnailCache.shared.prefetch(momentIDs: ids, loader: thumbnailLoader)
     }
 
+    /// The bottom scrim is unconditional: live or not, the timeline and the
+    /// controls beside it sit over whatever is on screen, and a busy desktop
+    /// leaves them unreadable without it. The top and side washes are for the
+    /// recalled still only — in live view they would dim the real desktop.
     private var chromeGradients: some View {
         ZStack {
-            LinearGradient(
-                colors: [.black.opacity(tuning.topScrimOpacity), .clear],
-                startPoint: .top,
-                endPoint: UnitPoint(x: 0.5, y: 0.23)
-            )
+            if !isLive {
+                LinearGradient(
+                    colors: [.black.opacity(tuning.topScrimOpacity), .clear],
+                    startPoint: .top,
+                    endPoint: UnitPoint(x: 0.5, y: 0.23)
+                )
+                LinearGradient(
+                    colors: [.black.opacity(0.17), .clear, .black.opacity(0.11)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
+
             LinearGradient(
                 stops: [
                     .init(color: .clear, location: 0.52),
@@ -343,11 +367,6 @@ public struct RecallView: View {
                 ],
                 startPoint: .top,
                 endPoint: .bottom
-            )
-            LinearGradient(
-                colors: [.black.opacity(0.17), .clear, .black.opacity(0.11)],
-                startPoint: .leading,
-                endPoint: .trailing
             )
         }
         .allowsHitTesting(false)
@@ -372,42 +391,78 @@ public struct RecallView: View {
             }
 
             RecallGlassCluster {
-                HStack(spacing: RecallGeometry.overlayChromeItemGap) {
-                    RecallChromeIconButton(
-                        symbol: showsDetails ? "sidebar.right" : "info.circle",
-                        help: showsDetails ? "Hide captured context" : "Show captured context",
-                        action: {
-                            if showsDetails {
-                                showsDetails = false
-                            } else {
-                                detailsPage = .root
-                                showsDetails = true
-                            }
+                RecallChromeIconButton(
+                    symbol: showsDetails ? "sidebar.right" : "info.circle",
+                    help: showsDetails ? "Hide captured context" : "Show captured context",
+                    action: {
+                        if showsDetails {
+                            showsDetails = false
+                        } else {
+                            detailsPage = .root
+                            showsDetails = true
                         }
-                    )
-
-                    RecallChromeIconButton(
-                        symbol: daySummaryExpanded
-                            ? "rectangle.bottomhalf.inset.filled"
-                            : "list.bullet.rectangle",
-                        help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
-                        tint: daySummaryExpanded ? RecallPalette.ray : .white,
-                        action: {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                daySummaryExpanded.toggle()
-                            }
-                        }
-                    )
-
-                    if let onOpenSettings {
-                        RecallChromeIconButton(
-                            symbol: "gearshape",
-                            help: "Settings",
-                            action: onOpenSettings
-                        )
                     }
+                )
+            }
+        }
+    }
+
+    /// Settings and the day-summary toggle sit at the bottom left, directly
+    /// under the panel the toggle opens and directly above the timeline they
+    /// belong to. Keeping the toggle next to the gear puts the control within
+    /// reach of what it reveals; the top-right cluster is for the frame you
+    /// are looking at, not for the day.
+    private var daySummaryChrome: some View {
+        RecallGlassCluster {
+            HStack(spacing: RecallGeometry.overlayChromeItemGap) {
+                RecallChromeIconButton(
+                    symbol: daySummaryExpanded
+                        ? "rectangle.bottomhalf.inset.filled"
+                        : "list.bullet.rectangle",
+                    help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                    tint: daySummaryExpanded ? RecallPalette.ray : .white,
+                    action: {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            daySummaryExpanded.toggle()
+                        }
+                    }
+                )
+
+                if let onOpenSettings {
+                    RecallChromeIconButton(
+                        symbol: "gearshape",
+                        help: "Settings",
+                        action: onOpenSettings
+                    )
                 }
             }
+        }
+    }
+
+    /// One row directly above the timeline: capture state, then the controls,
+    /// then zoom — all left-aligned over the bottom scrim, which is the only
+    /// part of the frame guaranteed to be dark enough to read them against.
+    /// The playhead clock rides the same row but stays centred on screen.
+    private var timelineChromeRow: some View {
+        ZStack {
+            HStack(spacing: RecallGeometry.overlayChromeItemGap) {
+                if let onToggleRecording {
+                    TimelineRecordingStatusButton(
+                        state: recordingState,
+                        isChanging: isChangingRecording,
+                        action: onToggleRecording
+                    )
+                }
+
+                daySummaryChrome
+
+                TimelineZoomStrip(zoom: $timelineZoom, isDragging: $isZoomingTimeline)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+
+            PlayheadTimestamp(date: selectedDate, isLive: isLive)
         }
     }
 
@@ -955,14 +1010,6 @@ private struct AppUsageTimeline: View {
 
     var body: some View {
         VStack(spacing: 9) {
-            PlayheadTimestamp(date: selectedDate, isLive: isLive)
-
-            HStack(spacing: 0) {
-                TimelineZoomStrip(zoom: $zoom, isDragging: $isZooming)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-
             GeometryReader { geometry in
                 let width = geometry.size.width
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
@@ -1154,6 +1201,79 @@ struct PlayheadTimestamp: View {
                 .frame(width: 5, height: 5)
                 .offset(y: 11)
                 .shadow(color: RecallPalette.ray, radius: 6)
+        }
+    }
+}
+
+/// Capture state as a word, not a symbol. "Recording" / "Waiting" / "Paused"
+/// is wordier than a dot, but a dot alone cannot say which of the three it is,
+/// and the row has room to spare. Tapping toggles capture.
+private struct TimelineRecordingStatusButton: View {
+    let state: DaemonRecordingState?
+    let isChanging: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(indicatorColor)
+                    .frame(width: 6, height: 6)
+                    .shadow(
+                        color: effectiveState == .recording ? indicatorColor.opacity(0.8) : .clear,
+                        radius: 5
+                    )
+                Text(statusLabel)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.78))
+            }
+            .padding(.horizontal, 12)
+            .frame(height: RecallGeometry.overlayChromeButtonSize)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(RecallGlassPressStyle())
+        .recallGlass(in: .capsule)
+        .disabled(effectiveState == .stopping || isChanging)
+        .help(toggleHelp)
+        .accessibilityLabel("Capture status")
+        .accessibilityValue(statusLabel)
+        .accessibilityHint(toggleHelp)
+    }
+
+    /// A toggle in flight reads as "Waiting" rather than briefly flashing back
+    /// to the state it is leaving.
+    private var effectiveState: DaemonRecordingState? {
+        if isChanging, state == nil || state == .idle {
+            return .waiting
+        }
+        return state
+    }
+
+    private var statusLabel: String {
+        switch effectiveState {
+        case .idle: "Paused"
+        case .waiting: "Waiting"
+        case .recording: "Recording"
+        case .stopping: "Pausing"
+        case .failed: "Failed"
+        case nil: "Offline"
+        }
+    }
+
+    private var indicatorColor: Color {
+        switch effectiveState {
+        case .recording: .red
+        case .waiting, .stopping: .orange
+        case .failed: .red.opacity(0.8)
+        case .idle: .white.opacity(0.48)
+        case nil: .secondary.opacity(0.55)
+        }
+    }
+
+    private var toggleHelp: String {
+        switch effectiveState {
+        case .waiting, .recording, .stopping: "Pause capture"
+        case .idle, .failed, nil: "Resume capture"
         }
     }
 }

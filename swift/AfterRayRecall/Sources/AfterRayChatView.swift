@@ -734,31 +734,3 @@ public struct AfterRayChatOverlay<Model: AfterRayChatModeling>: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
-
-public struct ChatLaunchBar: View {
-    let action: () -> Void
-
-    public init(action: @escaping () -> Void) {
-        self.action = action
-    }
-
-    public var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(RecallPalette.ray.opacity(0.92))
-                Text("Ask about your day")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.52))
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 14)
-            .frame(width: 420, height: 36)
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .recallGlass(in: .capsule)
-        .help("Open AfterRay chat")
-    }
-}

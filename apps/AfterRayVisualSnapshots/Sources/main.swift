@@ -118,6 +118,9 @@ private func chromeScene(
                 playheadMs: .constant(playheadMs),
                 isLive: .constant(false),
                 imageLoader: MockArtifactFactory.loader,
+                onOpenSettings: {},
+                recordingState: .recording,
+                onToggleRecording: {},
                 searchSession: session,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader

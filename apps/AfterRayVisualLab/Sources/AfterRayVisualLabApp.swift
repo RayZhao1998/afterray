@@ -46,6 +46,9 @@ private struct VisualLabView: View {
     @State private var scenario: RecallScenario = .long
     @State private var daySummaryKind: DaySummaryLabKind = .matching
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
+    /// Clicking the status capsule walks the states so every label and dot
+    /// colour is reachable without a daemon.
+    @State private var labRecordingState: DaemonRecordingState = .recording
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
     @State private var searchSession: RecallSearchSession?
@@ -125,6 +128,18 @@ private struct VisualLabView: View {
         }
     }
 
+    private static func nextLabRecordingState(
+        _ state: DaemonRecordingState
+    ) -> DaemonRecordingState {
+        switch state {
+        case .recording: .idle
+        case .idle: .waiting
+        case .waiting: .stopping
+        case .stopping: .failed
+        case .failed: .recording
+        }
+    }
+
     private var recallLab: some View {
         HSplitView {
             RecallView(
@@ -135,6 +150,9 @@ private struct VisualLabView: View {
                 imageLoader: MockArtifactFactory.loader,
                 onToggleFavorite: toggleFavorite,
                 onToggleAudio: { _ in },
+                onOpenSettings: {},
+                recordingState: labRecordingState,
+                onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
                 daySummary: labDaySummary,
                 searchSession: searchSession,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
