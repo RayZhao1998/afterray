@@ -396,7 +396,12 @@ final class RecallOverlayController {
         }
         registerHotKey()
         installKeyMonitor()
-        show()
+
+        // Keep the hosting tree alive so capture can bootstrap in the
+        // background, but do not order the full-screen panel in until the
+        // user explicitly opens AfterRay.
+        panel.orderOut(nil)
+        AfterRayMenuBar.shared.setOverlayVisible(false)
     }
 
     var isVisible: Bool { panel?.isVisible == true }
