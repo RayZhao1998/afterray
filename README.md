@@ -268,7 +268,6 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_GOP_ARCHIVE` | Pack cold stills into closed-GOP AV1 | `1` |
 | `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `30` |
 | `AFTERRAY_GOP_REQUIRE_AC` | Only encode while on AC power | `0` |
-| `AFTERRAY_MAX_UNSTARRED_MOMENTS` | Retention ceiling for non-favorites | `10000` |
 | `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
 | `AFTERRAY_MODEL_DIR` | Weight directory | `.afterray/models` |
 | `AFTERRAY_ASR_MODEL` | Qwen3-ASR snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B` |
@@ -283,6 +282,8 @@ docs/                         Product specification and implementation notes
 | `AFTERRAY_LLM_API_KEY` | Optional bearer token for OpenAI-compatible URLs | persisted Settings value |
 | `AFTERRAY_LLM_N_CTX` | llama.cpp context length | `8192` |
 | `AFTERRAY_LLM_MAX_TOKENS` | Generation cap | `512` |
+
+The encrypted capture vault has a 100 GB storage budget by default. Change it in **Settings → General → Storage**; AfterRay removes the oldest unstarred moments first and keeps favorites.
 
 ## Troubleshooting
 

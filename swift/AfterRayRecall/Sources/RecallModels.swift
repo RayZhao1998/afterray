@@ -442,10 +442,13 @@ public struct LlmEndpointStatus: Codable, Equatable, Sendable {
 }
 
 public struct AppSettings: Codable, Equatable, Sendable {
+    public static let defaultStorageLimitBytes: UInt64 = 100_000_000_000
+
     public let dataDir: String
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
+    public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
     public let llmProvider: LlmProvider
     public let llmBaseUrl: String
@@ -457,6 +460,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir: String,
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
+        storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
         llmProvider: LlmProvider = .builtin,
         llmBaseUrl: String = "",
@@ -467,6 +471,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.modelDir = modelDir
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
+        self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
         self.llmProvider = llmProvider
         self.llmBaseUrl = llmBaseUrl
@@ -479,6 +484,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case modelDir = "model_dir"
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
+        case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
@@ -492,6 +498,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir = try container.decode(String.self, forKey: .modelDir)
         recordAudio = try container.decode(Bool.self, forKey: .recordAudio)
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
+        storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
+            ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
         llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""

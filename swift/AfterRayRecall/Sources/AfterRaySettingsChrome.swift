@@ -12,6 +12,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadProgress: Double? { get }
     var downloadStatus: String? { get }
     var isUpdatingAudio: Bool { get }
+    var isUpdatingStorageLimit: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
     var isUpdatingExclusions: Bool { get }
@@ -33,6 +34,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
+    func setStorageLimitBytes(_ bytes: UInt64) async
     func excludeBundle(_ bundleID: String) async
     func includeBundle(_ bundleID: String) async
     func excludeFrontmostApp() async
@@ -543,8 +545,57 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 Text(model.storage.diskShareText)
                     .font(.settingsCaption)
                     .foregroundStyle(SettingsPalette.tertiaryLabel)
+                Rectangle()
+                    .fill(SettingsPalette.separator)
+                    .frame(height: 1)
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Memory limit")
+                            .font(.settingsRowTitle)
+                            .foregroundStyle(SettingsPalette.label)
+                        Text("Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.")
+                            .font(.settingsRowSubtitle)
+                            .foregroundStyle(SettingsPalette.secondaryLabel)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 16)
+                    if model.isUpdatingStorageLimit {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Picker("Memory limit", selection: storageLimitBinding) {
+                        ForEach(storageLimitOptions, id: \.self) { bytes in
+                            Text(AfterRayStorageSnapshot.byteCount(bytes)).tag(bytes)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 110)
+                    .disabled(model.isUpdatingStorageLimit)
+                }
             }
         }
+    }
+
+    private var storageLimitOptions: [UInt64] {
+        let presets: [UInt64] = [
+            10_000_000_000,
+            25_000_000_000,
+            50_000_000_000,
+            100_000_000_000,
+            250_000_000_000,
+            500_000_000_000,
+            1_000_000_000_000,
+        ]
+        let current = model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes
+        return Array(Set(presets + [current])).sorted()
+    }
+
+    private var storageLimitBinding: Binding<UInt64> {
+        Binding(
+            get: { model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes },
+            set: { bytes in Task { await model.setStorageLimitBytes(bytes) } }
+        )
     }
 
     /// AfterRay's own footprint, not the whole volume: at ~0.2% of a 1 TB disk

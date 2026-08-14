@@ -56,7 +56,8 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
         llmProvider: LlmProvider?,
         llmBaseUrl: String?,
         llmModel: String?,
-        llmApiKey: String?
+        llmApiKey: String?,
+        storageLimitBytes: UInt64?
     ) async throws -> AppSettings
     func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
     func downloadModels(packID: String?) async throws -> ModelLibrary
@@ -72,7 +73,8 @@ public extension AfterRayDaemonServing {
             llmProvider: nil,
             llmBaseUrl: nil,
             llmModel: nil,
-            llmApiKey: nil
+            llmApiKey: nil,
+            storageLimitBytes: nil
         )
     }
 }
@@ -132,7 +134,8 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         llmProvider: LlmProvider? = nil,
         llmBaseUrl: String? = nil,
         llmModel: String? = nil,
-        llmApiKey: String? = nil
+        llmApiKey: String? = nil,
+        storageLimitBytes: UInt64? = nil
     ) async throws -> AppSettings {
         try await request(
             WireRequest(
@@ -142,7 +145,8 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 llmProvider: llmProvider?.rawValue,
                 llmBaseUrl: llmBaseUrl,
                 llmModel: llmModel,
-                llmApiKey: llmApiKey
+                llmApiKey: llmApiKey,
+                storageLimitBytes: storageLimitBytes
             ),
             as: AppSettings.self
         )
@@ -290,6 +294,7 @@ struct WireRequest: Encodable, Equatable {
     var llmBaseUrl: String?
     var llmModel: String?
     var llmApiKey: String?
+    var storageLimitBytes: UInt64?
     var provider: String?
     var baseUrl: String?
 
@@ -318,6 +323,7 @@ struct WireRequest: Encodable, Equatable {
         case llmBaseUrl = "llm_base_url"
         case llmModel = "llm_model"
         case llmApiKey = "llm_api_key"
+        case storageLimitBytes = "storage_limit_bytes"
         case provider
         case baseUrl = "base_url"
     }
@@ -348,6 +354,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(llmBaseUrl, forKey: .llmBaseUrl)
         try container.encodeIfPresent(llmModel, forKey: .llmModel)
         try container.encodeIfPresent(llmApiKey, forKey: .llmApiKey)
+        try container.encodeIfPresent(storageLimitBytes, forKey: .storageLimitBytes)
         try container.encodeIfPresent(provider, forKey: .provider)
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
     }

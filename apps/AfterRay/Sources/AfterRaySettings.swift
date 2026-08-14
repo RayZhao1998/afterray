@@ -58,6 +58,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadProgress: Double?
     @Published var downloadStatus: String?
     @Published var isUpdatingAudio = false
+    @Published var isUpdatingStorageLimit = false
     @Published var isUpdatingExclusions = false
     @Published var isClearingHistory = false
     @Published var recentJobs: [ModelJob] = []
@@ -213,6 +214,29 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 : "Audio recording is off. Existing recordings stay in your vault."
         } catch {
             AfterRayPreferences.recordAudio = !enabled
+            message = error.localizedDescription
+        }
+    }
+
+    func setStorageLimitBytes(_ bytes: UInt64) async {
+        guard bytes != settings?.storageLimitBytes else { return }
+        isUpdatingStorageLimit = true
+        defer { isUpdatingStorageLimit = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                storageLimitBytes: bytes
+            )
+            storage = AfterRayStorageSnapshot.measure(
+                dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
+                modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
+                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
+            )
+            message = "Memory limit set to \(AfterRayStorageSnapshot.byteCount(bytes))."
+        } catch {
             message = error.localizedDescription
         }
     }
@@ -407,4 +431,3 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         }
     }
 }
-

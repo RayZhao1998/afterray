@@ -304,10 +304,10 @@ impl LineDedup {
         if self.seen.contains_key(&key) {
             return None;
         }
-        let lower = text.to_lowercase();
+        let lower = canonical(&text).to_lowercase();
         let bucket: String = lower.chars().take(BUCKET_CHARS).collect();
         if let Some(&id) = self.buckets.get(&bucket) {
-            let existing = self.lines[id].to_lowercase();
+            let existing = canonical(&self.lines[id]).to_lowercase();
             let shared = common_prefix_chars(&lower, &existing);
             let shortest = lower.chars().count().min(existing.chars().count());
             if shared * 10 >= shortest * 8 {
@@ -343,8 +343,36 @@ fn normalise_line(raw: &str) -> String {
     out.trim_end().to_owned()
 }
 
+/// Canonical comparison form. NFKC folds fullwidth/halfwidth variants
+/// (`：` vs `:`); a space survives only between two ASCII alphanumerics
+/// (genuine Latin word spacing). OCR splits CJK runs and punctuation
+/// spacing inconsistently — "Error: Agent 启动前失败" vs
+/// "Error:Agent启动前失败" are the same sentence — and that systematic
+/// difference, not recognition errors, is the main reason variants of one
+/// line refuse to merge.
+fn canonical(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let folded: String = text.nfkc().collect();
+    let chars: Vec<char> = folded.chars().collect();
+    let mut out = String::with_capacity(folded.len());
+    for (index, &c) in chars.iter().enumerate() {
+        if c == ' ' {
+            let prev_alnum = index > 0 && chars[index - 1].is_ascii_alphanumeric();
+            let next_alnum = chars
+                .get(index + 1)
+                .copied()
+                .is_some_and(|n| n.is_ascii_alphanumeric());
+            if !(prev_alnum && next_alnum) {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn dedup_key(text: &str) -> String {
-    let lower = text.to_lowercase();
+    let lower = canonical(text).to_lowercase();
     if lower.chars().count() >= DIGIT_FOLD_MAX_CHARS {
         return lower;
     }
@@ -1129,6 +1157,22 @@ mod tests {
         let all = runs(&card);
         let second: Vec<&String> = all[1].lines.iter().collect();
         assert_eq!(second, ["another real content line"], "{second:?}");
+    }
+
+    #[test]
+    fn cjk_spacing_and_width_variants_merge() {
+        // Real OCR variants of one sentence, observed on 2026-08-14. The
+        // spacing difference is systematic (OCR splits CJK runs
+        // inconsistently), so it must die in normalisation, not in fuzzy
+        // matching. Fullwidth punctuation folds via NFKC.
+        let rows = vec![
+            row("a", 0, "Chrome", "p1", Some("Error: Agent 启动前失败")),
+            row("b", 10_000, "Chrome", "p2", Some("Error:Agent启动前失败")),
+            row("c", 20_000, "Chrome", "p3", Some("Error：Agent启动前失败")),
+        ];
+        let card = build_slot_card(0, &rows, 0, 10_000);
+        let total: usize = runs(&card).iter().map(|r| r.lines.len()).sum();
+        assert_eq!(total, 1, "{:?}", runs(&card).iter().map(|r| &r.lines).collect::<Vec<_>>());
     }
 
     #[test]

@@ -141,7 +141,22 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.modelDir, "/tmp/models")
         XCTAssertFalse(settings.recordAudio)
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
+        XCTAssertEqual(settings.storageLimitBytes, AppSettings.defaultStorageLimitBytes)
         XCTAssertTrue(settings.excludedBundleIds.isEmpty)
+    }
+
+    func testUpdateSettingsRequestIncludesStorageLimit() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", storageLimitBytes: 250_000_000_000)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["storage_limit_bytes"] as? UInt64, 250_000_000_000)
+    }
+
+    func testAppSettingsDecodesStorageLimit() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"storage_limit_bytes":250000000000}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.storageLimitBytes, 250_000_000_000)
     }
 
     func testAppSettingsDecodesExcludedApps() throws {

@@ -90,7 +90,7 @@ const en = {
         {
           app: 'GitHub',
           time: 'Wed 13:15',
-          text: '…retention ceiling for non-favorites — AFTERRAY_MAX_UNSTARRED_MOMENTS…',
+          text: '…storage budget for unstarred memories — Settings → Storage…',
           score: '0.91',
         },
         {
@@ -288,7 +288,7 @@ const zh: Copy = {
         {
           app: 'GitHub',
           time: '周三 13:15',
-          text: '…retention ceiling for non-favorites — AFTERRAY_MAX_UNSTARRED_MOMENTS…',
+          text: '…未收藏记忆的存储预算——设置 → 存储…',
           score: '0.91',
         },
         {

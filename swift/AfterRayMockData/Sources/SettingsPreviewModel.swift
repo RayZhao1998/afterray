@@ -24,6 +24,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadProgress: Double?
     @Published public var downloadStatus: String?
     @Published public var isUpdatingAudio = false
+    @Published public var isUpdatingStorageLimit = false
     @Published public var isUpdatingExclusions = false
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
@@ -118,6 +119,25 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = enabled ? "Audio recording is on." : "Audio recording is off."
     }
 
+    public func setStorageLimitBytes(_ bytes: UInt64) async {
+        guard let current = settings else { return }
+        isUpdatingStorageLimit = true
+        settings = AppSettings(
+            dataDir: current.dataDir,
+            modelDir: current.modelDir,
+            recordAudio: current.recordAudio,
+            captureIntervalSeconds: current.captureIntervalSeconds,
+            storageLimitBytes: bytes,
+            excludedBundleIds: current.excludedBundleIds,
+            llmProvider: current.llmProvider,
+            llmBaseUrl: current.llmBaseUrl,
+            llmModel: current.llmModel,
+            llmApiKeySet: current.llmApiKeySet
+        )
+        isUpdatingStorageLimit = false
+        message = "Preview memory limit updated."
+    }
+
     public func excludeBundle(_ bundleID: String) async {
         if !excludedBundleIds.contains(bundleID) {
             excludedBundleIds.append(bundleID)
@@ -187,6 +207,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             modelDir: settings?.modelDir ?? modelDirectoryPath,
             recordAudio: recordAudio,
             captureIntervalSeconds: 10,
+            storageLimitBytes: settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
             llmProvider: provider,
             llmBaseUrl: draftLlmBaseUrl,
             llmModel: draftLlmModel

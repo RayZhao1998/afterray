@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
+pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +115,8 @@ pub enum Request {
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage_limit_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +277,8 @@ pub struct AppSettings {
     pub model_dir: String,
     pub record_audio: bool,
     pub capture_interval_seconds: u64,
+    #[serde(default = "default_storage_limit_bytes")]
+    pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
     #[serde(default)]
@@ -284,6 +289,10 @@ pub struct AppSettings {
     pub llm_model: String,
     #[serde(default)]
     pub llm_api_key_set: bool,
+}
+
+const fn default_storage_limit_bytes() -> u64 {
+    DEFAULT_STORAGE_LIMIT_BYTES
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -638,6 +647,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: Some(false),
+                storage_limit_bytes: None,
                 excluded_bundle_ids: None,
                 llm_provider: None,
                 llm_base_url: None,
@@ -667,6 +677,25 @@ mod tests {
         assert!(settings.llm_base_url.is_empty());
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
+        assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn storage_limit_update_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::UpdateSettings {
+            record_audio: None,
+            storage_limit_bytes: Some(250_000_000_000),
+            excluded_bundle_ids: None,
+            llm_provider: None,
+            llm_base_url: None,
+            llm_model: None,
+            llm_api_key: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"update_settings","storage_limit_bytes":250000000000}"#
+        );
     }
 
     #[test]
