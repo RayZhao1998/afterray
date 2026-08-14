@@ -1,3 +1,5 @@
+mod stream;
+
 use crate::{
     AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
     ProcessAdapter,
@@ -6,6 +8,9 @@ use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
+use tokio::sync::mpsc;
+
+pub use stream::{ollama_chat_delta, ollama_chat_url, openai_sse_delta};
 
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -61,20 +66,61 @@ impl LlmRuntimeConfig {
     }
 }
 
+/// Optional chat-only side channel. The next remote `execute` takes the
+/// sender so a queued T2 job cannot keep the outlet after chat arms it.
+#[derive(Clone, Default)]
+pub struct LlmTokenSink {
+    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+}
+
+impl LlmTokenSink {
+    /// Installs a sender until the guard drops. Chat holds the guard around
+    /// `submit`/`wait` so tokens from that generation can leak out.
+    #[must_use = "dropping the guard clears the token outlet"]
+    pub fn install(&self, tx: mpsc::Sender<String>) -> LlmTokenSinkGuard {
+        *self.lock() = Some(tx);
+        LlmTokenSinkGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    fn take(&self) -> Option<mpsc::Sender<String>> {
+        self.lock().take()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<String>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Clears the outlet even if the chat task is cancelled mid-wait.
+pub struct LlmTokenSinkGuard {
+    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+}
+
+impl Drop for LlmTokenSinkGuard {
+    fn drop(&mut self) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// Routes LLM jobs to the built-in llama.cpp worker or an OpenAI-compatible HTTP
 /// endpoint (Ollama included).
 pub struct LlmRouterAdapter {
     builtin: ProcessAdapter,
     config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     client: reqwest::Client,
+    token_sink: LlmTokenSink,
 }
 
 impl LlmRouterAdapter {
     #[must_use]
-    pub fn new(
-        builtin: ProcessAdapter,
-        config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
-    ) -> Self {
+    pub fn new(builtin: ProcessAdapter, config: Arc<std::sync::Mutex<LlmRuntimeConfig>>) -> Self {
         Self {
             builtin,
             config,
@@ -83,7 +129,13 @@ impl LlmRouterAdapter {
                 .timeout(GENERATE_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            token_sink: LlmTokenSink::default(),
         }
+    }
+
+    #[must_use]
+    pub fn token_sink(&self) -> LlmTokenSink {
+        self.token_sink.clone()
     }
 
     fn snapshot(&self) -> LlmRuntimeConfig {
@@ -121,21 +173,26 @@ impl ModelAdapter for LlmRouterAdapter {
             )));
         }
         let config = self.snapshot();
+        // Consume the outlet even on the builtin path so a later remote job
+        // cannot inherit a chat sender that was never claimed.
+        let token_tx = self.token_sink.take();
         match config.provider {
-            LlmProvider::Builtin => {
-                self.builtin
-                    .execute(job_id, input, cancellation)
-                    .await
-            }
+            LlmProvider::Builtin => self.builtin.execute(job_id, input, cancellation).await,
             LlmProvider::Ollama | LlmProvider::OpenaiCompatible => {
                 let ModelInput::Llm { prompt, system } = input else {
                     return Err(AdapterError::InvalidOutput(
                         "LLM router received a non-LLM input".into(),
                     ));
                 };
-                let text =
-                    generate_remote(&self.client, &config, prompt, system.as_deref(), cancellation)
-                        .await?;
+                let text = generate_remote(
+                    &self.client,
+                    &config,
+                    prompt,
+                    system.as_deref(),
+                    token_tx,
+                    cancellation,
+                )
+                .await?;
                 Ok(ModelOutput::Llm { text })
             }
         }
@@ -222,7 +279,10 @@ pub async fn probe_llm(
     }
 }
 
-async fn probe_ollama(client: &reqwest::Client, origin: &str) -> Result<Vec<LlmRemoteModel>, String> {
+async fn probe_ollama(
+    client: &reqwest::Client,
+    origin: &str,
+) -> Result<Vec<LlmRemoteModel>, String> {
     let tags_url = ollama_tags_url(origin);
     match get_json(client, &tags_url, None).await {
         Ok(value) => Ok(models_from_ollama_tags(&value)),
@@ -253,8 +313,13 @@ async fn generate_remote(
     config: &LlmRuntimeConfig,
     prompt: &str,
     system: Option<&str>,
+    token_tx: Option<mpsc::Sender<String>>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
+    if let Some(token_tx) = token_tx {
+        return stream::generate_streaming(client, config, prompt, system, token_tx, cancellation)
+            .await;
+    }
     let model = config.chat_model();
     if model.is_empty() {
         return Err(AdapterError::MissingModel(
@@ -303,15 +368,14 @@ async fn generate_remote(
     if !status.is_success() {
         return Err(remote_http_error(status.as_u16(), &text, model));
     }
-    let value: Value = serde_json::from_str(&text).map_err(|error| {
-        AdapterError::InvalidOutput(format!("LLM returned non-JSON: {error}"))
-    })?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| AdapterError::InvalidOutput(format!("LLM returned non-JSON: {error}")))?;
     chat_message_content(&value).ok_or_else(|| {
         AdapterError::InvalidOutput("OpenAI-compatible response had no assistant text".into())
     })
 }
 
-fn remote_http_error(status: u16, body: &str, model: &str) -> AdapterError {
+pub(crate) fn remote_http_error(status: u16, body: &str, model: &str) -> AdapterError {
     let preview = truncate(body.trim(), 400);
     match status {
         401 | 403 => AdapterError::Process(format!(
@@ -382,9 +446,7 @@ pub fn openai_models_url(origin: &str) -> String {
 #[must_use]
 pub fn ollama_tags_url(origin: &str) -> String {
     let origin = normalize_origin(origin);
-    let host = origin
-        .strip_suffix("/v1")
-        .unwrap_or(origin.as_str());
+    let host = origin.strip_suffix("/v1").unwrap_or(origin.as_str());
     format!("{host}/api/tags")
 }
 
@@ -486,10 +548,7 @@ fn is_embedding_only_ollama(entry: &Value, id: &str) -> bool {
     let Some(capabilities) = entry.get("capabilities").and_then(Value::as_array) else {
         return false;
     };
-    let labels: Vec<_> = capabilities
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
+    let labels: Vec<_> = capabilities.iter().filter_map(Value::as_str).collect();
     !labels.is_empty() && labels.iter().all(|label| *label == "embedding")
 }
 
@@ -612,7 +671,10 @@ mod tests {
         let models = models_from_openai_list(&value);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "qwen3.7-max");
-        assert_eq!(recommend_model(["qwen3.7-max"]).as_deref(), Some("qwen3.7-max"));
+        assert_eq!(
+            recommend_model(["qwen3.7-max"]).as_deref(),
+            Some("qwen3.7-max")
+        );
     }
 
     #[test]
@@ -623,5 +685,50 @@ mod tests {
             "choices":[{"message":{"content":[{"type":"text","text":"hi "},{"type":"text","text":"there"}]}}]
         });
         assert_eq!(chat_message_content(&parts).as_deref(), Some("hi there"));
+    }
+
+    #[tokio::test]
+    async fn builtin_execute_consumes_sink_without_tokens() {
+        let script = r#"
+import json, sys
+req = json.load(sys.stdin)
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "llm", "text": "one shot"},
+  "retryable": False
+}))
+"#;
+        let mut builtin =
+            crate::ProcessAdapterConfig::new("test-llm", ModelCapability::Llm, "/usr/bin/python3");
+        builtin.args = vec!["-c".to_owned(), script.to_owned()];
+        let adapter = LlmRouterAdapter::new(
+            crate::ProcessAdapter::new(builtin),
+            Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())),
+        );
+        let sink = adapter.token_sink();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _guard = sink.install(tx);
+        let output = adapter
+            .execute(
+                "job-1",
+                &ModelInput::Llm {
+                    prompt: "hi".into(),
+                    system: None,
+                },
+                Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            ModelOutput::Llm {
+                text: "one shot".into()
+            }
+        );
+        assert!(rx.try_recv().is_err(), "builtin must not emit token deltas");
+        assert!(
+            sink.take().is_none(),
+            "builtin must consume the outlet so a later job cannot inherit it"
+        );
     }
 }

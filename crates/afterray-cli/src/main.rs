@@ -1,3 +1,5 @@
+mod chat;
+
 use afterray_models::{download_packs, library_in, model_directory, specs_for_download_in};
 use afterray_protocol::{Request, Response};
 use anyhow::Context;
@@ -133,7 +135,7 @@ enum Command {
     /// Multi-turn chat against the local vault.
     Chat {
         #[command(subcommand)]
-        command: ChatCommand,
+        command: chat::ChatCommand,
     },
     Gop {
         segment_id: String,
@@ -229,22 +231,6 @@ enum HistoryCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum ChatCommand {
-    Send {
-        message: String,
-        #[arg(long)]
-        conversation: Option<String>,
-    },
-    List,
-    History {
-        conversation_id: String,
-    },
-    Delete {
-        conversation_id: String,
-    },
-}
-
 #[derive(Clone, clap::ValueEnum)]
 enum HistoryScopeArg {
     LastHour,
@@ -258,6 +244,9 @@ async fn main() -> anyhow::Result<()> {
     let socket = cli
         .socket
         .unwrap_or_else(|| std::env::temp_dir().join("afterray-v0.sock"));
+    if let Command::Chat { command } = cli.command {
+        return chat::run(&socket, command, cli.json).await;
+    }
     let Some(request) = request_from_command(cli.command, &socket).await? else {
         return Ok(());
     };
@@ -276,20 +265,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn chat_request(command: ChatCommand) -> Request {
-    match command {
-        ChatCommand::Send {
-            message,
-            conversation,
-        } => Request::ChatSend {
-            conversation_id: conversation,
-            message,
-        },
-        ChatCommand::List => Request::ChatList,
-        ChatCommand::History { conversation_id } => Request::ChatHistory { conversation_id },
-        ChatCommand::Delete { conversation_id } => Request::ChatDelete { conversation_id },
-    }
-}
 
 #[allow(clippy::too_many_lines)]
 async fn request_from_command(
@@ -470,7 +445,9 @@ async fn request_from_command(
             from_ms,
             to_ms,
         },
-        Command::Chat { command } => chat_request(command),
+        Command::Chat { .. } => {
+            anyhow::bail!("chat is handled before the one-line request path")
+        }
         Command::Gop { segment_id } => Request::GopShow { segment_id },
         Command::Pack {
             command: PackCommand::Status,
