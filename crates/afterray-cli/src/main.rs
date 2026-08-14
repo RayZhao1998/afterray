@@ -205,6 +205,12 @@ enum SlotCommand {
         #[arg(long = "at-ms")]
         at_ms: i64,
     },
+    /// Summarise every ready-but-untouched slot in the last N days. The daemon
+    /// sweeps the last two on its own; this is for older history.
+    Backfill {
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -320,6 +326,9 @@ async fn request_from_command(
         Command::Slot {
             command: SlotCommand::Day { at_ms },
         } => Request::DaySummary { day_ms: at_ms },
+        Command::Slot {
+            command: SlotCommand::Backfill { days },
+        } => Request::SlotBackfill { days },
         Command::Slot {
             command: SlotCommand::Prompt { at_ms, user_only },
         } => {

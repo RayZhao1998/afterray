@@ -21,7 +21,9 @@ use afterray_protocol::{
     LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request,
     Response, SearchHit, Status, local_calendar_day_bounds_ms,
 };
-use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
+use afterray_store::{
+    MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig, fuse_search_results,
+};
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
@@ -151,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => eprintln!("background artifact maintenance paused: {error}"),
     });
     spawn_gop_packer(Arc::clone(&state));
+    spawn_slot_summarizer(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -517,6 +520,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         },
         Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
         Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
+        Request::SlotBackfill { days } => slot_backfill(state, days).await,
         Request::DaySummary { day_ms } => {
             let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
             into_response(state.store.day_summary(day_ms, interval_ms))
@@ -1512,11 +1516,18 @@ fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
 /// `slot_start_ms` as the `slot.t1` line, so a card's full history is
 /// recoverable from the log.
 async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
+    match run_slot_t2(state, at_ms).await {
+        Ok(value) => Response::success(value),
+        Err(error) => Response::failure(error),
+    }
+}
+
+/// One T2 pass over the slot containing `at_ms`: render the prompt, run it
+/// through the configured model, persist the card. Shared by the RPC and the
+/// background sweeper so both agree on what "summarised" means.
+async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
-    let prompt = match slot_prompt_for(state, at_ms) {
-        Ok(value) => value,
-        Err(error) => return Response::failure(error.to_string()),
-    };
+    let prompt = slot_prompt_for(state, at_ms).map_err(|error| error.to_string())?;
     let slot_start_ms = prompt
         .get("slot_start_ms")
         .and_then(serde_json::Value::as_i64)
@@ -1533,30 +1544,26 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
         .to_owned();
 
     ensure_remote_llm_model(state).await;
-    let job_id = match state
+    let job_id = state
         .models
         .submit(ModelInput::Llm {
             prompt: user.clone(),
             system: Some(system),
         })
         .await
-    {
-        Ok(id) => id,
-        Err(error) => return Response::failure(error.to_string()),
-    };
-    let snapshot = match state.models.wait(&job_id).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Response::failure(error.to_string()),
-    };
+        .map_err(|error| error.to_string())?;
+    let snapshot = state
+        .models
+        .wait(&job_id)
+        .await
+        .map_err(|error| error.to_string())?;
     if snapshot.state != JobState::Done {
-        return Response::failure(
-            snapshot
-                .last_error
-                .unwrap_or_else(|| "t2 job did not complete".to_owned()),
-        );
+        return Err(snapshot
+            .last_error
+            .unwrap_or_else(|| "t2 job did not complete".to_owned()));
     }
     let Some(afterray_models::ModelOutput::Llm { text: raw }) = snapshot.output else {
-        return Response::failure("t2 job returned a non-text output");
+        return Err("t2 job returned a non-text output".to_owned());
     };
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1590,7 +1597,14 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
         }
     }
 
-    Response::success(serde_json::json!({
+    if parsed.is_none() {
+        return Err(format!(
+            "the model returned no parseable T2 card ({} chars)",
+            raw.chars().count()
+        ));
+    }
+
+    Ok(serde_json::json!({
         "slot_start_ms": slot_start_ms,
         "model": snapshot.adapter,
         "latency_ms": latency_ms,
@@ -1598,6 +1612,148 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
         "card": card_value,
         "raw": raw,
     }))
+}
+
+/// How long after a slot closes before it is eligible. Frames captured near the
+/// boundary land in the vault a beat late; summarising immediately would read a
+/// slot that is still filling in.
+const T2_SETTLE_MS: i64 = 3 * 60 * 1000;
+/// How far back a sweep looks. Bounded so a first run on an old vault does not
+/// try to summarise months of history in one go — `slot backfill` is the
+/// deliberate way to do that.
+const T2_LOOKBACK_DAYS: i64 = 2;
+/// Attempts per slot per daemon run. A slot that fails this often is failing
+/// for a reason a retry loop will not fix; a restart is a good time to find out
+/// whether it has changed, so the count is deliberately not persisted.
+const T2_MAX_ATTEMPTS: u32 = 3;
+/// Slots summarised per tick. The queue is shared with OCR, so a backlog drains
+/// gradually instead of monopolising the model for minutes at a time.
+const T2_PER_TICK: usize = 2;
+
+/// Every occupied slot that T1 marked ready, has closed and settled, and has no
+/// T2 card yet — oldest first, so a backlog fills in the order it happened.
+fn slots_awaiting_t2(state: &Arc<AppState>, now: i64, lookback_days: i64) -> Vec<i64> {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let mut due = Vec::new();
+    for day in 0..=lookback_days.max(0) {
+        let day_ms = now - day * 24 * 60 * 60 * 1000;
+        let Ok(summary) = state.store.day_summary(day_ms, interval_ms) else {
+            continue;
+        };
+        due.extend(due_slot_starts(&summary.slots, now));
+    }
+    due.sort_unstable();
+    due.dedup();
+    due
+}
+
+/// The selection rule on its own, so the two things that make it wrong — the
+/// state filter and the settle window — can be tested without a vault.
+fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+    slots
+        .iter()
+        // Degraded is precisely "T1 said summarise me, nothing has".
+        .filter(|slot| slot.state == SlotSummaryState::Degraded)
+        .filter(|slot| slot.slot_end_ms + T2_SETTLE_MS <= now)
+        .map(|slot| slot.slot_start_ms)
+        .collect()
+}
+
+/// Ceiling on one backfill call. The RPC blocks until it returns, and each slot
+/// is a full model round trip — better to finish and report than to hold the
+/// socket open for an hour. Re-run to continue.
+const T2_BACKFILL_CAP: usize = 40;
+
+async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
+    let due = slots_awaiting_t2(state, now_ms(), days);
+    let total = due.len();
+    let mut summarised = 0_usize;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    for slot_start_ms in due.into_iter().take(T2_BACKFILL_CAP) {
+        match run_slot_t2(state, slot_start_ms).await {
+            Ok(_) => summarised += 1,
+            Err(error) => failures.push(serde_json::json!({
+                "slot_start_ms": slot_start_ms,
+                "error": error,
+            })),
+        }
+    }
+    Response::success(serde_json::json!({
+        "eligible": total,
+        "attempted": summarised + failures.len(),
+        "summarised": summarised,
+        "remaining": total.saturating_sub(T2_BACKFILL_CAP),
+        "failures": failures,
+    }))
+}
+
+/// Closes the loop the day panel was missing: T1 has been marking slots ready
+/// since capture began, but nothing ever ran T2 on them, so every row fell back
+/// to a bare app list. This is the only automatic caller.
+fn spawn_slot_summarizer(state: Arc<AppState>) {
+    let period = Duration::from_secs(
+        std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+    if period.is_zero() {
+        eprintln!("slot.t2 sweeper: disabled by AFTERRAY_T2_SWEEP_SECONDS=0");
+        return;
+    }
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        // Long enough for the model runtime to come up; a sweep that races it
+        // just burns an attempt on every slot.
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let mut attempts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+        let mut timer = tokio::time::interval(period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = timer.tick() => {}
+            }
+
+            // OCR is on the critical path for the frames still arriving; T2 is
+            // not. Yield the queue and pick the backlog up next tick.
+            if state.models.ocr_in_flight() {
+                continue;
+            }
+
+            let due = slots_awaiting_t2(&state, now_ms(), T2_LOOKBACK_DAYS);
+            let mut ran = 0;
+            for slot_start_ms in due {
+                if ran >= T2_PER_TICK {
+                    break;
+                }
+                let attempt = attempts.entry(slot_start_ms).or_default();
+                if *attempt >= T2_MAX_ATTEMPTS {
+                    continue;
+                }
+                *attempt += 1;
+                let attempt = *attempt;
+                ran += 1;
+                match run_slot_t2(&state, slot_start_ms).await {
+                    Ok(_) => {
+                        attempts.remove(&slot_start_ms);
+                        eprintln!("slot.t2 sweeper: summarised slot={slot_start_ms}");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "slot.t2 sweeper: slot={slot_start_ms} attempt={attempt}/{T2_MAX_ATTEMPTS} failed: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("slot.t2 sweeper: stopped");
+    });
 }
 
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
@@ -1895,6 +2051,73 @@ mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
+
+    fn day_slot(start_ms: i64, state: SlotSummaryState) -> afterray_store::DaySlot {
+        afterray_store::DaySlot {
+            slot_start_ms: start_ms,
+            slot_end_ms: start_ms + afterray_store::SLOT_DURATION_MS,
+            state,
+            facts: afterray_store::SlotFacts {
+                apps: Vec::new(),
+                top_windows: Vec::new(),
+                top_documents: Vec::new(),
+                top_urls: Vec::new(),
+                has_audio: false,
+                audio_moment_count: 0,
+                moment_count: 12,
+                ocr_moment_count: 0,
+                ax_moment_count: 0,
+                switch_count: 0,
+                longest_focus_ms: 0,
+                idle_ratio: 0.0,
+            },
+            title: None,
+            bullets: None,
+            category: None,
+        }
+    }
+
+    /// Everything except `Degraded` is either already summarised, deliberately
+    /// skipped, or has nothing to summarise. Picking any of them up would mean
+    /// re-running the model over work it already did.
+    #[test]
+    fn only_degraded_slots_are_swept() {
+        let base = 1_700_000_000_000;
+        let long_ago = base - 10 * afterray_store::SLOT_DURATION_MS;
+        let slots = [
+            day_slot(long_ago, SlotSummaryState::Degraded),
+            day_slot(long_ago + 60_000, SlotSummaryState::Done),
+            day_slot(long_ago + 120_000, SlotSummaryState::SkippedIdle),
+            day_slot(long_ago + 180_000, SlotSummaryState::NoData),
+            day_slot(long_ago + 240_000, SlotSummaryState::Failed),
+        ];
+        assert_eq!(due_slot_starts(&slots, base), vec![long_ago]);
+    }
+
+    /// A slot is not eligible the instant it closes: frames captured near the
+    /// boundary are still landing, and summarising then reads a partial slot.
+    #[test]
+    fn a_slot_waits_out_the_settle_window() {
+        let start = 1_700_000_000_000;
+        let end = start + afterray_store::SLOT_DURATION_MS;
+        let slots = [day_slot(start, SlotSummaryState::Degraded)];
+
+        assert!(due_slot_starts(&slots, end).is_empty(), "closed but not settled");
+        assert!(
+            due_slot_starts(&slots, end + T2_SETTLE_MS - 1).is_empty(),
+            "one millisecond short still counts as unsettled"
+        );
+        assert_eq!(due_slot_starts(&slots, end + T2_SETTLE_MS), vec![start]);
+    }
+
+    /// The slot the user is inside right now has not closed at all.
+    #[test]
+    fn the_slot_in_progress_is_never_swept() {
+        let start = 1_700_000_000_000;
+        let slots = [day_slot(start, SlotSummaryState::Degraded)];
+        let midway = start + afterray_store::SLOT_DURATION_MS / 2;
+        assert!(due_slot_starts(&slots, midway).is_empty());
+    }
 
     #[test]
     fn stale_capture_cleanup_only_removes_files() {

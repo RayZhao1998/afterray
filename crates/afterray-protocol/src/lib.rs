@@ -96,6 +96,12 @@ pub enum Request {
     SlotSummarize {
         at_ms: i64,
     },
+    /// Summarises every slot in the last `days` local days that T1 marked ready
+    /// and no model has touched. The background sweeper only reaches back two
+    /// days; this is how older history gets filled in.
+    SlotBackfill {
+        days: i64,
+    },
     /// Every occupied half-hour on the local day containing `day_ms`.
     /// Slots the model has never touched are included with facts only.
     DaySummary {
