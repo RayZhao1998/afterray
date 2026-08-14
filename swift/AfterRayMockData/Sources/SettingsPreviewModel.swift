@@ -24,6 +24,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadProgress: Double?
     @Published public var downloadStatus: String?
     @Published public var isUpdatingAudio = false
+    @Published public var isUpdatingStorageLimit = false
+    @Published public var isUpdatingLanguage = false
     @Published public var isUpdatingExclusions = false
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
@@ -118,6 +120,30 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = enabled ? "Audio recording is on." : "Audio recording is off."
     }
 
+    public func setStorageLimitBytes(_ bytes: UInt64) async {
+        guard let current = settings else { return }
+        isUpdatingStorageLimit = true
+        settings = replacing(current, storageLimitBytes: bytes)
+        isUpdatingStorageLimit = false
+        message = "Preview memory limit updated."
+    }
+
+    public func setUiLanguage(_ code: String) async {
+        guard let current = settings else { return }
+        isUpdatingLanguage = true
+        settings = replacing(current, uiLanguage: code)
+        isUpdatingLanguage = false
+        message = "Preview interface language updated."
+    }
+
+    public func setSummaryLanguage(_ code: String) async {
+        guard let current = settings else { return }
+        isUpdatingLanguage = true
+        settings = replacing(current, summaryLanguage: code)
+        isUpdatingLanguage = false
+        message = "Preview summary language updated."
+    }
+
     public func excludeBundle(_ bundleID: String) async {
         if !excludedBundleIds.contains(bundleID) {
             excludedBundleIds.append(bundleID)
@@ -182,16 +208,46 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     }
 
     public func setLlmProvider(_ provider: LlmProvider) async {
+        let current = settings
         settings = AppSettings(
-            dataDir: settings?.dataDir ?? dataDirectoryPath,
-            modelDir: settings?.modelDir ?? modelDirectoryPath,
+            dataDir: current?.dataDir ?? dataDirectoryPath,
+            modelDir: current?.modelDir ?? modelDirectoryPath,
             recordAudio: recordAudio,
             captureIntervalSeconds: 10,
+            storageLimitBytes: current?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
+            excludedBundleIds: current?.excludedBundleIds ?? excludedBundleIds,
             llmProvider: provider,
             llmBaseUrl: draftLlmBaseUrl,
-            llmModel: draftLlmModel
+            llmModel: draftLlmModel,
+            llmApiKeySet: current?.llmApiKeySet ?? false,
+            uiLanguage: current?.uiLanguage ?? AppSettings.defaultLanguage,
+            summaryLanguage: current?.summaryLanguage ?? AppSettings.defaultLanguage,
+            languageOptions: current?.languageOptions ?? []
         )
         message = "Preview switched assistant source to \(provider.title)."
+    }
+
+    private func replacing(
+        _ current: AppSettings,
+        storageLimitBytes: UInt64? = nil,
+        uiLanguage: String? = nil,
+        summaryLanguage: String? = nil
+    ) -> AppSettings {
+        AppSettings(
+            dataDir: current.dataDir,
+            modelDir: current.modelDir,
+            recordAudio: current.recordAudio,
+            captureIntervalSeconds: current.captureIntervalSeconds,
+            storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
+            excludedBundleIds: current.excludedBundleIds,
+            llmProvider: current.llmProvider,
+            llmBaseUrl: current.llmBaseUrl,
+            llmModel: current.llmModel,
+            llmApiKeySet: current.llmApiKeySet,
+            uiLanguage: uiLanguage ?? current.uiLanguage,
+            summaryLanguage: summaryLanguage ?? current.summaryLanguage,
+            languageOptions: current.languageOptions
+        )
     }
 
     public func saveLlmConnection() async {

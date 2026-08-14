@@ -309,17 +309,14 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
+        button.alphaValue = isRecording ? 1 : 0.46
         let state = isRecording ? "AfterRay is recording" : "AfterRay is paused"
         button.toolTip = "\(state) · press \(shortcut.displayString) to open"
         pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
     }
 
     private static func icon() -> NSImage {
-        let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "AfterRay")
-            ?? NSImage(size: NSSize(width: 18, height: 18))
-        image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = true
-        return image
+        AfterRayMenuBarIcon.make()
     }
 }
 
@@ -871,7 +868,9 @@ private struct AfterRayRootView: View {
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
+    @StateObject private var chat: AfterRayChatModel
     @State private var isLive = true
+    @State private var isChatPresented = false
     private let images: RecallImageRepository
 
     init() {
@@ -879,6 +878,7 @@ private struct AfterRayRootView: View {
         let repository = RecallImageRepository(daemon: daemon)
         _store = StateObject(wrappedValue: RecallStore(daemon: daemon))
         _control = StateObject(wrappedValue: AfterRayControlModel(daemon: daemon))
+        _chat = StateObject(wrappedValue: AfterRayChatModel(daemon: daemon))
         _audioPlayer = StateObject(wrappedValue: ArtifactAudioPlayer(repository: repository))
         images = repository
     }
@@ -907,6 +907,10 @@ private struct AfterRayRootView: View {
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
             chromeTopPadding: controlBarTopPadding,
+            daySummary: store.daySummary,
+            onVisibleDayChange: { dayMs in
+                Task { await store.loadDaySummary(dayMs: dayMs) }
+            },
             searchSession: control.searchSession,
             thumbnailLoader: { momentID in
                 try await images.thumbnail(momentID: momentID).bytes
@@ -935,12 +939,7 @@ private struct AfterRayRootView: View {
                     },
                     onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
                 )
-                ImmersiveAskBar(
-                    model: control,
-                    onAsk: submitAsk,
-                    onOpenSettings: { AfterRaySettingsController.shared.show() },
-                    onSelectCitation: openAskCitation
-                )
+                ChatLaunchBar(action: openChat)
                 if let message = control.message, !control.isRecording {
                     CaptureFailureBanner(message: message, onRetry: toggleRecording)
                 }
@@ -970,8 +969,23 @@ private struct AfterRayRootView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
+        .overlay {
+            if isChatPresented {
+                AfterRayChatOverlay(
+                    model: chat,
+                    onClose: { isChatPresented = false },
+                    onOpenMoment: openChatMoment
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
+        }
         .animation(.easeOut(duration: 0.16), value: settings.isPresented)
+        .animation(.easeOut(duration: 0.16), value: isChatPresented)
         .onExitCommand {
+            if isChatPresented {
+                isChatPresented = false
+                return
+            }
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
         }
@@ -1039,6 +1053,8 @@ private struct AfterRayRootView: View {
             audioPlayer.stop()
             store.clearSensitiveState()
             control.clearSensitiveState()
+            chat.clearSensitiveState()
+            isChatPresented = false
             clearRecallDecodedImageCache()
             Task { await images.clearSensitiveData() }
         }
@@ -1152,13 +1168,24 @@ private struct AfterRayRootView: View {
         }
     }
 
-    private func submitAsk() {
+    private func openChat() {
         control.dismissSearch()
-        Task { await control.ask() }
+        isChatPresented = true
+        Task { await chat.refresh() }
     }
 
-    private func openAskCitation(_ citation: AskCitation) {
-        openSearchHit(citation.asSearchHit())
+    private func openChatMoment(_ momentID: String) {
+        isChatPresented = false
+        openSearchHit(
+            RecallSearchHit(
+                momentId: momentID,
+                sessionId: "",
+                capturedAtMs: 0,
+                source: "chat",
+                text: "",
+                score: 1
+            )
+        )
     }
 }
 
@@ -1436,197 +1463,6 @@ private struct ImmersiveControlBar: View {
         case .stopping: return "Stopping"
         case .failed: return "Capture failed"
         }
-    }
-}
-
-private struct ImmersiveAskBar: View {
-    @ObservedObject var model: AfterRayControlModel
-    let onAsk: () -> Void
-    let onOpenSettings: () -> Void
-    let onSelectCitation: (AskCitation) -> Void
-    @FocusState private var isAskFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(RecallPalette.ray.opacity(0.92))
-                TextField("Ask about your day", text: $model.askQuestion)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .focused($isAskFocused)
-                    .onSubmit(onAsk)
-                if model.isAsking {
-                    ProgressView().controlSize(.small)
-                } else if !model.askQuestion.isEmpty {
-                    Button(action: model.dismissAsk) {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear question")
-                }
-            }
-            .padding(.horizontal, 14)
-            .frame(width: 420, height: 36)
-            .recallGlass(in: .capsule)
-
-            if model.isAsking || model.askAnswer != nil || model.askMessage != nil {
-                AskAnswerPanel(
-                    isAsking: model.isAsking,
-                    answer: model.askAnswer,
-                    error: model.askMessage,
-                    onOpenSettings: onOpenSettings,
-                    onSelectCitation: onSelectCitation,
-                    onDismiss: model.dismissAsk
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
-            }
-        }
-    }
-}
-
-private struct AskAnswerPanel: View {
-    let isAsking: Bool
-    let answer: AskAnswer?
-    let error: String?
-    let onOpenSettings: () -> Void
-    let onSelectCitation: (AskCitation) -> Void
-    let onDismiss: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(panelTitle)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .tracking(1.4)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: onDismiss) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-            }
-
-            if isAsking {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Reading today's memory…")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.78))
-                }
-            } else if let error {
-                Text(error)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.88))
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let answer {
-                AskAnswerText(text: answer.answer) { momentID in
-                    if let citation = answer.citations.first(where: { $0.momentId == momentID }) {
-                        onSelectCitation(citation)
-                    } else {
-                        onSelectCitation(
-                            AskCitation(
-                                momentId: momentID,
-                                capturedAtMs: 0,
-                                label: "",
-                                excerpt: ""
-                            )
-                        )
-                    }
-                }
-                if !answer.citations.isEmpty {
-                    HStack(spacing: 6) {
-                        ForEach(Array(answer.citations.prefix(3))) { citation in
-                            Button {
-                                onSelectCitation(citation)
-                            } label: {
-                                Text(citationChipTitle(citation))
-                                    .lineLimit(1)
-                            }
-                            .buttonStyle(AskCitationChipStyle())
-                            .help(citation.excerpt)
-                        }
-                    }
-                }
-                if answer.modelMissing {
-                    Button("Open Settings", action: onOpenSettings)
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(RecallPalette.ray)
-                }
-            }
-        }
-        .padding(14)
-        .frame(width: 420, alignment: .leading)
-        .recallGlass(in: .rounded(10))
-    }
-
-    private var panelTitle: String {
-        if isAsking { return "ASKING" }
-        if answer?.modelMissing == true { return "MODEL MISSING" }
-        if error != nil { return "ASK FAILED" }
-        return "ANSWER"
-    }
-
-    private func citationChipTitle(_ citation: AskCitation) -> String {
-        let time = Date(timeIntervalSince1970: TimeInterval(citation.capturedAtMs) / 1_000)
-            .formatted(date: .omitted, time: .shortened)
-        if citation.label.isEmpty {
-            return time
-        }
-        return "\(time) · \(citation.label)"
-    }
-}
-
-private struct AskAnswerText: View {
-    let text: String
-    let onOpenMoment: (String) -> Void
-
-    var body: some View {
-        Text(attributed)
-            .font(.system(size: 13, weight: .medium, design: .rounded))
-            .foregroundStyle(.white.opacity(0.92))
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-            .environment(\.openURL, OpenURLAction { url in
-                if url.scheme == "afterray", url.host == "moment" {
-                    let momentID = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                    if !momentID.isEmpty {
-                        onOpenMoment(momentID)
-                        return .handled
-                    }
-                }
-                return .systemAction
-            })
-    }
-
-    private var attributed: AttributedString {
-        var markdown = text
-        if !markdown.contains("](afterray://moment/") {
-            markdown = markdown.replacingOccurrences(
-                of: #"afterray://moment/([A-Za-z0-9\-]+)"#,
-                with: "[moment](afterray://moment/$1)",
-                options: .regularExpression
-            )
-        }
-        if let parsed = try? AttributedString(
-            markdown: markdown,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            return parsed
-        }
-        return AttributedString(text)
-    }
-}
-
-private struct AskCitationChipStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
-            .foregroundStyle(.white.opacity(0.88))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(.white.opacity(configuration.isPressed ? 0.08 : 0.12), in: Capsule())
     }
 }
 

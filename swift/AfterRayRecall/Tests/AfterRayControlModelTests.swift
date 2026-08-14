@@ -194,16 +194,22 @@ private actor ControlDaemon: AfterRayDaemonServing {
         llmProvider: LlmProvider?,
         llmBaseUrl: String?,
         llmModel: String?,
-        llmApiKey _: String?
+        llmApiKey _: String?,
+        storageLimitBytes: UInt64?,
+        uiLanguage: String?,
+        summaryLanguage: String?
     ) async throws -> AppSettings {
         AppSettings(
             dataDir: "/tmp/afterray-data",
             modelDir: "/tmp/afterray-models",
             recordAudio: recordAudio ?? true,
             captureIntervalSeconds: 10,
+            storageLimitBytes: storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
             llmProvider: llmProvider ?? .builtin,
             llmBaseUrl: llmBaseUrl ?? "",
-            llmModel: llmModel ?? ""
+            llmModel: llmModel ?? "",
+            uiLanguage: uiLanguage ?? AppSettings.defaultLanguage,
+            summaryLanguage: summaryLanguage ?? AppSettings.defaultLanguage
         )
     }
 

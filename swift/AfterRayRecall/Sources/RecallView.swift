@@ -23,6 +23,8 @@ public struct RecallView: View {
     public var onOpenSettings: (() -> Void)?
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
+    public var daySummary: DaySummary
+    public var onVisibleDayChange: ((Int64) -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
     public var searchSession: RecallSearchSession?
@@ -38,6 +40,7 @@ public struct RecallView: View {
     @State private var timelineViewportWidth: CGFloat = 720
     @State private var timelineZoom: CGFloat = 1
     @State private var isZoomingTimeline = false
+    @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
     @State private var settledStill: SettledStill?
     @State private var searchScrollAccumulator: CGFloat = 0
     /// Trackpad travel needed to advance one filmstrip cell.
@@ -62,6 +65,8 @@ public struct RecallView: View {
         onOpenSettings: (() -> Void)? = nil,
         chromeTopPadding: CGFloat = 22,
         trailingChromeInset: CGFloat = 0,
+        daySummary: DaySummary = .empty,
+        onVisibleDayChange: ((Int64) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
@@ -83,6 +88,8 @@ public struct RecallView: View {
         self.onOpenSettings = onOpenSettings
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
+        self.daySummary = daySummary
+        self.onVisibleDayChange = onVisibleDayChange
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
         self.ocrLoader = ocrLoader
@@ -161,6 +168,21 @@ public struct RecallView: View {
                 }
 
                 Spacer(minLength: 100)
+
+                if !isLive, daySummaryExpanded {
+                    HStack(alignment: .bottom, spacing: 0) {
+                        DaySummaryPanel(
+                            summary: daySummary,
+                            playheadMs: playheadMs,
+                            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                            onSelectSlot: { selectPlayhead(playheadMs: $0) }
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
 
                 if !isLive {
                     TranscriptCaption(
@@ -244,8 +266,13 @@ public struct RecallView: View {
             return .handled
         }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
+        .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
         .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection)") {
             prefetchAroundSelection()
+        }
+        .onAppear { onVisibleDayChange?(playheadMs) }
+        .onChange(of: playheadDayKey) { _, _ in
+            onVisibleDayChange?(playheadMs)
         }
         .task(id: highlightKey) {
             await loadHighlightRegions()
@@ -253,6 +280,10 @@ public struct RecallView: View {
         .task(id: searchSession?.selectedIndex ?? -1) {
             prefetchFilmstripThumbnails()
         }
+    }
+
+    private var playheadDayKey: String {
+        DaySummaryLayout.localDayKey(ms: playheadMs)
     }
 
     /// Reloading is only worth it when the frame or the query actually changed.
@@ -351,6 +382,19 @@ public struct RecallView: View {
                             } else {
                                 detailsPage = .root
                                 showsDetails = true
+                            }
+                        }
+                    )
+
+                    RecallChromeIconButton(
+                        symbol: daySummaryExpanded
+                            ? "rectangle.bottomhalf.inset.filled"
+                            : "list.bullet.rectangle",
+                        help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                        tint: daySummaryExpanded ? RecallPalette.ray : .white,
+                        action: {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                daySummaryExpanded.toggle()
                             }
                         }
                     )

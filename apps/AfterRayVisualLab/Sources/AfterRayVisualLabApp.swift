@@ -17,6 +17,7 @@ struct AfterRayVisualLabApp: App {
 private enum LabSurface: String, CaseIterable, Identifiable {
     case recall
     case settings
+    case chat
     case onboarding
 
     var id: String { rawValue }
@@ -25,6 +26,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
         switch self {
         case .recall: "Recall"
         case .settings: "Settings"
+        case .chat: "Chat"
         case .onboarding: "Welcome"
         }
     }
@@ -32,6 +34,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
     static var launchArgument: LabSurface {
         if CommandLine.arguments.contains("--onboarding") { return .onboarding }
         if CommandLine.arguments.contains("--settings") { return .settings }
+        if CommandLine.arguments.contains("--chat") { return .chat }
         return .recall
     }
 }
@@ -41,6 +44,7 @@ private struct VisualLabView: View {
     @State private var settingsPage: AfterRaySettingsPage = CommandLine.arguments.contains("--models") ? .models : .general
     @State private var settingsModel = SettingsPreviewModel()
     @State private var scenario: RecallScenario = .long
+    @State private var daySummaryKind: DaySummaryLabKind = .matching
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
@@ -49,6 +53,12 @@ private struct VisualLabView: View {
     @State private var labHotKeys: RecallHotKeyStore
     @State private var onboardingModel: AfterRayOnboardingModel
     @State private var labGreeting = "Good evening."
+    @State private var chatScenario: ChatScenario = CommandLine.arguments.contains("--stream")
+        ? .streaming
+        : .markdown
+    @StateObject private var chat = ChatPreviewModel(scenario: CommandLine.arguments.contains("--stream")
+        ? .streaming
+        : .markdown)
 
     @MainActor
     init() {
@@ -82,6 +92,8 @@ private struct VisualLabView: View {
                 recallLab
             case .settings:
                 settingsLab
+            case .chat:
+                chatLab
             case .onboarding:
                 onboardingLab
             }
@@ -123,6 +135,7 @@ private struct VisualLabView: View {
                 imageLoader: MockArtifactFactory.loader,
                 onToggleFavorite: toggleFavorite,
                 onToggleAudio: { _ in },
+                daySummary: labDaySummary,
                 searchSession: searchSession,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader,
@@ -243,6 +256,65 @@ private struct VisualLabView: View {
         }
     }
 
+    private var chatLab: some View {
+        HSplitView {
+            ZStack {
+                Color(red: 0.025, green: 0.022, blue: 0.026).ignoresSafeArea()
+                AfterRayChatView(
+                    model: chat,
+                    onClose: {},
+                    fillsAvailableSpace: true
+                )
+                .padding(28)
+            }
+            .frame(minWidth: 760)
+
+            chatTuningPanel
+                .frame(minWidth: 250, idealWidth: 280, maxWidth: 320)
+        }
+        .task(id: chatScenario) {
+            chat.apply(chatScenario)
+            if chatScenario == .streaming {
+                await chat.simulateStream()
+            }
+        }
+    }
+
+    private var chatTuningPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("VISUAL LAB")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .tracking(2)
+                        .foregroundStyle(.red)
+                    Text("Chat fixtures")
+                        .font(.title2.weight(.semibold))
+                }
+
+                Picker("Scene", selection: $chatScenario) {
+                    ForEach(ChatScenario.allCases) { scene in
+                        Text(scene.title).tag(scene)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text("Mock conversations only. Send still streams a canned reply so you can watch markdown land line by line.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button("Replay stream") {
+                    Task { await chat.simulateStream() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(chatScenario == .empty)
+            }
+            .padding(22)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
     private var settingsLab: some View {
         ZStack {
             Color.black.opacity(0.55).ignoresSafeArea()
@@ -274,6 +346,13 @@ private struct VisualLabView: View {
                 }
                 .pickerStyle(.menu)
 
+                Picker("Day summary", selection: $daySummaryKind) {
+                    ForEach(DaySummaryLabKind.allCases) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .pickerStyle(.menu)
+
                 VStack(spacing: 18) {
                     TuneSlider(title: "Top scrim", value: $tuning.topScrimOpacity, range: 0...1)
                     TuneSlider(title: "Bottom scrim", value: $tuning.bottomScrimOpacity, range: 0...1)
@@ -291,11 +370,51 @@ private struct VisualLabView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
+    private var labDaySummary: DaySummary {
+        let origin = scenario.moments.first?.capturedAtMs ?? playheadMs
+        // A getter with a preceding statement does not treat the switch as an
+        // implicit return, so both the keyword and the explicit type are
+        // needed for the branches to type-check.
+        return switch daySummaryKind {
+        case .matching:
+            scenario.daySummary
+        case .rich:
+            DaySummary.mockRich(around: origin)
+        case .facts:
+            DaySummary.mockFactsOnly(around: origin)
+        case .empty:
+            DaySummary(
+                day: DaySummaryLayout.localDayKey(ms: origin),
+                dayStartMs: DaySummaryLayout.dayBounds(ms: origin).start,
+                dayEndMs: DaySummaryLayout.dayBounds(ms: origin).end,
+                slots: []
+            )
+        }
+    }
+
     private func toggleFavorite() {
         guard let selected = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments) else { return }
         let id = selected.id
         if favoriteOverrides.contains(id) { favoriteOverrides.remove(id) }
         else { favoriteOverrides.insert(id) }
+    }
+}
+
+private enum DaySummaryLabKind: String, CaseIterable, Identifiable {
+    case matching
+    case rich
+    case facts
+    case empty
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .matching: "Match scene"
+        case .rich: "T2 titles"
+        case .facts: "Facts only"
+        case .empty: "Empty day"
+        }
     }
 }
 

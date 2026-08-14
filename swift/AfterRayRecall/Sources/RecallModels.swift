@@ -441,37 +441,92 @@ public struct LlmEndpointStatus: Codable, Equatable, Sendable {
     }
 }
 
+/// One language the daemon is willing to store. The catalogue lives in
+/// afterray-protocol; Swift only renders what Settings already returned.
+public struct LanguageOption: Codable, Equatable, Identifiable, Sendable {
+    public let code: String
+    public let nativeName: String
+    public let englishName: String
+
+    public var id: String { code }
+
+    public init(code: String, nativeName: String, englishName: String) {
+        self.code = code
+        self.nativeName = nativeName
+        self.englishName = englishName
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case nativeName = "native_name"
+        case englishName = "english_name"
+    }
+
+    public static let autoCode = "auto"
+
+    /// Last-resort row when an old daemon omits `language_options`.
+    public static let followSystem = LanguageOption(
+        code: autoCode,
+        nativeName: "跟随系统",
+        englishName: "Follow system"
+    )
+
+    public var isAuto: Bool {
+        code.compare(Self.autoCode, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+
+    /// Menu label: `auto` is always 「跟随系统」, everything else uses the native name.
+    public var menuTitle: String {
+        isAuto ? "跟随系统" : nativeName
+    }
+}
+
 public struct AppSettings: Codable, Equatable, Sendable {
+    public static let defaultStorageLimitBytes: UInt64 = 100_000_000_000
+    public static let defaultLanguage = LanguageOption.autoCode
+
     public let dataDir: String
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
+    public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
     public let llmProvider: LlmProvider
     public let llmBaseUrl: String
     public let llmModel: String
     public let llmApiKeySet: Bool
+    public let uiLanguage: String
+    public let summaryLanguage: String
+    public let languageOptions: [LanguageOption]
 
     public init(
         dataDir: String,
         modelDir: String,
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
+        storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
         llmProvider: LlmProvider = .builtin,
         llmBaseUrl: String = "",
         llmModel: String = "",
-        llmApiKeySet: Bool = false
+        llmApiKeySet: Bool = false,
+        uiLanguage: String = defaultLanguage,
+        summaryLanguage: String = defaultLanguage,
+        languageOptions: [LanguageOption] = []
     ) {
         self.dataDir = dataDir
         self.modelDir = modelDir
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
+        self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
         self.llmProvider = llmProvider
         self.llmBaseUrl = llmBaseUrl
         self.llmModel = llmModel
         self.llmApiKeySet = llmApiKeySet
+        self.uiLanguage = uiLanguage
+        self.summaryLanguage = summaryLanguage
+        self.languageOptions = languageOptions
     }
 
     enum CodingKeys: String, CodingKey {
@@ -479,11 +534,15 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case modelDir = "model_dir"
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
+        case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
         case llmModel = "llm_model"
         case llmApiKeySet = "llm_api_key_set"
+        case uiLanguage = "ui_language"
+        case summaryLanguage = "summary_language"
+        case languageOptions = "language_options"
     }
 
     public init(from decoder: Decoder) throws {
@@ -492,11 +551,27 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir = try container.decode(String.self, forKey: .modelDir)
         recordAudio = try container.decode(Bool.self, forKey: .recordAudio)
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
+        storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
+            ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
         llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""
         llmModel = try container.decodeIfPresent(String.self, forKey: .llmModel) ?? ""
         llmApiKeySet = try container.decodeIfPresent(Bool.self, forKey: .llmApiKeySet) ?? false
+        uiLanguage = try container.decodeIfPresent(String.self, forKey: .uiLanguage) ?? Self.defaultLanguage
+        summaryLanguage = try container.decodeIfPresent(String.self, forKey: .summaryLanguage)
+            ?? Self.defaultLanguage
+        languageOptions = try container.decodeIfPresent([LanguageOption].self, forKey: .languageOptions) ?? []
+    }
+
+    /// Rows for a language picker. The catalogue itself is never hardcoded here;
+    /// an empty list (old daemon) falls back to `auto` so the control still works.
+    public func languagePickerOptions(selected: String) -> [LanguageOption] {
+        var options = languageOptions.isEmpty ? [LanguageOption.followSystem] : languageOptions
+        if !selected.isEmpty, !options.contains(where: { $0.code == selected }) {
+            options.append(LanguageOption(code: selected, nativeName: selected, englishName: selected))
+        }
+        return options
     }
 }
 
@@ -725,6 +800,10 @@ public enum RecallGeometry {
     public static let overlayChromeMargin: CGFloat = 26
     /// Space between sibling buttons inside one chrome cluster.
     public static let overlayChromeItemGap: CGFloat = 10
+    public static let daySummaryPanelWidth: CGFloat = 308
+    public static let daySummaryMaxHeight: CGFloat = 304
+    public static let daySummaryListMaxHeight: CGFloat = 248
+    public static let daySummaryCornerRadius: CGFloat = 16
     /// Window titles run long. Cap the identity capsule so one verbose title
     /// cannot push the rest of the chrome row off screen.
     public static let appIdentityTitleMaxWidth: CGFloat = 320

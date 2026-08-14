@@ -12,6 +12,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadProgress: Double? { get }
     var downloadStatus: String? { get }
     var isUpdatingAudio: Bool { get }
+    var isUpdatingStorageLimit: Bool { get }
+    var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
     var isUpdatingExclusions: Bool { get }
@@ -33,6 +35,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
+    func setStorageLimitBytes(_ bytes: UInt64) async
+    func setUiLanguage(_ code: String) async
+    func setSummaryLanguage(_ code: String) async
     func excludeBundle(_ bundleID: String) async
     func includeBundle(_ bundleID: String) async
     func excludeFrontmostApp() async
@@ -462,6 +467,33 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
 
         SettingsSection(
+            title: "Language",
+            footnote: "Interface language is stored for later localization. Summaries use their own language."
+        ) {
+            SettingsRow(
+                title: "Interface",
+                subtitle: "AfterRay's own chrome. Not applied yet."
+            ) {
+                languageMenu(
+                    title: "Interface language",
+                    selection: uiLanguageBinding,
+                    options: languagePickerOptions(selected: model.settings?.uiLanguage)
+                )
+            }
+            SettingsSeparator()
+            SettingsRow(
+                title: "Summaries",
+                subtitle: "Language for generated memory cards."
+            ) {
+                languageMenu(
+                    title: "Summary language",
+                    selection: summaryLanguageBinding,
+                    options: languagePickerOptions(selected: model.settings?.summaryLanguage)
+                )
+            }
+        }
+
+        SettingsSection(
             title: "Excluded apps",
             footnote: "AfterRay skips a moment when an excluded app is in front."
         ) {
@@ -543,7 +575,99 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 Text(model.storage.diskShareText)
                     .font(.settingsCaption)
                     .foregroundStyle(SettingsPalette.tertiaryLabel)
+                Rectangle()
+                    .fill(SettingsPalette.separator)
+                    .frame(height: 1)
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Memory limit")
+                            .font(.settingsRowTitle)
+                            .foregroundStyle(SettingsPalette.label)
+                        Text("Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.")
+                            .font(.settingsRowSubtitle)
+                            .foregroundStyle(SettingsPalette.secondaryLabel)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 16)
+                    if model.isUpdatingStorageLimit {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Picker("Memory limit", selection: storageLimitBinding) {
+                        ForEach(storageLimitOptions, id: \.self) { bytes in
+                            Text(AfterRayStorageSnapshot.byteCount(bytes)).tag(bytes)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 110)
+                    .disabled(model.isUpdatingStorageLimit)
+                }
             }
+        }
+    }
+
+    private var storageLimitOptions: [UInt64] {
+        let presets: [UInt64] = [
+            10_000_000_000,
+            25_000_000_000,
+            50_000_000_000,
+            100_000_000_000,
+            250_000_000_000,
+            500_000_000_000,
+            1_000_000_000_000,
+        ]
+        let current = model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes
+        return Array(Set(presets + [current])).sorted()
+    }
+
+    private var storageLimitBinding: Binding<UInt64> {
+        Binding(
+            get: { model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes },
+            set: { bytes in Task { await model.setStorageLimitBytes(bytes) } }
+        )
+    }
+
+    private var uiLanguageBinding: Binding<String> {
+        Binding(
+            get: { model.settings?.uiLanguage ?? AppSettings.defaultLanguage },
+            set: { code in Task { await model.setUiLanguage(code) } }
+        )
+    }
+
+    private var summaryLanguageBinding: Binding<String> {
+        Binding(
+            get: { model.settings?.summaryLanguage ?? AppSettings.defaultLanguage },
+            set: { code in Task { await model.setSummaryLanguage(code) } }
+        )
+    }
+
+    private func languagePickerOptions(selected: String?) -> [LanguageOption] {
+        model.settings?.languagePickerOptions(selected: selected ?? AppSettings.defaultLanguage)
+            ?? [LanguageOption.followSystem]
+    }
+
+    private func languageMenu(
+        title: String,
+        selection: Binding<String>,
+        options: [LanguageOption]
+    ) -> some View {
+        HStack(spacing: 8) {
+            if model.isUpdatingLanguage {
+                ProgressView().controlSize(.mini)
+            }
+            Picker(title, selection: selection) {
+                ForEach(options) { option in
+                    Text(option.menuTitle)
+                        .tag(option.code)
+                        .accessibilityLabel(option.englishName)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 132, maxWidth: 176)
+            .disabled(model.isUpdatingLanguage)
+            .accessibilityLabel(title)
         }
     }
 

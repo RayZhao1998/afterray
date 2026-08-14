@@ -8,7 +8,8 @@
 
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
-    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Memory, Moment, SearchHit, Session,
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Conversation, ConversationMessage,
+    DEFAULT_STORAGE_LIMIT_BYTES, Memory, Moment, SearchHit, Session,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -37,7 +38,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -46,6 +50,7 @@ mod activity;
 mod gop;
 mod jpeg;
 mod memory;
+mod slot;
 
 pub use gop::{
     GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
@@ -53,10 +58,25 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
-    AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
+    AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
+    parse_accessibility_digest,
+};
+/// One stretch of transcribed speech: when it started, which track it came
+/// from, and what was said.
+pub type TranscriptLine = (i64, String, String);
+
+/// A capture id paired with the instant it was taken.
+pub type MomentAt = (String, i64);
+
+pub use slot::{
+    AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
+    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
+    SlotSummaryState, StoredSlotOverlay, T2Card, T2_SYSTEM_PROMPT, TimelineEntry,
+    assemble_day_summary, build_slot_card, extract_json_object, local_day_bounds, local_day_for,
+    parse_t2_card, render_t2_prompt, shorten_place, slot_clock_label, slot_start_for,
 };
 
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// `text_evidence.source` for the synthetic rows that put window titles in FTS.
 pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
@@ -74,6 +94,8 @@ const ARTIFACT_FORMAT_VERSION: i64 = 1;
 const NONCE_LENGTH: usize = 24;
 const WRAPPED_DEK_LENGTH: usize = 32 + 16;
 const ARTIFACT_HEADER_LENGTH: usize = 4 + NONCE_LENGTH;
+const ARTIFACT_FILE_OVERHEAD_BYTES: i64 = (ARTIFACT_HEADER_LENGTH + 16) as i64;
+const RETENTION_BATCH_SIZE: i64 = 256;
 const DATABASE_KEY_CONTEXT: &str = "dev.afterray.vault.database-key.v1";
 const ARTIFACT_WRAP_KEY_CONTEXT: &str = "dev.afterray.vault.artifact-wrap-key.v1";
 const KEYCHAIN_SERVICE: &str = "dev.afterray.v0.vault";
@@ -323,14 +345,14 @@ fn decode_key(value: &[u8]) -> Result<VaultKey, StoreError> {
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
     pub data_dir: PathBuf,
-    pub max_unstarred_moments: usize,
+    pub max_storage_bytes: u64,
 }
 
 impl Default for VaultConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            max_unstarred_moments: 10_000,
+            max_storage_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
         }
     }
 }
@@ -341,7 +363,7 @@ pub struct Vault {
     artifact_wrap_key: Zeroizing<[u8; 32]>,
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
-    max_unstarred_moments: usize,
+    max_storage_bytes: AtomicU64,
 }
 
 impl Vault {
@@ -378,12 +400,36 @@ impl Vault {
             )),
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
-            max_unstarred_moments: config.max_unstarred_moments,
+            max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
         let _ = vault.cleanup_unreferenced_gop_artifacts();
+        vault.enforce_retention()?;
         Ok(vault)
+    }
+
+    #[must_use]
+    pub fn storage_limit_bytes(&self) -> u64 {
+        self.max_storage_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_storage_limit_bytes(&self, bytes: u64) -> Result<(), StoreError> {
+        let previous = self.max_storage_bytes.swap(bytes, Ordering::Relaxed);
+        if let Err(error) = self.enforce_retention() {
+            self.max_storage_bytes.store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn storage_usage_bytes(&self) -> Result<u64, StoreError> {
+        let bytes = self.connection.lock().unwrap().query_row(
+            "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+            [ARTIFACT_FILE_OVERHEAD_BYTES],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
     pub fn create_session_sync(&self, started_at_ms: i64) -> Result<Session, StoreError> {
@@ -839,6 +885,531 @@ impl Vault {
         Ok(activity::fold_activity_spans(&moments, limit))
     }
 
+    /// Builds the deterministic T1 card for the slot containing `at_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn slot_card(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SlotCard, StoreError> {
+        let slot_start_ms = slot::slot_start_for(at_ms);
+        let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
+        let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        // The AX artifact is decrypted once per frame at T1 build time
+        // (once per half hour). It yields the two strongest intent signals
+        // (selection, composition) and, when the tree is rich enough, the
+        // frame's text itself: AX text is exact where OCR guesses, and is
+        // scoped to the frontmost app — the thing the user was operating,
+        // not everything on screen. Measured on a real slot, the two
+        // sources barely merge (60KB + 73KB ≈ 132KB combined), so this is
+        // a per-frame either/or, never a blend.
+        for row in &mut rows {
+            if !row.ax_present {
+                continue;
+            }
+            if let Ok(Some(bytes)) = self.accessibility_bytes_for_moment(&row.id) {
+                let digest = parse_accessibility_digest(&bytes);
+                row.selected_text = digest.selected_text;
+                row.focused_value = digest.focused_value;
+                let lines = accessibility_text_lines(&bytes);
+                let chars: usize = lines.iter().map(|line| line.chars().count()).sum();
+                if chars >= slot::AX_TEXT_MIN_CHARS {
+                    row.ocr_text = Some(lines.join("\n"));
+                    row.text_from_ax = true;
+                }
+            }
+        }
+        let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
+        Ok(slot::build_slot_card(
+            slot_start_ms,
+            &rows,
+            idle_ms,
+            capture_interval_ms,
+        ))
+    }
+
+    /// Persists a successful T2 card. Re-running the same slot increments
+    /// `generation` so a later model swap can tell the row is stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2Card,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let facts_json = serde_json::to_string(&card.facts).unwrap_or_else(|_| "{}".to_owned());
+        let artifacts_json = serde_json::to_string(&t2.artifacts).ok();
+        let bullets_json = serde_json::to_string(&t2.bullets).ok();
+        let evidence_json =
+            serde_json::to_string(&card.evidence).unwrap_or_else(|_| "{}".to_owned());
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO slot_summaries (
+                id, slot_start_ms, slot_end_ms, local_day, state, generation, schema_version,
+                facts_json, theme_key, artifacts_json, title, bullets_json, category, confidence,
+                evidence_json, producer, produced_at_ms, latency_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, 'done', 1, ?5,
+                ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+             )
+             ON CONFLICT(slot_start_ms) DO UPDATE SET
+                slot_end_ms = excluded.slot_end_ms,
+                local_day = excluded.local_day,
+                state = excluded.state,
+                generation = slot_summaries.generation + 1,
+                schema_version = excluded.schema_version,
+                facts_json = excluded.facts_json,
+                theme_key = excluded.theme_key,
+                artifacts_json = excluded.artifacts_json,
+                title = excluded.title,
+                bullets_json = excluded.bullets_json,
+                category = excluded.category,
+                confidence = excluded.confidence,
+                evidence_json = excluded.evidence_json,
+                producer = excluded.producer,
+                produced_at_ms = excluded.produced_at_ms,
+                latency_ms = excluded.latency_ms",
+            params![
+                id,
+                card.slot_start_ms,
+                card.slot_end_ms,
+                card.local_day,
+                SLOT_SUMMARY_SCHEMA_VERSION,
+                facts_json,
+                card.theme_key,
+                artifacts_json,
+                t2.title.trim(),
+                bullets_json,
+                t2.category.as_deref(),
+                t2.confidence,
+                evidence_json,
+                producer,
+                produced_at_ms,
+                latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Neighbouring T2 titles, oldest first. Fed to the next T2 pass as a
+    /// negative constraint so adjacent cards do not copy each other's wording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn previous_slot_titles(
+        &self,
+        before_start_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<slot::PrevCard>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, title FROM slot_summaries
+              WHERE title IS NOT NULL AND TRIM(title) != '' AND slot_start_ms < ?1
+              ORDER BY slot_start_ms DESC
+              LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![before_start_ms, limit], |row| {
+            let start_ms: i64 = row.get(0)?;
+            let title: String = row.get(1)?;
+            Ok(slot::PrevCard {
+                from_label: slot::slot_clock_label(start_ms),
+                title,
+            })
+        })?;
+        let mut cards = rows.collect::<Result<Vec<_>, _>>()?;
+        cards.reverse();
+        Ok(cards)
+    }
+
+    /// The day panel payload: every occupied slot that day, with T2 titles
+    /// when they exist and T1 facts otherwise.
+    ///
+    /// AX is not decrypted here. Facts only need app names and durations;
+    /// walking every tree on a 48-slot day would stall the overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn day_summary(
+        &self,
+        day_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::DaySummary, StoreError> {
+        let day = slot::local_day_for(day_ms);
+        let (day_start_ms, day_end_ms) = slot::local_day_bounds(day_ms);
+        let rows = self.slot_moment_rows(day_start_ms, day_end_ms)?;
+        let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(slot::slot_start_for(row.captured_at_ms))
+                .or_default()
+                .push(row);
+        }
+        let mut cards = Vec::new();
+        let mut starts: Vec<i64> = grouped.keys().copied().collect();
+        starts.sort_unstable();
+        for start in starts {
+            let slot_rows = grouped.remove(&start).unwrap_or_default();
+            let idle_ms = self.idle_overlap_ms(start, start + slot::SLOT_DURATION_MS)?;
+            cards.push(slot::build_slot_card(
+                start,
+                &slot_rows,
+                idle_ms,
+                capture_interval_ms,
+            ));
+        }
+        let overlays = self.slot_overlays_for_day(&day)?;
+        Ok(slot::assemble_day_summary(
+            day,
+            day_start_ms,
+            day_end_ms,
+            &cards,
+            &overlays,
+        ))
+    }
+
+    fn slot_overlays_for_day(
+        &self,
+        local_day: &str,
+    ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, state, title, bullets_json, category
+               FROM slot_summaries
+              WHERE local_day = ?1
+              ORDER BY slot_start_ms",
+        )?;
+        let rows = statement.query_map(params![local_day], |row| {
+            let start: i64 = row.get(0)?;
+            let state_raw: String = row.get(1)?;
+            let title: Option<String> = row.get(2)?;
+            let bullets_json: Option<String> = row.get(3)?;
+            let category: Option<String> = row.get(4)?;
+            let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
+            Ok((
+                start,
+                slot::StoredSlotOverlay {
+                    state: slot::SlotSummaryState::parse(&state_raw),
+                    title,
+                    bullets,
+                    category,
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Moments in `[from_ms, to_ms)` joined with their OCR text and evidence flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn slot_moment_rows(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<slot::SlotMomentRow>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.captured_at_ms, m.application_name, m.bundle_identifier,
+                    m.window_title, m.url, m.document,
+                    (SELECT group_concat(te.text, '\n') FROM text_evidence te
+                      WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                    m.accessibility_artifact_id IS NOT NULL,
+                    EXISTS (SELECT 1 FROM audio_segments a
+                             WHERE m.captured_at_ms BETWEEN a.started_at_ms AND a.ended_at_ms)
+               FROM moments m
+              WHERE m.captured_at_ms >= ?1 AND m.captured_at_ms < ?2
+              ORDER BY m.captured_at_ms, m.id",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(slot::SlotMomentRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                application_name: row.get(2)?,
+                bundle_identifier: row.get(3)?,
+                window_title: row.get(4)?,
+                url: row.get(5)?,
+                document: row.get(6)?,
+                ocr_text: row.get(7)?,
+                selected_text: None,
+                focused_value: None,
+                text_from_ax: false,
+                ax_present: row.get(8)?,
+                has_audio: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Milliseconds of `[from_ms, to_ms)` covered by recorded idle spans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn idle_overlap_ms(&self, from_ms: i64, to_ms: i64) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT started_at_ms, ended_at_ms FROM idle_spans
+              WHERE started_at_ms < ?2 AND (ended_at_ms IS NULL OR ended_at_ms > ?1)",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            let started: i64 = row.get(0)?;
+            let ended: Option<i64> = row.get(1)?;
+            Ok((started, ended.unwrap_or(to_ms)))
+        })?;
+        let mut total = 0_i64;
+        for span in rows {
+            let (started, ended) = span?;
+            let overlap = ended.min(to_ms).saturating_sub(started.max(from_ms));
+            total += overlap.max(0);
+        }
+        Ok(total.min(to_ms.saturating_sub(from_ms)))
+    }
+
+    /// Speech transcribed in a window, oldest first.
+    ///
+    /// Meetings are otherwise unreachable to an agent: transcripts hang off
+    /// audio segments, not moments, so asking about "the call at three" has
+    /// no moment id to start from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn transcripts_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<TranscriptLine>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT te.started_at_ms, COALESCE(a.track, 'unknown'), te.text
+               FROM text_evidence te
+               LEFT JOIN audio_segments a ON a.id = te.audio_segment_id
+              WHERE te.source = 'transcript'
+                AND te.started_at_ms >= ?1 AND te.started_at_ms <= ?2
+              ORDER BY te.started_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Moments captured in a window, oldest first. Entry points for an agent
+    /// that knows a time but no ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_ids_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MomentAt>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms FROM moments
+              WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+              ORDER BY captured_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Nearest moment to `at_ms`, in either direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_nearest(&self, at_ms: i64) -> Result<Option<String>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id FROM moments
+              ORDER BY ABS(captured_at_ms - ?1), captured_at_ms
+              LIMIT 1",
+        )?;
+        let mut rows = statement.query(params![at_ms])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Creates a conversation and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn create_conversation(&self, title: &str, now_ms: i64) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO conversations (id, title, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![id, title, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Conversations, most recently touched first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              ORDER BY c.updated_at_ms DESC
+              LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// One conversation by id, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation(&self, id: &str) -> Result<Option<Conversation>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              WHERE c.id = ?1",
+        )?;
+        let mut rows = statement.query(params![id])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            }),
+            None => None,
+        })
+    }
+
+    /// Appends a message and bumps the conversation's updated timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either write fails.
+    pub fn append_message(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        tool_log: Option<&str>,
+        now_ms: i64,
+    ) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO conversation_messages
+               (id, conversation_id, role, content, tool_log, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, conversation_id, role, content, tool_log, now_ms],
+        )?;
+        connection.execute(
+            "UPDATE conversations SET updated_at_ms = ?2 WHERE id = ?1",
+            params![conversation_id, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Messages of one conversation in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, conversation_id, role, content, tool_log, created_at_ms
+               FROM conversation_messages
+              WHERE conversation_id = ?1
+              ORDER BY created_at_ms, id",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            Ok(ConversationMessage {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_log: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Renames a conversation — used to replace the placeholder title with
+    /// one derived from the opening question.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a conversation and, by cascade, its messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_conversation(&self, id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {
         let connection = self.connection.lock().unwrap();
         let open: Option<String> = connection
@@ -980,6 +1551,13 @@ impl Vault {
         }
         self.connection.lock().unwrap().execute(
             "DELETE FROM memories WHERE start_ms <= ?2 AND end_ms >= ?1",
+            params![from_ms, to_ms],
+        )?;
+        // A leftover card after the evidence is gone is both a privacy leak
+        // and a hallucination source for the next T2 pass.
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM slot_summaries
+              WHERE slot_start_ms <= ?2 AND slot_end_ms > ?1",
             params![from_ms, to_ms],
         )?;
         Ok(count)
@@ -1577,102 +2155,181 @@ impl Vault {
 
     #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
-        let max = i64::try_from(self.max_unstarred_moments).unwrap_or(i64::MAX);
-        let mut connection = self.connection.lock().unwrap();
-        let count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM moments", [], |row| row.get(0))?;
-        let excess = count.saturating_sub(max).max(0);
-        if excess == 0 {
-            return Ok(());
-        }
-        let transaction = connection.transaction()?;
-        let candidates: Vec<(String, Vec<String>)> = {
-            let mut statement = transaction.prepare(
-                "SELECT id, image_artifact_id, accessibility_artifact_id, thumbnail_artifact_id
-                   FROM moments
-                 ORDER BY captured_at_ms ASC LIMIT ?1",
+        loop {
+            let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
+            let mut connection = self.connection.lock().unwrap();
+            let used: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+                [ARTIFACT_FILE_OVERHEAD_BYTES],
+                |row| row.get(0),
             )?;
-            statement
-                .query_map([excess], |row| {
-                    let owned: Vec<Option<String>> = vec![row.get(1)?, row.get(2)?, row.get(3)?];
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        owned.into_iter().flatten().collect(),
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut gop_artifact_ids = Vec::new();
-        for (moment_id, artifact_ids) in &candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE moment_id = ?1)",
-                [moment_id],
-            )?;
-            transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
-            transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-            for artifact_id in artifact_ids {
+            let excess = used.saturating_sub(max).max(0);
+            if excess == 0 {
+                return Ok(());
+            }
+
+            let transaction = connection.transaction()?;
+            let candidate_pool = {
+                let mut statement = transaction.prepare(
+                    "SELECT m.id, m.image_artifact_id, m.accessibility_artifact_id,
+                            m.thumbnail_artifact_id,
+                            COALESCE(image.byte_length + ?1, 0)
+                              + COALESCE(accessibility.byte_length + ?1, 0)
+                              + COALESCE(thumbnail.byte_length + ?1, 0)
+                              + CASE
+                                  WHEN m.gop_segment_id IS NOT NULL
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM moments favorite
+                                      WHERE favorite.gop_segment_id = m.gop_segment_id
+                                        AND favorite.is_favorite = 1
+                                   )
+                                  THEN COALESCE(gop_artifact.byte_length + ?1, 0)
+                                    / MAX((
+                                        SELECT COUNT(*) FROM moments sibling
+                                         WHERE sibling.gop_segment_id = m.gop_segment_id
+                                           AND sibling.is_favorite = 0
+                                      ), 1)
+                                  ELSE 0
+                                END
+                       FROM moments m
+                       LEFT JOIN artifacts image ON image.id = m.image_artifact_id
+                       LEFT JOIN artifacts accessibility
+                         ON accessibility.id = m.accessibility_artifact_id
+                       LEFT JOIN artifacts thumbnail
+                         ON thumbnail.id = m.thumbnail_artifact_id
+                       LEFT JOIN gop_segments gop ON gop.id = m.gop_segment_id
+                       LEFT JOIN artifacts gop_artifact ON gop_artifact.id = gop.artifact_id
+                      WHERE m.is_favorite = 0
+                        AND (
+                          image.id IS NOT NULL
+                          OR accessibility.id IS NOT NULL
+                          OR m.gop_segment_id IS NULL
+                          OR NOT EXISTS (
+                            SELECT 1 FROM moments favorite
+                             WHERE favorite.gop_segment_id = m.gop_segment_id
+                               AND favorite.is_favorite = 1
+                          )
+                        )
+                      ORDER BY m.captured_at_ms ASC, m.id ASC
+                      LIMIT ?2",
+                )?;
+                statement
+                    .query_map(
+                        params![ARTIFACT_FILE_OVERHEAD_BYTES, RETENTION_BATCH_SIZE],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut estimated_reclaim = 0_i64;
+            let mut candidates = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id, thumbnail_artifact_id, bytes) in
+                candidate_pool
+            {
+                candidates.push((
+                    moment_id,
+                    artifact_id,
+                    accessibility_artifact_id,
+                    thumbnail_artifact_id,
+                ));
+                estimated_reclaim = estimated_reclaim.saturating_add(bytes.max(0));
+                if bytes <= 0 || estimated_reclaim >= excess {
+                    break;
+                }
+            }
+
+            let mut gop_artifact_ids = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in
+                &candidates
+            {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE moment_id = ?1)",
+                    [moment_id],
+                )?;
+                transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
+                transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                }
+            }
+            let empty_segments: Vec<(String, Option<String>)> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, artifact_id FROM gop_segments
+                      WHERE id NOT IN (
+                        SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
+                      )
+                      AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &empty_segments {
+                transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+                if let Some(artifact_id) = artifact_id {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                    gop_artifact_ids.push(artifact_id.clone());
+                }
+            }
+            let audio_candidates = {
+                let mut statement = transaction.prepare(
+                    "SELECT audio.id, audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM moments m
+                         WHERE m.session_id = audio.session_id
+                           AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                      )",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &audio_candidates {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
+                    [segment_id],
+                )?;
+                transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
                 transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
             }
-        }
-        let empty_segments: Vec<(String, Option<String>)> = {
-            let mut statement = transaction.prepare(
-                "SELECT id, artifact_id FROM gop_segments
-                  WHERE id NOT IN (
-                    SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
-                  )
-                  AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
-            )?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &empty_segments {
-            transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
-            if let Some(artifact_id) = artifact_id {
-                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-                gop_artifact_ids.push(artifact_id.clone());
+            let removed_anything = !candidates.is_empty()
+                || !gop_artifact_ids.is_empty()
+                || !audio_candidates.is_empty();
+            transaction.commit()?;
+            drop(connection);
+            for (_, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in candidates {
+                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = fs::remove_file(self.artifact_path(&artifact_id));
+                }
             }
-        }
-        let audio_candidates = {
-            let mut statement = transaction.prepare(
-                "SELECT audio.id, audio.audio_artifact_id
-                   FROM audio_segments audio
-                  WHERE NOT EXISTS (
-                    SELECT 1 FROM moments m
-                     WHERE m.session_id = audio.session_id
-                       AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                  )",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &audio_candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
-                [segment_id],
-            )?;
-            transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
-            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-        }
-        transaction.commit()?;
-        drop(connection);
-        for (_, artifact_ids) in candidates {
-            for artifact_id in artifact_ids {
+            for artifact_id in gop_artifact_ids {
                 let _ = fs::remove_file(self.artifact_path(&artifact_id));
             }
+            for (_, artifact_id) in audio_candidates {
+                let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            }
+            if !removed_anything {
+                return Ok(());
+            }
         }
-        for artifact_id in gop_artifact_ids {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        for (_, artifact_id) in audio_candidates {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        Ok(())
     }
 
     fn artifact_path(&self, id: &str) -> PathBuf {
@@ -1890,6 +2547,8 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_10(connection)?;
     migrate_schema_11(connection)?;
     migrate_schema_12(connection)?;
+    migrate_schema_13(connection)?;
+    migrate_schema_14(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2213,6 +2872,34 @@ fn migrate_schema_11(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Chat lives in the vault like every other capture: encrypted at rest and
+/// removed by the same retention and clear-history paths. A conversation
+/// about what you did all day is as revealing as the recording it is about.
+fn migrate_schema_13(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversations (
+           id TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversations_updated
+           ON conversations(updated_at_ms DESC);
+         CREATE TABLE IF NOT EXISTS conversation_messages (
+           id TEXT PRIMARY KEY,
+           conversation_id TEXT NOT NULL
+             REFERENCES conversations(id) ON DELETE CASCADE,
+           role TEXT NOT NULL,
+           content TEXT NOT NULL,
+           tool_log TEXT,
+           created_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversation_messages_thread
+           ON conversation_messages(conversation_id, created_at_ms);",
+    )?;
+    Ok(())
+}
+
 fn migrate_schema_12(connection: &Connection) -> Result<(), StoreError> {
     let moment_columns = moment_column_names(connection)?;
     if !moment_columns
@@ -2224,6 +2911,40 @@ fn migrate_schema_12(connection: &Connection) -> Result<(), StoreError> {
             [],
         )?;
     }
+    Ok(())
+}
+
+/// Slot cards persist independently of the live T1 compute path. T2 output
+/// used to vanish when the process exited; the day panel needs it to survive.
+fn migrate_schema_14(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slot_summaries (
+           id              TEXT PRIMARY KEY,
+           slot_start_ms   INTEGER NOT NULL,
+           slot_end_ms     INTEGER NOT NULL,
+           local_day       TEXT NOT NULL,
+           state           TEXT NOT NULL,
+           generation      INTEGER NOT NULL DEFAULT 1,
+           schema_version  INTEGER NOT NULL,
+           facts_json      TEXT NOT NULL,
+           theme_key       TEXT,
+           artifacts_json  TEXT,
+           title           TEXT,
+           bullets_json    TEXT,
+           category        TEXT,
+           confidence      REAL,
+           evidence_json   TEXT NOT NULL,
+           producer        TEXT,
+           produced_at_ms  INTEGER,
+           input_tokens    INTEGER,
+           output_tokens   INTEGER,
+           latency_ms      INTEGER
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS slot_summaries_slot
+           ON slot_summaries(slot_start_ms);
+         CREATE INDEX IF NOT EXISTS slot_summaries_day
+           ON slot_summaries(local_day, slot_start_ms);",
+    )?;
     Ok(())
 }
 
@@ -2591,12 +3312,16 @@ mod pipeline_bench;
 mod tests {
     use super::*;
 
-    fn test_vault(max: usize) -> (tempfile::TempDir, Vault) {
+    fn test_vault(max_storage_gigabytes: u64) -> (tempfile::TempDir, Vault) {
+        test_vault_with_storage_limit(max_storage_gigabytes.saturating_mul(1_000_000_000))
+    }
+
+    fn test_vault_with_storage_limit(max_storage_bytes: u64) -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: max,
+                max_storage_bytes,
             },
             [7_u8; 32],
         )
@@ -2641,7 +3366,7 @@ mod tests {
         let result = Vault::open(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             &provider,
         );
@@ -2745,7 +3470,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             master_key,
         )
@@ -2769,7 +3494,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let master_key = [23_u8; 32];
         let vault = Vault::open_with_key(config.clone(), master_key).unwrap();
@@ -2923,8 +3648,8 @@ mod tests {
     }
 
     #[test]
-    fn retention_evicts_oldest_moments() {
-        let (_directory, vault) = test_vault(2);
+    fn storage_retention_evicts_oldest_moments() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
         let session = vault.create_session_sync(1).unwrap();
         let first = vault
             .insert_moment(&session.id, 1, "image/jpeg", b"one")
@@ -2947,6 +3672,156 @@ mod tests {
         assert!(!ids.contains(&second.id.as_str()));
         assert!(ids.contains(&third.id.as_str()));
         assert!(ids.contains(&fourth.id.as_str()));
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn lowering_storage_limit_prunes_immediately() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let third = vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+
+        vault.set_storage_limit_bytes(100).unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(ids.contains(&second.id));
+        assert!(ids.contains(&third.id));
+        assert_eq!(vault.storage_limit_bytes(), 100);
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn opening_vault_applies_persisted_storage_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: data_dir.clone(),
+                max_storage_bytes: 10_000,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+        drop(vault);
+
+        let reopened = Vault::open_with_key(
+            VaultConfig {
+                data_dir,
+                max_storage_bytes: 100,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let ids = reopened
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(reopened.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn storage_retention_keeps_favorites() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
+        let session = vault.create_session_sync(1).unwrap();
+        let favorite = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"favorite")
+            .unwrap();
+        vault.set_favorite(&favorite.id, true).unwrap();
+        let removable = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"temporary")
+            .unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&favorite.id));
+        assert!(!ids.contains(&removable.id));
+    }
+
+    #[test]
+    fn retention_keeps_unstarred_moments_when_their_shared_gop_is_pinned() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let ids = vec![first.id.clone(), second.id.clone()];
+        let frames = vec![
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 8,
+                content_hash: [1; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 8,
+                byte_length: 8,
+                content_hash: [2; 32],
+            },
+        ];
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                started_at_ms: 1,
+                ended_at_ms: 2,
+                content_hash: "shared",
+                frames: &frames,
+            })
+            .unwrap();
+        vault.mark_gop_ready(&segment).unwrap();
+        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 2);
+        vault.set_favorite(&first.id, true).unwrap();
+        let usage = vault.storage_usage_bytes().unwrap();
+
+        vault.set_storage_limit_bytes(usage - 1).unwrap();
+
+        let remaining = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|moment| moment.id == second.id));
+        assert!(vault.storage_usage_bytes().unwrap() > vault.storage_limit_bytes());
     }
 
     #[test]
@@ -3199,6 +4074,10 @@ mod tests {
             .unwrap();
         let live = vault.live_gop_frames(&segment).unwrap();
         assert_eq!(live.len(), 6);
+        let storage_before_new_moment = vault.storage_usage_bytes().unwrap();
+        vault
+            .set_storage_limit_bytes(storage_before_new_moment)
+            .unwrap();
         vault
             .insert_moment(&session.id, 80_000, "image/jpeg", &jpeg)
             .unwrap();
@@ -3975,7 +4854,10 @@ mod tests {
 
     #[test]
     fn retention_reclaims_thumbnail_artifacts() {
-        let (_directory, vault) = test_vault(1);
+        // The limit is a byte budget, so it has to be small enough that one
+        // moment plus its thumbnail already exceeds it; a count would not
+        // evict anything here.
+        let (_directory, vault) = test_vault_with_storage_limit(u64::try_from(ARTIFACT_FILE_OVERHEAD_BYTES).unwrap_or(0) + 64);
         let session = vault.create_session_sync(1).unwrap();
         let evicted = vault
             .insert_moment(&session.id, 1_000, "image/jpeg", b"old")
@@ -4101,7 +4983,7 @@ mod tests {
         let key = [11_u8; 32];
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 100,
+            ..VaultConfig::default()
         };
         let seeded = seed_then_downgrade_to_schema_10(&config, key);
 
@@ -4211,6 +5093,45 @@ mod tests {
     }
 
     #[test]
+    fn conversations_round_trip_and_cascade_on_delete() {
+        let (_directory, vault) = test_vault(10);
+        let id = vault.create_conversation("Untitled", 1_000).unwrap();
+        vault
+            .append_message(&id, "user", "昨天下午我在干嘛？", None, 1_100)
+            .unwrap();
+        vault
+            .append_message(
+                &id,
+                "assistant",
+                "你在调 GOP 打包。",
+                Some(r#"[{"tool":"list_activity"}]"#),
+                1_200,
+            )
+            .unwrap();
+        vault.rename_conversation(&id, "昨天下午").unwrap();
+
+        let listed = vault.conversations(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "昨天下午");
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].updated_at_ms, 1_200, "append bumps updated_at");
+        assert_eq!(vault.conversation(&id).unwrap().unwrap().title, "昨天下午");
+        assert!(vault.conversation("missing").unwrap().is_none());
+
+        let messages = vault.conversation_messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[1].tool_log.is_some(), "tool log survives");
+
+        vault.delete_conversation(&id).unwrap();
+        assert!(vault.conversations(10).unwrap().is_empty());
+        assert!(
+            vault.conversation_messages(&id).unwrap().is_empty(),
+            "messages cascade with the conversation"
+        );
+    }
+
+    #[test]
     fn memories_round_trip_and_delete_with_history() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
@@ -4246,7 +5167,7 @@ mod tests {
         let key = [7_u8; 32];
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let session_id = {
             let vault = Vault::open_with_key(config.clone(), key).unwrap();
@@ -4280,6 +5201,222 @@ mod tests {
         assert!(columns.iter().any(|column| column == "window_title"));
         assert!(columns.iter().any(|column| column == "url"));
         assert!(columns.iter().any(|column| column == "document"));
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+    }
+
+    fn stamp_app(vault: &Vault, moment_id: &str, app: &str, bundle: &str, title: &str) {
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments
+                    SET application_name = ?2,
+                        bundle_identifier = ?3,
+                        window_title = ?4
+                  WHERE id = ?1",
+                params![moment_id, app, bundle, title],
+            )
+            .unwrap();
+    }
+
+    fn insert_named_moment(
+        vault: &Vault,
+        session_id: &str,
+        at_ms: i64,
+        app: &str,
+        bundle: &str,
+        title: &str,
+    ) -> Moment {
+        let moment = vault
+            .insert_moment(session_id, at_ms, "image/jpeg", b"screen")
+            .unwrap();
+        stamp_app(vault, &moment.id, app, bundle, title);
+        moment
+    }
+
+    #[test]
+    fn slot_summaries_round_trip_and_day_summary_keeps_t1_only_slots() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+        let first_slot = slot_start_for(day_start + 10 * 3_600_000);
+        let second_slot = first_slot + SLOT_DURATION_MS;
+        for (offset, title) in [(0_i64, "gop.rs"), (20_000, "encoder.rs"), (40_000, "ivf.rs")] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                first_slot + offset,
+                "Xcode",
+                "com.apple.dt.Xcode",
+                title,
+            );
+        }
+        for offset in [0_i64, 20_000, 40_000] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                second_slot + offset,
+                "Safari",
+                "com.apple.Safari",
+                "docs.rs",
+            );
+        }
+
+        let second_card = vault.slot_card(second_slot + 1_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Reading rav1e Config".into(),
+                    bullets: vec!["docs.rs for the IVF header".into()],
+                    category: Some("reading".into()),
+                    confidence: Some(0.7),
+                },
+                "ollama:qwen",
+                second_slot,
+                Some(1_200),
+            )
+            .unwrap();
+
+        let summary = vault.day_summary(first_slot + 1_000, 10_000).unwrap();
+        assert_eq!(summary.slots.len(), 2);
+        let t1 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == first_slot)
+            .unwrap();
+        assert!(t1.title.is_none(), "T2 never ran on this slot");
+        assert!(!t1.facts.apps.is_empty());
+        assert_eq!(t1.state, SlotSummaryState::Degraded);
+        let t2 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == second_slot)
+            .unwrap();
+        assert_eq!(t2.title.as_deref(), Some("Reading rav1e Config"));
+        assert_eq!(t2.state, SlotSummaryState::Done);
+        assert_eq!(t2.category.as_deref(), Some("reading"));
+
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Second pass".into(),
+                    bullets: vec![],
+                    category: Some("reading".into()),
+                    confidence: Some(0.8),
+                },
+                "ollama:qwen",
+                second_slot + 1,
+                Some(800),
+            )
+            .unwrap();
+        let generation: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM slot_summaries WHERE slot_start_ms = ?1",
+                [second_slot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+
+        let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
+        assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+    }
+
+    #[test]
+    fn delete_history_removes_slot_summaries_with_the_evidence() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let at = 1_786_698_000_000;
+        let slot = slot_start_for(at);
+        insert_named_moment(
+            &vault,
+            &session.id,
+            slot + 5_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "gop.rs",
+        );
+        let card = vault.slot_card(slot + 5_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Should vanish".into(),
+                    bullets: vec![],
+                    category: None,
+                    confidence: None,
+                },
+                "test",
+                slot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap(), 1);
+        let remaining: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM slot_summaries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(vault.day_summary(slot, 10_000).unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn schema_12_adds_slot_summaries_without_resetting_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [7_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP TABLE slot_summaries;
+                     DROP INDEX IF EXISTS slot_summaries_slot;
+                     DROP INDEX IF EXISTS slot_summaries_day;
+                     UPDATE schema_meta SET version = 11;",
+                )
+                .unwrap();
+            session.id
+        };
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let has_table: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'slot_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_table, 1);
         let version: i64 = vault
             .connection
             .lock()

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
+pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +78,29 @@ pub enum Request {
     MomentGet {
         moment_id: String,
     },
+    /// Nearest moment to a wall-clock instant. Entry point for agent tools
+    /// that address evidence by time rather than by id.
+    MomentAt {
+        at_ms: i64,
+    },
+    /// Deterministic T1 card for the slot containing `at_ms`.
+    SlotCard {
+        at_ms: i64,
+    },
+    /// T1 card rendered as the prompt handed to a T2 agent.
+    SlotPrompt {
+        at_ms: i64,
+    },
+    /// Runs the T2 pass for a slot through the configured model and returns
+    /// the parsed card alongside timing and the raw completion.
+    SlotSummarize {
+        at_ms: i64,
+    },
+    /// Every occupied half-hour on the local day containing `day_ms`.
+    /// Slots the model has never touched are included with facts only.
+    DaySummary {
+        day_ms: i64,
+    },
     EvidenceOcr {
         moment_id: String,
     },
@@ -107,10 +131,35 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_ms: Option<i64>,
     },
+    ChatSend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        message: String,
+    },
+    /// NDJSON event stream for one chat turn. The daemon writes event lines
+    /// until `done` or `error` instead of a single [`Response`].
+    ChatStream {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        message: String,
+    },
+    ChatList,
+    ChatHistory {
+        conversation_id: String,
+    },
+    ChatDelete {
+        conversation_id: String,
+    },
     Settings,
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage_limit_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +320,8 @@ pub struct AppSettings {
     pub model_dir: String,
     pub record_audio: bool,
     pub capture_interval_seconds: u64,
+    #[serde(default = "default_storage_limit_bytes")]
+    pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
     #[serde(default)]
@@ -281,6 +332,81 @@ pub struct AppSettings {
     pub llm_model: String,
     #[serde(default)]
     pub llm_api_key_set: bool,
+    /// Language for the application's own interface.
+    #[serde(default = "default_language")]
+    pub ui_language: String,
+    /// Language the summarising agent writes cards in. Independent of the
+    /// interface: reading a UI in English while wanting summaries in your
+    /// own language is a normal combination.
+    #[serde(default = "default_language")]
+    pub summary_language: String,
+    /// The catalogue the settings UI renders, so one list serves every client.
+    #[serde(default = "summary_language_options")]
+    pub language_options: Vec<LanguageOption>,
+}
+
+/// A language a summary can be written in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguageOption {
+    /// BCP-47 tag, or `auto` to follow the system language.
+    pub code: String,
+    /// Name in the language itself — a Japanese speaker scanning the list
+    /// looks for 日本語, not "Japanese".
+    pub native_name: String,
+    /// English name, for accessibility labels and search.
+    pub english_name: String,
+}
+
+/// Languages offered for summary output. `auto` first, then the sixteen
+/// most widely used, ordered by global speaker count.
+#[must_use]
+pub fn summary_language_options() -> Vec<LanguageOption> {
+    const ENTRIES: &[(&str, &str, &str)] = &[
+        ("auto", "跟随系统 / System", "Follow system"),
+        ("en", "English", "English"),
+        ("zh-Hans", "简体中文", "Chinese (Simplified)"),
+        ("zh-Hant", "繁體中文", "Chinese (Traditional)"),
+        ("es", "Español", "Spanish"),
+        ("hi", "हिन्दी", "Hindi"),
+        ("ar", "العربية", "Arabic"),
+        ("pt", "Português", "Portuguese"),
+        ("ru", "Русский", "Russian"),
+        ("ja", "日本語", "Japanese"),
+        ("de", "Deutsch", "German"),
+        ("fr", "Français", "French"),
+        ("ko", "한국어", "Korean"),
+        ("it", "Italiano", "Italian"),
+        ("tr", "Türkçe", "Turkish"),
+        ("vi", "Tiếng Việt", "Vietnamese"),
+        ("id", "Bahasa Indonesia", "Indonesian"),
+    ];
+    ENTRIES
+        .iter()
+        .map(|(code, native_name, english_name)| LanguageOption {
+            code: (*code).to_owned(),
+            native_name: (*native_name).to_owned(),
+            english_name: (*english_name).to_owned(),
+        })
+        .collect()
+}
+
+/// The name a model should be told to write in, for a stored language code.
+/// Falls back to English for anything unrecognised, including `auto` — the
+/// caller resolves `auto` against the system language before calling.
+#[must_use]
+pub fn language_display_name(code: &str) -> String {
+    summary_language_options()
+        .into_iter()
+        .find(|option| option.code.eq_ignore_ascii_case(code))
+        .map_or_else(|| "English".to_owned(), |option| option.english_name)
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
+}
+
+const fn default_storage_limit_bytes() -> u64 {
+    DEFAULT_STORAGE_LIMIT_BYTES
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,6 +415,57 @@ pub enum HistoryScope {
     LastHour,
     Today,
     All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Conversation {
+    pub id: String,
+    pub title: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub conversation_id: String,
+    /// `user` or `assistant`.
+    pub role: String,
+    pub content: String,
+    /// Which tools the assistant ran for this turn, as JSON. Kept so the UI
+    /// can show its work and a later session can tell what was already
+    /// looked up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_log: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Reply to [`Request::ChatSend`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatReply {
+    pub conversation: Conversation,
+    pub answer: String,
+    pub user_message_id: String,
+    pub assistant_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_log: Option<String>,
+    #[serde(default)]
+    pub model_missing: bool,
+}
+
+/// One conversation plus its messages, in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatThread {
+    pub conversation: Conversation,
+    pub messages: Vec<ConversationMessage>,
+}
+
+/// Reply to [`Request::ChatDelete`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatDeleteResult {
+    pub deleted: bool,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -562,6 +739,47 @@ pub struct AskAnswer {
     pub model_missing: bool,
 }
 
+/// One line of a [`Request::ChatStream`] response.
+///
+/// Tokens are optional: adapters that cannot stream omit them until the
+/// finished answer is known, then emit a single `token` so clients can
+/// treat every turn the same way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    ToolCall {
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        name: String,
+        chars: usize,
+    },
+    Token {
+        text: String,
+    },
+    Done {
+        message_id: String,
+        conversation_id: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl ChatStreamEvent {
+    /// Encodes one NDJSON line, including the trailing newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be serialized.
+    pub fn to_ndjson_line(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut line = serde_json::to_vec(self)?;
+        line.push(b'\n');
+        Ok(line)
+    }
+}
+
 /// Inclusive local-calendar day bounds containing `now_ms`.
 ///
 /// Used when an [`Request::Ask`] omits `from_ms` / `to_ms`.
@@ -627,6 +845,12 @@ mod tests {
     }
 
     #[test]
+    fn day_summary_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::DaySummary { day_ms: 42 }).unwrap();
+        assert_eq!(json, r#"{"type":"day_summary","day_ms":42}"#);
+    }
+
+    #[test]
     fn settings_wire_shape_is_stable() {
         assert_eq!(
             serde_json::to_string(&Request::Settings).unwrap(),
@@ -635,6 +859,9 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: Some(false),
+                ui_language: None,
+                summary_language: None,
+                storage_limit_bytes: None,
                 excluded_bundle_ids: None,
                 llm_provider: None,
                 llm_base_url: None,
@@ -664,6 +891,74 @@ mod tests {
         assert!(settings.llm_base_url.is_empty());
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
+        assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn storage_limit_update_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::UpdateSettings {
+            record_audio: None,
+            ui_language: None,
+            summary_language: None,
+            storage_limit_bytes: Some(250_000_000_000),
+            excluded_bundle_ids: None,
+            llm_provider: None,
+            llm_base_url: None,
+            llm_model: None,
+            llm_api_key: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"update_settings","storage_limit_bytes":250000000000}"#
+        );
+    }
+
+    #[test]
+    fn chat_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ChatSend {
+                conversation_id: None,
+                message: "我今天下午在干嘛".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_send","message":"我今天下午在干嘛"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatSend {
+                conversation_id: Some("c1".into()),
+                message: "那第三件呢".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_send","conversation_id":"c1","message":"那第三件呢"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatList).unwrap(),
+            r#"{"type":"chat_list"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatHistory {
+                conversation_id: "c1".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_history","conversation_id":"c1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatDelete {
+                conversation_id: "c1".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_delete","conversation_id":"c1"}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"chat_send","message":"hello"}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::ChatSend {
+                ref message,
+                conversation_id: None
+            } if message == "hello"
+        ));
     }
 
     #[test]
@@ -720,6 +1015,81 @@ mod tests {
                 limit: 100
             }
         ));
+    }
+
+    #[test]
+    fn chat_stream_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ChatStream {
+                conversation_id: None,
+                message: "我今天下午在干嘛".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_stream","message":"我今天下午在干嘛"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ChatStream {
+                conversation_id: Some("c1".into()),
+                message: "那第三件呢".into(),
+            })
+            .unwrap(),
+            r#"{"type":"chat_stream","conversation_id":"c1","message":"那第三件呢"}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"chat_stream","message":"hello"}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::ChatStream {
+                ref message,
+                conversation_id: None
+            } if message == "hello"
+        ));
+    }
+
+    #[test]
+    fn chat_stream_event_wire_shape_is_stable() {
+        let tool = ChatStreamEvent::ToolCall {
+            name: "get_slot_card".into(),
+            args: serde_json::json!({"at_ms": 1}),
+        };
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            r#"{"kind":"tool_call","name":"get_slot_card","args":{"at_ms":1}}"#
+        );
+        let result = ChatStreamEvent::ToolResult {
+            name: "get_slot_card".into(),
+            chars: 2480,
+        };
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480}"#
+        );
+        let token = ChatStreamEvent::Token {
+            text: "你今天下午".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&token).unwrap(),
+            r#"{"kind":"token","text":"你今天下午"}"#
+        );
+        let done = ChatStreamEvent::Done {
+            message_id: "m1".into(),
+            conversation_id: "c1".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&done).unwrap(),
+            r#"{"kind":"done","message_id":"m1","conversation_id":"c1"}"#
+        );
+        let error = ChatStreamEvent::Error {
+            message: "boom".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#"{"kind":"error","message":"boom"}"#
+        );
+        let line = token.to_ndjson_line().unwrap();
+        assert!(line.ends_with(b"\n"));
+        let parsed: ChatStreamEvent = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+        assert_eq!(parsed, token);
     }
 
     #[test]

@@ -58,6 +58,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadProgress: Double?
     @Published var downloadStatus: String?
     @Published var isUpdatingAudio = false
+    @Published var isUpdatingStorageLimit = false
+    @Published var isUpdatingLanguage = false
     @Published var isUpdatingExclusions = false
     @Published var isClearingHistory = false
     @Published var recentJobs: [ModelJob] = []
@@ -213,6 +215,65 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 : "Audio recording is off. Existing recordings stay in your vault."
         } catch {
             AfterRayPreferences.recordAudio = !enabled
+            message = error.localizedDescription
+        }
+    }
+
+    func setUiLanguage(_ code: String) async {
+        guard code != settings?.uiLanguage else { return }
+        await persistLanguage(uiLanguage: code, summaryLanguage: nil)
+    }
+
+    func setSummaryLanguage(_ code: String) async {
+        guard code != settings?.summaryLanguage else { return }
+        await persistLanguage(uiLanguage: nil, summaryLanguage: code)
+    }
+
+    private func persistLanguage(uiLanguage: String?, summaryLanguage: String?) async {
+        isUpdatingLanguage = true
+        defer { isUpdatingLanguage = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                uiLanguage: uiLanguage,
+                summaryLanguage: summaryLanguage
+            )
+            if let uiLanguage {
+                message = "Interface language set to \(languageLabel(uiLanguage))."
+            } else if let summaryLanguage {
+                message = "Summary language set to \(languageLabel(summaryLanguage))."
+            }
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func languageLabel(_ code: String) -> String {
+        settings?.languageOptions.first { $0.code == code }?.menuTitle ?? code
+    }
+
+    func setStorageLimitBytes(_ bytes: UInt64) async {
+        guard bytes != settings?.storageLimitBytes else { return }
+        isUpdatingStorageLimit = true
+        defer { isUpdatingStorageLimit = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                storageLimitBytes: bytes
+            )
+            storage = AfterRayStorageSnapshot.measure(
+                dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
+                modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
+                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
+            )
+            message = "Memory limit set to \(AfterRayStorageSnapshot.byteCount(bytes))."
+        } catch {
             message = error.localizedDescription
         }
     }
@@ -407,4 +468,3 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         }
     }
 }
-

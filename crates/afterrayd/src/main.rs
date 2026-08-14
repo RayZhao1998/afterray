@@ -1,23 +1,25 @@
 mod agent;
 mod ask;
+mod chat;
 mod gop_packer;
 mod memory;
+mod stream;
 mod tools;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
-    JobState, LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput,
-    ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig, download_packs,
-    library, model_directory, probe_llm, specs_for_download,
+    JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
+    ModelInput, ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
+    download_packs, library, model_directory, probe_llm, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
     apply_background_qos,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, GopReadMode, HistoryScope, LlmProvider, ModelDownloadProgress,
-    PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit, Status,
-    local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode, HistoryScope,
+    LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request,
+    Response, SearchHit, Status, local_calendar_day_bounds_ms,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
@@ -73,15 +75,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
         vault_config.data_dir = PathBuf::from(path);
     }
-    if let Ok(value) = std::env::var("AFTERRAY_MAX_UNSTARRED_MOMENTS") {
-        vault_config.max_unstarred_moments = value.parse().context("invalid retention limit")?;
-    }
     let staging_dir = vault_config.data_dir.join("capture-staging");
     let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
     if removed_staging_files > 0 {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
     let persisted = load_persisted_settings(&vault_config.data_dir);
+    vault_config.max_storage_bytes = persisted.storage_limit_bytes;
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
@@ -105,10 +105,9 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from(".build/release/afterray-native-model-worker"),
         PathBuf::from,
     );
-    let models = ModelQueue::new(
-        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config)),
-        QueueConfig::default(),
-    )?;
+    let (adapters, llm_token_sink) =
+        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config));
+    let models = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
@@ -138,7 +137,12 @@ async fn main() -> anyhow::Result<()> {
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
+        languages: std::sync::Mutex::new((
+            persisted.ui_language.clone(),
+            persisted.summary_language.clone(),
+        )),
         llm_config,
+        llm_token_sink,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -211,33 +215,37 @@ fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
-) -> Vec<Arc<dyn ModelAdapter>> {
-    let llm = Arc::new(LlmRouterAdapter::new(
+) -> (Vec<Arc<dyn ModelAdapter>>, LlmTokenSink) {
+    let llm = LlmRouterAdapter::new(
         ProcessAdapter::new(ProcessAdapterConfig::new(
             "llama-llm",
             ModelCapability::Llm,
             general_worker.clone(),
         )),
         llm_config,
-    ));
-    vec![
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "vision-ocr",
-            ModelCapability::Ocr,
-            native_worker,
-        ))) as Arc<dyn ModelAdapter>,
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "qwen3-asr",
-            ModelCapability::Asr,
-            general_worker.clone(),
-        ))),
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "llama-embedding",
-            ModelCapability::Embedding,
-            general_worker,
-        ))),
-        llm,
-    ]
+    );
+    let token_sink = llm.token_sink();
+    (
+        vec![
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "vision-ocr",
+                ModelCapability::Ocr,
+                native_worker,
+            ))) as Arc<dyn ModelAdapter>,
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "qwen3-asr",
+                ModelCapability::Asr,
+                general_worker.clone(),
+            ))),
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "llama-embedding",
+                ModelCapability::Embedding,
+                general_worker,
+            ))),
+            Arc::new(llm),
+        ],
+        token_sink,
+    )
 }
 
 struct AppState {
@@ -255,13 +263,19 @@ struct AppState {
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
+    /// (ui_language, summary_language) as stored preferences; `auto` until
+    /// the user picks, resolved against the system locale at prompt time.
+    languages: std::sync::Mutex<(String, String)>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
+    llm_token_sink: LlmTokenSink,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedSettings {
     #[serde(default = "default_record_audio")]
     record_audio: bool,
+    #[serde(default = "default_storage_limit_bytes")]
+    storage_limit_bytes: u64,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
     #[serde(default)]
@@ -272,21 +286,57 @@ struct PersistedSettings {
     llm_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     llm_api_key: String,
+    #[serde(default = "default_language")]
+    ui_language: String,
+    #[serde(default = "default_language")]
+    summary_language: String,
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
+}
+
+/// Resolves a stored language preference to the English name a model should
+/// be told to write in. `auto` follows the system language, defaulting to
+/// English when the locale is unset or unrecognised.
+fn resolve_summary_language(stored: &str) -> String {
+    if !stored.eq_ignore_ascii_case("auto") {
+        return afterray_protocol::language_display_name(stored);
+    }
+    let locale = std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .unwrap_or_default();
+    let tag = locale.split(['.', '_']).next().unwrap_or("").to_lowercase();
+    let region = locale.split('.').next().unwrap_or("").to_lowercase();
+    let code = match (tag.as_str(), region.as_str()) {
+        ("zh", region) if region.contains("tw") || region.contains("hk") => "zh-Hant",
+        ("zh", _) => "zh-Hans",
+        (other, _) if !other.is_empty() => other,
+        _ => "en",
+    };
+    afterray_protocol::language_display_name(code)
 }
 
 const fn default_record_audio() -> bool {
     true
 }
 
+const fn default_storage_limit_bytes() -> u64 {
+    DEFAULT_STORAGE_LIMIT_BYTES
+}
+
 impl Default for PersistedSettings {
     fn default() -> Self {
         Self {
             record_audio: true,
+            storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
+            ui_language: default_language(),
+            summary_language: default_language(),
         }
     }
 }
@@ -332,6 +382,12 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                     gop_packer::read_gop_frame(&state.store, &segment_id, index, mode),
                 )
                 .await?;
+            }
+            Ok(Request::ChatStream {
+                conversation_id,
+                message,
+            }) => {
+                stream::handle_chat_stream(&mut write, &state, conversation_id, message).await?;
             }
             Ok(Request::ReadThumbnail {
                 moment_id,
@@ -424,6 +480,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         | Request::ReadThumbnail { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
+        Request::ChatStream { .. } => Response::failure(
+            "chat streams are framed as NDJSON events and are handled separately",
+        ),
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
@@ -447,6 +506,24 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
+        },
+        Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
+            Ok(Some(moment_id)) => match tools::moment_detail(&state.store, &moment_id) {
+                Ok(moment) => Response::success(moment),
+                Err(error) => Response::failure(error),
+            },
+            Ok(None) => Response::failure("no moment has been captured yet"),
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
+        Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
+        Request::DaySummary { day_ms } => {
+            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+            into_response(state.store.day_summary(day_ms, interval_ms))
+        }
+        Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
+            Ok(prompt) => Response::success(prompt),
+            Err(error) => Response::failure(error.to_string()),
         },
         Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
             Ok(evidence) => Response::success(evidence),
@@ -492,9 +569,34 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             )
             .await
         }
+        Request::ChatSend {
+            conversation_id,
+            message,
+        } => {
+            let llm_ready = ensure_remote_llm_model(state).await;
+            chat::handle_send(
+                &state.store,
+                &state.models,
+                conversation_id.as_deref(),
+                &message,
+                now_ms(),
+                llm_ready,
+            )
+            .await
+        }
+        Request::ChatList => chat::handle_list(&state.store),
+        Request::ChatHistory { conversation_id } => {
+            chat::handle_history(&state.store, &conversation_id)
+        }
+        Request::ChatDelete { conversation_id } => {
+            chat::handle_delete(&state.store, &conversation_id)
+        }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
             record_audio,
+            ui_language,
+            summary_language,
+            storage_limit_bytes,
             excluded_bundle_ids,
             llm_provider,
             llm_base_url,
@@ -503,12 +605,17 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         } => {
             update_settings(
                 state,
-                record_audio,
-                excluded_bundle_ids,
-                llm_provider,
-                llm_base_url,
-                llm_model,
-                llm_api_key,
+                SettingsPatch {
+                    record_audio,
+                    ui_language,
+                    summary_language,
+                    storage_limit_bytes,
+                    excluded_bundle_ids,
+                    llm_provider,
+                    llm_base_url,
+                    llm_model,
+                    llm_api_key,
+                },
             )
             .await
         }
@@ -755,6 +862,7 @@ fn current_settings(state: &AppState) -> AppSettings {
         model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
             .lock()
@@ -767,37 +875,101 @@ fn current_settings(state: &AppState) -> AppSettings {
             .api_key
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
+        ui_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
+        summary_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
+        language_options: afterray_protocol::summary_language_options(),
     }
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
-    let llm = current_llm_config(state);
-    save_persisted_settings(
-        &state.data_dir,
-        &PersistedSettings {
-            record_audio: state.capture.record_audio(),
-            excluded_bundle_ids: state
-                .excluded_bundle_ids
-                .lock()
-                .map(|ids| ids.clone())
-                .unwrap_or_default(),
-            llm_provider: llm.provider,
-            llm_base_url: llm.base_url,
-            llm_model: llm.model,
-            llm_api_key: llm.api_key.unwrap_or_default(),
-        },
-    )
+    save_persisted_settings(&state.data_dir, &persisted_settings(state))
 }
 
-async fn update_settings(
-    state: &Arc<AppState>,
+fn persisted_settings(state: &AppState) -> PersistedSettings {
+    let llm = current_llm_config(state);
+    PersistedSettings {
+        record_audio: state.capture.record_audio(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
+        excluded_bundle_ids: state
+            .excluded_bundle_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default(),
+        llm_provider: llm.provider,
+        llm_base_url: llm.base_url,
+        llm_model: llm.model,
+        llm_api_key: llm.api_key.unwrap_or_default(),
+        ui_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
+        summary_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
+    }
+}
+
+/// Every field a settings update may carry. Grouped so the handler keeps
+/// one parameter as the surface grows.
+struct SettingsPatch {
     record_audio: Option<bool>,
+    ui_language: Option<String>,
+    summary_language: Option<String>,
+    storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
-) -> Response {
+}
+
+async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
+    let SettingsPatch {
+        record_audio,
+        ui_language,
+        summary_language,
+        storage_limit_bytes,
+        excluded_bundle_ids,
+        llm_provider,
+        llm_base_url,
+        llm_model,
+        llm_api_key,
+    } = patch;
+    if ui_language.is_some() || summary_language.is_some() {
+        let mut pending = persisted_settings(state);
+        if let Some(value) = ui_language.clone() {
+            pending.ui_language = value;
+        }
+        if let Some(value) = summary_language.clone() {
+            pending.summary_language = value;
+        }
+        if let Ok(mut langs) = state.languages.lock() {
+            langs.0 = pending.ui_language.clone();
+            langs.1 = pending.summary_language.clone();
+        }
+        let _ = save_persisted_settings(&state.data_dir, &pending);
+    }
+    if let Some(bytes) = storage_limit_bytes {
+        let previous = state.store.storage_limit_bytes();
+        let mut pending = persisted_settings(state);
+        pending.storage_limit_bytes = bytes;
+        if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
+            return Response::failure(format!("could not save storage limit: {error}"));
+        }
+        if let Err(error) = state.store.set_storage_limit_bytes(bytes) {
+            let mut rollback = persisted_settings(state);
+            rollback.storage_limit_bytes = previous;
+            let _ = save_persisted_settings(&state.data_dir, &rollback);
+            return Response::failure(format!("could not apply storage limit: {error}"));
+        }
+    }
     if let Some(enabled) = record_audio {
         let previous = state.capture.record_audio();
         state.capture.set_record_audio(enabled);
@@ -918,13 +1090,7 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         HistoryScope::Today => local_calendar_day_bounds_ms(now),
         HistoryScope::All => (0, now),
     };
-    memory::flush(
-        &state.store,
-        &state.models,
-        &state.memories,
-        llm_is_ready(state),
-    )
-    .await;
+    memory::flush(&state.store, &state.memories);
     match state.store.delete_history(from_ms, to_ms) {
         Ok(deleted) => Response::success(serde_json::json!({
             "scope": scope,
@@ -956,7 +1122,7 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    memory::flush(&state.store, &state.models, &state.memories, llm_is_ready(state)).await;
+    memory::flush(&state.store, &state.memories);
     let _ = state
         .store
         .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
@@ -1204,14 +1370,11 @@ async fn import_artifact(
                 {
                     memory::observe_and_maybe_commit(
                         &state.store,
-                        &state.models,
                         &state.memories,
                         started_at_ms,
                         &moment_id,
                         &bytes,
-                        llm_is_ready(state),
-                    )
-                    .await;
+                    );
                 }
             } else {
                 eprintln!(
@@ -1341,6 +1504,102 @@ fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     hits
 }
 
+/// Runs the T2 pass: T1 card → configured model → parsed card.
+///
+/// Goes through `ModelQueue` like every other inference, so the builtin
+/// GGUF worker, Ollama and any OpenAI-compatible endpoint are all reachable
+/// by switching settings alone. Emits `slot.t2` carrying the same
+/// `slot_start_ms` as the `slot.t1` line, so a card's full history is
+/// recoverable from the log.
+async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
+    let started = std::time::Instant::now();
+    let prompt = match slot_prompt_for(state, at_ms) {
+        Ok(value) => value,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    let slot_start_ms = prompt
+        .get("slot_start_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(at_ms);
+    let user = prompt
+        .get("user")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let system = prompt
+        .get("system")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    ensure_remote_llm_model(state).await;
+    let job_id = match state
+        .models
+        .submit(ModelInput::Llm {
+            prompt: user.clone(),
+            system: Some(system),
+        })
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    let snapshot = match state.models.wait(&job_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::failure(error.to_string()),
+    };
+    if snapshot.state != JobState::Done {
+        return Response::failure(
+            snapshot
+                .last_error
+                .unwrap_or_else(|| "t2 job did not complete".to_owned()),
+        );
+    }
+    let Some(afterray_models::ModelOutput::Llm { text: raw }) = snapshot.output else {
+        return Response::failure("t2 job returned a non-text output");
+    };
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let parsed = afterray_store::parse_t2_card(&raw);
+    let card_value = parsed.as_ref().and_then(|card| serde_json::to_value(card).ok());
+    eprintln!(
+        "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
+         parsed={}",
+        snapshot.adapter,
+        user.chars().count(),
+        raw.chars().count(),
+        parsed.is_some(),
+    );
+
+    if let Some(t2) = parsed.as_ref() {
+        match slot_card_for(state, at_ms) {
+            Ok(card) => {
+                if let Err(error) = state.store.put_t2_summary(
+                    &card,
+                    t2,
+                    &snapshot.adapter,
+                    now_ms(),
+                    i64::try_from(latency_ms).ok(),
+                ) {
+                    eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}");
+            }
+        }
+    }
+
+    Response::success(serde_json::json!({
+        "slot_start_ms": slot_start_ms,
+        "model": snapshot.adapter,
+        "latency_ms": latency_ms,
+        "prompt_chars": user.chars().count(),
+        "card": card_value,
+        "raw": raw,
+    }))
+}
+
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     let text = match state.store.session_text(session_id) {
         Ok(text) if !text.is_empty() => text,
@@ -1371,6 +1630,75 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
         ),
         Err(error) => Response::failure(error.to_string()),
     }
+}
+
+/// Builds the T1 card and records what it was derived from.
+///
+/// The log line is the audit trail for the T1 half of a card: which slot, how
+/// many moments went in, what the gate decided, and which map entries a T2
+/// agent will see. Pair it with the `slot.t2` line emitted by the summariser
+/// to reconstruct a card's full history.
+fn slot_card_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<afterray_store::SlotCard, afterray_store::StoreError> {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let card = state.store.slot_card(at_ms, interval_ms)?;
+    let (run_count, gap_count, dedup_chars) = card.timeline.iter().fold(
+        (0_usize, 0_usize, 0_usize),
+        |(runs, gaps, chars), entry| match entry {
+            afterray_store::TimelineEntry::Run(run) => (runs + 1, gaps, chars + run.total_chars),
+            afterray_store::TimelineEntry::Gap(_) => (runs, gaps + 1, chars),
+        },
+    );
+    eprintln!(
+        "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} switches={} idle={:.2} \
+         runs={run_count} gaps={gap_count} revisits={} dedup_chars={dedup_chars} theme={:?}",
+        card.slot_start_ms,
+        card.local_day,
+        card.state,
+        card.facts.moment_count,
+        card.facts.ocr_moment_count,
+        card.facts.ax_moment_count,
+        card.facts.switch_count,
+        card.facts.idle_ratio,
+        card.revisits.len(),
+        card.theme_key.as_deref().unwrap_or("-"),
+    );
+    Ok(card)
+}
+
+/// Renders the full T2 prompt: system instructions plus the JSON card view.
+/// `prev_cards` will carry neighbouring T2 titles once slot summaries are
+/// persisted; until then it is empty.
+fn slot_prompt_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<serde_json::Value, afterray_store::StoreError> {
+    let card = slot_card_for(state, at_ms)?;
+    let stored = state
+        .languages
+        .lock()
+        .map_or_else(|_| default_language(), |langs| langs.1.clone());
+    let language = resolve_summary_language(&stored);
+    let prev_cards = state
+        .store
+        .previous_slot_titles(card.slot_start_ms, 3)
+        .unwrap_or_default();
+    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language);
+    eprintln!(
+        "slot.prompt slot={} language={language} user_chars={}",
+        card.slot_start_ms,
+        user.chars().count()
+    );
+    Ok(serde_json::json!({
+        "slot_start_ms": card.slot_start_ms,
+        "slot_end_ms": card.slot_end_ms,
+        "local_day": card.local_day,
+        "state": card.state,
+        "system": afterray_store::T2_SYSTEM_PROMPT,
+        "user": user,
+    }))
 }
 
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
@@ -1580,12 +1908,19 @@ mod tests {
         assert_eq!(clear_stale_capture_files(directory.path()).unwrap(), 0);
     }
 
+    #[test]
+    fn legacy_settings_default_to_one_hundred_gigabytes() {
+        let settings: PersistedSettings =
+            serde_json::from_str(r#"{"record_audio":false}"#).unwrap();
+        assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
     fn test_vault() -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )
