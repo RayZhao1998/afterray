@@ -21,7 +21,7 @@ const en = {
     download: 'Download',
   },
   hero: {
-    eyebrow: 'LOCAL-FIRST AI MEMORY — macOS',
+    eyebrow: 'AFTERRAY — LOCAL-FIRST AI MEMORY',
     titleA: ['Total ', { em: 'recall.' }] as Part[],
     titleB: [{ em: 'Zero' }, ' upload.'] as Part[],
     sub: 'AfterRay records what you see and hear on your Mac, and turns it into memory you can rewind, search, and build on — with AI that runs entirely on-device. No cloud. No account. No exceptions.',
@@ -219,7 +219,7 @@ const zh: Copy = {
     download: '下载',
   },
   hero: {
-    eyebrow: 'LOCAL-FIRST AI MEMORY — macOS',
+    eyebrow: 'AFTERRAY — LOCAL-FIRST AI MEMORY',
     titleA: ['记住', { em: '一切。' }],
     titleB: ['止于', { em: '本机。' }],
     sub: 'AfterRay 持续记录你在 Mac 上看到与听到的一切，由完全在本机运行的 AI 整理成可回溯、可检索、可沉淀的记忆。无云端，无账号，无例外。',
