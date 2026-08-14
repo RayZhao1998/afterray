@@ -113,6 +113,18 @@ public struct DaySummaryRowText: Equatable, Sendable {
     public let time: String
     public let primary: String
     public let isT2: Bool
+    /// Why this row is showing raw activity instead of a summary. Nil once a
+    /// model has written a card. Without it a fallback row reads as if the
+    /// half hour genuinely amounted to "Zed 14m · Chrome 9m", when in fact
+    /// nothing has looked at it yet.
+    public let badge: String?
+
+    public init(time: String, primary: String, isT2: Bool, badge: String? = nil) {
+        self.time = time
+        self.primary = primary
+        self.isT2 = isT2
+        self.badge = badge
+    }
 }
 
 /// Slot grouping, highlight, and row copy — kept pure so Visual Lab and
@@ -222,6 +234,26 @@ public enum DaySummaryLayout {
         if let title = slot.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
             return DaySummaryRowText(time: time, primary: title, isT2: true)
         }
-        return DaySummaryRowText(time: time, primary: factLine(apps: slot.facts.apps), isT2: false)
+        return DaySummaryRowText(
+            time: time,
+            primary: factLine(apps: slot.facts.apps),
+            isT2: false,
+            badge: fallbackBadge(state: slot.state)
+        )
+    }
+
+    /// Names the reason a row has no summary. "Not summarised" and "Summary
+    /// failed" are different situations — one is waiting its turn, the other
+    /// needs the model looked at — and a row that was deliberately skipped
+    /// should not claim to be pending forever.
+    static func fallbackBadge(state: String) -> String? {
+        switch state {
+        case "failed": "Summary failed"
+        case "skipped_idle": "Idle"
+        case "paused": "Capture paused"
+        case "asleep": "Asleep"
+        case "no_data": nil
+        default: "Not summarised"
+        }
     }
 }

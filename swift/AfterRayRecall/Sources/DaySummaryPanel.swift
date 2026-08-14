@@ -122,12 +122,24 @@ private struct DaySummaryRow: View {
                     .monospacedDigit()
                     .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
                     .frame(width: 42, alignment: .leading)
-                Text(text.primary)
-                    .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
-                    .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.56))
-                    .multilineTextAlignment(.leading)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(text.primary)
+                        .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
+                        .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.56))
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if let badge = text.badge {
+                        Text(badge)
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .foregroundStyle(badgeTint(badge).opacity(0.9))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(badgeTint(badge).opacity(0.14), in: Capsule())
+                            .accessibilityLabel("Summary status: \(badge)")
+                    }
+                }
             }
             .padding(.leading, 12)
             .padding(.trailing, 12)
@@ -149,6 +161,13 @@ private struct DaySummaryRow: View {
         .padding(.horizontal, 6)
         .onHover { isHovering = $0 }
         .help(text.primary)
+    }
+
+    /// A failure is the only badge worth a warm colour — it is the one the user
+    /// can act on. The rest are states, not problems, and should not compete
+    /// with the summarised rows for attention.
+    private func badgeTint(_ badge: String) -> Color {
+        badge == "Summary failed" ? RecallPalette.ray : .white.opacity(0.5)
     }
 
     private var rowFill: Color {

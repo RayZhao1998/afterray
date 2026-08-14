@@ -121,6 +121,7 @@ private func chromeScene(
                 onOpenSettings: {},
                 recordingState: .recording,
                 onToggleRecording: {},
+                daySummary: .mockRich(around: playheadMs),
                 searchSession: session,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader

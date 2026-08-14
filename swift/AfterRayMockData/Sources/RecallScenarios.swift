@@ -120,7 +120,7 @@ public extension DaySummary {
                 DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 1_320_000),
                 DayAppFact(name: "Terminal", bundleIdentifier: "com.apple.Terminal", ms: 360_000),
             ]),
-            (current - slot, nil, "degraded", [
+            (current - slot, nil, "failed", [
                 DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 900_000),
                 DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 600_000),
             ]),
@@ -131,7 +131,7 @@ public extension DaySummary {
                 DayAppFact(name: "Terminal", bundleIdentifier: "com.apple.Terminal", ms: 840_000),
                 DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 720_000),
             ]),
-            (current + 2 * slot, nil, "degraded", [
+            (current + 2 * slot, nil, "skipped_idle", [
                 DayAppFact(name: "Figma", bundleIdentifier: "com.figma.Desktop", ms: 1_200_000),
             ]),
             (current + 3 * slot, "Visual Lab pass on the day panel", "other", [
@@ -148,7 +148,9 @@ public extension DaySummary {
             DaySlotSummary(
                 slotStartMs: start,
                 slotEndMs: start + slot,
-                state: title == nil ? "degraded" : "done",
+                // Untitled rows carry their reason in the category slot, so the
+                // lab shows every badge the panel can render, not just one.
+                state: title == nil ? category : "done",
                 facts: DaySlotFacts(apps: apps, momentCount: 12),
                 title: title,
                 bullets: title.map { ["\($0)"] },

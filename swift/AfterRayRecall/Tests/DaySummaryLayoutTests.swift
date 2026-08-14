@@ -69,6 +69,32 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertEqual(DaySummaryLayout.factLine(apps: []), "Quiet — nothing on screen")
     }
 
+    /// A fallback row shows an app list, which reads exactly like a finished
+    /// summary of a shallow half hour. The badge is the only thing separating
+    /// "nothing has read this yet" from "this is all there was".
+    func testUnsummarisedRowsSaySo() {
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let pending = DaySummaryLayout.rowText(slot: slot(start: 0, title: nil), timeZone: utc)
+        XCTAssertEqual(pending.badge, "Not summarised")
+
+        let summarised = DaySummaryLayout.rowText(
+            slot: slot(start: 0, title: "Chased a GOP header bug"),
+            timeZone: utc
+        )
+        XCTAssertNil(summarised.badge, "a summarised row must not be labelled pending")
+    }
+
+    /// Waiting its turn, needing attention, and deliberately skipped are three
+    /// different things; collapsing them would tell the user to go look at a
+    /// model that is working fine.
+    func testEachFallbackReasonIsNamedDistinctly() {
+        XCTAssertEqual(DaySummaryLayout.fallbackBadge(state: "degraded"), "Not summarised")
+        XCTAssertEqual(DaySummaryLayout.fallbackBadge(state: "failed"), "Summary failed")
+        XCTAssertEqual(DaySummaryLayout.fallbackBadge(state: "skipped_idle"), "Idle")
+        XCTAssertEqual(DaySummaryLayout.fallbackBadge(state: "paused"), "Capture paused")
+        XCTAssertNil(DaySummaryLayout.fallbackBadge(state: "no_data"))
+    }
+
     func testTodayHeadingUsesTodayKicker() {
         let now = Int64(1_786_698_000_000)
         let bounds = DaySummaryLayout.dayBounds(ms: now, timeZone: shanghai)
