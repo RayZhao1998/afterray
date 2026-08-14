@@ -21,6 +21,15 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var logDirectoryPath: String { get }
     var logFilePath: String { get }
     var recentJobs: [ModelJob] { get }
+    var llmProbe: LlmEndpointStatus? { get }
+    var isProbingLlm: Bool { get }
+    var isUpdatingLlm: Bool { get }
+    var draftLlmBaseUrl: String { get set }
+    var draftLlmModel: String { get set }
+    var draftLlmApiKey: String { get set }
+    var cliStatus: String { get }
+    var isInstallingCli: Bool { get }
+    var cliInstalled: Bool { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -32,6 +41,10 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func download(packID: String?) async
     func revealLogs()
     func copyDiagnostics()
+    func setLlmProvider(_ provider: LlmProvider) async
+    func saveLlmConnection() async
+    func probeLlm() async
+    func installCli() async
 }
 
 public struct AfterRayStorageSnapshot: Equatable, Sendable {
@@ -142,6 +155,17 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// One line under the page title. Replaces the loose paragraphs that used
+    /// to float above the first card on every page.
+    var summary: String {
+        switch self {
+        case .general: "How you open AfterRay, what it captures, and how much room it takes."
+        case .models: "Pick where Ask runs, and manage on-device model packs."
+        case .advanced: "Capture cadence and where AfterRay keeps its files."
+        case .diagnostics: "Logs and a copyable report for bug reports."
+        }
+    }
+
     var icon: String {
         switch self {
         case .general: "slider.horizontal.3"
@@ -161,8 +185,80 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+// MARK: - Design tokens
+
+/// One place for the panel's geometry. Nested radii stay concentric:
+/// `panel 14 → card 10 → control 6`, each one step in from its parent's inset.
+private enum SettingsMetrics {
+    static let panelWidth: CGFloat = 820
+    static let panelHeight: CGFloat = 620
+    static let panelRadius: CGFloat = 14
+    static let sidebarWidth: CGFloat = 204
+    static let gutter: CGFloat = 24
+    static let sectionGap: CGFloat = 22
+    static let cardRadius: CGFloat = 10
+    static let controlRadius: CGFloat = 6
+    static let rowInset: CGFloat = 14
+    static let rowMinHeight: CGFloat = 46
+}
+
+private enum SettingsPalette {
+    static let accent = RecallPalette.ray
+    static let panel = Color(red: 0.055, green: 0.052, blue: 0.060)
+    static let sidebar = Color.black.opacity(0.24)
+
+    static let label = Color.white.opacity(0.94)
+    static let secondaryLabel = Color.white.opacity(0.60)
+    static let tertiaryLabel = Color.white.opacity(0.40)
+
+    static let cardFill = Color.white.opacity(0.042)
+    static let cardStroke = Color.white.opacity(0.070)
+    static let separator = Color.white.opacity(0.055)
+
+    static let controlFill = Color.white.opacity(0.075)
+    static let controlHover = Color.white.opacity(0.115)
+    static let controlStroke = Color.white.opacity(0.085)
+
+    static let positive = Color(red: 0.40, green: 0.83, blue: 0.55)
+    static let warning = Color(red: 0.98, green: 0.74, blue: 0.34)
+    static let danger = Color(red: 1.0, green: 0.42, blue: 0.34)
+}
+
+private extension Font {
+    static let settingsPageTitle = Font.system(size: 21, weight: .semibold)
+    static let settingsSectionTitle = Font.system(size: 11, weight: .semibold)
+    static let settingsRowTitle = Font.system(size: 13, weight: .medium)
+    static let settingsRowSubtitle = Font.system(size: 11)
+    static let settingsBody = Font.system(size: 12)
+    static let settingsCaption = Font.system(size: 11)
+    static let settingsControl = Font.system(size: 12, weight: .medium)
+    static let settingsFieldLabel = Font.system(size: 10, weight: .medium)
+    static let settingsMono = Font.system(size: 11.5, design: .monospaced)
+    static let settingsStat = Font.system(size: 19, weight: .semibold, design: .rounded)
+    static let settingsPill = Font.system(size: 10.5, weight: .semibold)
+}
+
+private enum SettingsTone {
+    case neutral
+    case positive
+    case warning
+    case danger
+
+    var color: Color {
+        switch self {
+        case .neutral: SettingsPalette.secondaryLabel
+        case .positive: SettingsPalette.positive
+        case .warning: SettingsPalette.warning
+        case .danger: SettingsPalette.danger
+        }
+    }
+}
+
+// MARK: - Panel
+
 public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ObservedObject var model: Model
+    @ObservedObject private var hotKeys = RecallHotKeyStore.shared
     let onClose: () -> Void
     @State private var page: AfterRaySettingsPage
     @State private var copied = false
@@ -180,208 +276,301 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     public var body: some View {
         HStack(spacing: 0) {
             sidebar
-            pageContent
-        }
-        .frame(width: 760, height: 570)
-        .background(Color(red: 0.052, green: 0.050, blue: 0.056))
-        .preferredColorScheme(.dark)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(alignment: .top) {
             Rectangle()
-                .fill(RecallPalette.ray.opacity(0.9))
-                .frame(height: 2)
+                .fill(SettingsPalette.separator)
+                .frame(width: 1)
+            pageColumn
+        }
+        .frame(width: SettingsMetrics.panelWidth, height: SettingsMetrics.panelHeight)
+        .background(SettingsPalette.panel)
+        .preferredColorScheme(.dark)
+        .clipShape(RoundedRectangle(cornerRadius: SettingsMetrics.panelRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: SettingsMetrics.panelRadius, style: .continuous)
+                .strokeBorder(.white.opacity(0.09), lineWidth: 1)
         }
         .task { await model.refresh() }
     }
 
+    // MARK: Sidebar
+
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("Settings")
-                    .font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(SettingsPressStyle())
-                .help("Close settings")
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 9) {
+                Rectangle()
+                    .fill(SettingsPalette.accent)
+                    .frame(width: 16, height: 2)
+                Text("AFTERRAY")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(1.1)
+                    .foregroundStyle(SettingsPalette.accent)
             }
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 10)
+            .padding(.top, 6)
 
             VStack(spacing: 2) {
                 ForEach(AfterRaySettingsPage.allCases) { item in
-                    sidebarRow(item)
-                }
-            }
-            Spacer()
-        }
-        .padding(14)
-        .frame(width: 196)
-        .background(Color.black.opacity(0.22))
-    }
-
-    private func sidebarRow(_ item: AfterRaySettingsPage) -> some View {
-        let selected = page == item
-        return Button {
-            page = item
-        } label: {
-            HStack(spacing: 9) {
-                Image(systemName: selected ? item.selectedIcon : item.icon)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(selected ? .white : .white.opacity(0.55))
-                    .frame(width: 16)
-                Text(item.title)
-                    .font(.system(size: 13, weight: selected ? .semibold : .regular))
-                    .foregroundStyle(selected ? .white : .white.opacity(0.72))
-                Spacer(minLength: 0)
-                if item == .models, missingRequiredCount > 0 {
-                    Text("\(missingRequiredCount)")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 6)
-                        .frame(height: 16)
-                        .background(.white.opacity(0.14), in: Capsule())
-                }
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 32)
-            .background(
-                selected ? Color.white.opacity(0.075) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-            )
-            .overlay(alignment: .leading) {
-                if selected {
-                    Rectangle()
-                        .fill(RecallPalette.ray)
-                        .frame(width: 2, height: 18)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(SettingsPressStyle())
-    }
-
-    private var missingRequiredCount: Int {
-        model.library?.packs.filter { $0.required && !$0.present }.count ?? 0
-    }
-
-    private var pageContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text("AFTERRAY / SETTINGS")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .tracking(1.2)
-                    .foregroundStyle(RecallPalette.ray)
-                Text(page.title)
-                    .font(.system(size: 23, weight: .semibold))
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 22)
-            .padding(.bottom, 16)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
-                    switch page {
-                    case .general:
-                        captureSection
-                        storageSection
-                    case .models:
-                        modelsSection
-                    case .advanced:
-                        advancedSection
-                    case .diagnostics:
-                        diagnosticsSection
-                    }
-                    if let message = model.message {
-                        Text(message)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                    SettingsSidebarRow(
+                        page: item,
+                        isSelected: page == item,
+                        badge: item == .models ? missingRequiredCount : 0
+                    ) {
+                        page = item
                     }
                 }
-                .padding(.horizontal, 28)
-                .padding(.bottom, 28)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(width: SettingsMetrics.sidebarWidth, alignment: .leading)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(SettingsPalette.sidebar)
+    }
+
+    // MARK: Page column
+
+    @ViewBuilder
+    private var pageSections: some View {
+        VStack(alignment: .leading, spacing: SettingsMetrics.sectionGap) {
+            switch page {
+            case .general: generalPage
+            case .models: modelsPage
+            case .advanced: advancedPage
+            case .diagnostics: diagnosticsPage
+            }
+        }
+        .padding(.horizontal, SettingsMetrics.gutter)
+        .padding(.bottom, 24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var pageColumn: some View {
+        VStack(spacing: 0) {
+            header
+            ScrollView { pageSections }
+            statusBar
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(.easeOut(duration: 0.16), value: model.message)
     }
 
-    private var captureSection: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            SettingsGroup(title: "Capture") {
-                SettingsRow(
-                    title: "Record audio",
-                    subtitle: "System audio and microphone for transcripts. Already-saved recordings stay in the vault."
-                ) {
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(page.title)
+                    .font(.settingsPageTitle)
+                    .foregroundStyle(SettingsPalette.label)
+                Text(page.summary)
+                    .font(.settingsBody)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            HStack(spacing: 6) {
+                if model.isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 28, height: 28)
+                } else {
+                    SettingsIconButton(symbol: "arrow.clockwise", help: "Refresh") {
+                        Task { await model.refresh() }
+                    }
+                }
+                SettingsIconButton(symbol: "xmark", help: "Close settings", action: onClose)
+            }
+        }
+        .padding(.horizontal, SettingsMetrics.gutter)
+        .padding(.top, 20)
+        .padding(.bottom, 16)
+    }
+
+    /// Pinned under the scroll view so a message never reflows the page.
+    @ViewBuilder
+    private var statusBar: some View {
+        if let message = model.message, !message.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    .padding(.top, 1)
+                Text(message)
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, SettingsMetrics.gutter)
+            .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.black.opacity(0.22))
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(SettingsPalette.separator)
+                    .frame(height: 1)
+            }
+            .transition(.opacity)
+        }
+    }
+
+    // MARK: General
+
+    @ViewBuilder
+    private var generalPage: some View {
+        SettingsSection(
+            title: "Opening AfterRay",
+            footnote: hotKeys.failure
+                ?? hotKeys.hotKey.systemConflictNote
+                ?? "Press it from any app to bring your timeline back."
+        ) {
+            SettingsRow(
+                title: "Global shortcut",
+                subtitle: hotKeys.isRecording
+                    ? "Listening — press the keys you want, or esc to keep the current one."
+                    : "Click the keys to record a new combination."
+            ) {
+                HStack(spacing: 8) {
+                    if !hotKeys.isDefault, !hotKeys.isRecording {
+                        Button("Reset") { hotKeys.restoreDefault() }
+                            .buttonStyle(SettingsButtonStyle())
+                    }
+                    RecallHotKeyField(store: hotKeys, size: .compact)
+                }
+            }
+        }
+
+        SettingsSection(title: "Capture") {
+            SettingsRow(
+                title: "Record audio",
+                subtitle: "System audio and microphone for transcripts. Recordings already in the vault stay."
+            ) {
+                HStack(spacing: 8) {
+                    if model.isUpdatingAudio {
+                        ProgressView().controlSize(.mini)
+                    }
                     Toggle("", isOn: Binding(
                         get: { model.recordAudio },
                         set: { enabled in Task { await model.setRecordAudio(enabled) } }
                     ))
                     .toggleStyle(.switch)
+                    .controlSize(.small)
                     .labelsHidden()
                     .disabled(model.isUpdatingAudio)
                 }
             }
+        }
 
-            SettingsGroup(title: "Excluded apps") {
-                VStack(spacing: 0) {
-                    if model.excludedBundleIds.isEmpty {
-                        SettingsRow(
-                            title: "None excluded",
-                            subtitle: "AfterRay records the frontmost app unless you exclude it."
-                        ) {
-                            EmptyView()
+        SettingsSection(
+            title: "Excluded apps",
+            footnote: "AfterRay skips a moment when an excluded app is in front."
+        ) {
+            if model.excludedBundleIds.isEmpty {
+                // Empty state carries the action itself: a lone footer bar under
+                // an empty row leaves a separator floating over dead space.
+                SettingsRow(
+                    title: "Nothing excluded",
+                    subtitle: "Every app you use is captured."
+                ) {
+                    excludeFrontmostButton
+                }
+            } else {
+                ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
+                    if index > 0 { SettingsSeparator() }
+                    let name = appName(for: bundleID)
+                    SettingsRow(title: name, subtitle: name == bundleID ? nil : bundleID) {
+                        Button("Include") {
+                            Task { await model.includeBundle(bundleID) }
                         }
-                    } else {
-                        ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
-                            if index > 0 {
-                                Divider().overlay(Color.white.opacity(0.06))
-                            }
-                            SettingsRow(
-                                title: appName(for: bundleID),
-                                subtitle: bundleID
-                            ) {
-                                Button("Include") {
-                                    Task { await model.includeBundle(bundleID) }
-                                }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.7))
-                                .disabled(model.isUpdatingExclusions)
-                            }
-                        }
+                        .buttonStyle(SettingsButtonStyle())
+                        .disabled(model.isUpdatingExclusions)
                     }
                 }
-                HStack {
-                    Spacer()
-                    Button("Exclude Frontmost App") {
-                        Task { await model.excludeFrontmostApp() }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
-                    .disabled(model.isUpdatingExclusions)
-                }
-                .padding(.top, 10)
+                SettingsSeparator()
+                SettingsFooterBar { excludeFrontmostButton }
             }
+        }
 
-            SettingsGroup(title: "Delete history") {
-                HStack(spacing: 16) {
+        storageSection
+
+        SettingsSection(
+            title: "Delete history",
+            footnote: "Deleted moments are removed from this Mac and cannot be recovered."
+        ) {
+            SettingsRow(
+                title: "Remove captured moments",
+                subtitle: "Pick a range to delete from the vault."
+            ) {
+                HStack(spacing: 7) {
                     Button("Last hour") { Task { await model.clearHistory(.lastHour) } }
+                        .buttonStyle(SettingsButtonStyle())
                     Button("Today") { Task { await model.clearHistory(.today) } }
+                        .buttonStyle(SettingsButtonStyle())
                     Button("Everything") { Task { await model.clearHistory(.all) } }
-                    Spacer()
+                        .buttonStyle(SettingsButtonStyle(kind: .destructive))
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.7))
                 .disabled(model.isClearingHistory)
             }
         }
+    }
+
+    private var excludeFrontmostButton: some View {
+        Button("Exclude Frontmost App") {
+            Task { await model.excludeFrontmostApp() }
+        }
+        .buttonStyle(SettingsButtonStyle())
+        .disabled(model.isUpdatingExclusions)
+    }
+
+    private var storageSection: some View {
+        SettingsSection(title: "Storage", contentPadding: 16) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .firstTextBaseline) {
+                    storageStat("AfterRay uses", AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
+                    Spacer(minLength: 12)
+                    storageStat(
+                        "Free on disk",
+                        AfterRayStorageSnapshot.byteCount(model.storage.volumeFree),
+                        align: .trailing
+                    )
+                }
+                StorageCompositionBar(segments: storageSegments)
+                VStack(spacing: 7) {
+                    ForEach(storageSegments) { segment in
+                        storageLegend(segment)
+                    }
+                }
+                Text(model.storage.diskShareText)
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+            }
+        }
+    }
+
+    /// AfterRay's own footprint, not the whole volume: at ~0.2% of a 1 TB disk
+    /// a whole-disk bar renders as an invisible hairline.
+    private var storageSegments: [StorageSegment] {
+        [
+            StorageSegment(
+                id: "memories",
+                title: "Memories",
+                bytes: model.storage.vaultBytes,
+                color: SettingsPalette.accent
+            ),
+            StorageSegment(
+                id: "models",
+                title: "Models",
+                bytes: model.storage.modelBytes,
+                color: SettingsPalette.accent.opacity(0.58)
+            ),
+            StorageSegment(
+                id: "runtime",
+                title: "Runtime",
+                bytes: model.storage.runtimeBytes,
+                color: SettingsPalette.accent.opacity(0.32)
+            ),
+        ]
+        .filter { $0.bytes > 0 }
     }
 
     private func appName(for bundleID: String) -> String {
@@ -391,199 +580,278 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         return bundleID
     }
 
-    private var storageSection: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            SettingsGroup(title: "This disk") {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(alignment: .firstTextBaseline) {
-                        storageStat("AfterRay uses", AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
-                        Spacer()
-                        storageStat(
-                            "Still free",
-                            AfterRayStorageSnapshot.byteCount(model.storage.volumeFree),
-                            align: .trailing
-                        )
-                    }
-                    StorageDiskBar(snapshot: model.storage)
-                    VStack(alignment: .leading, spacing: 7) {
-                        storageLegend("AfterRay", model.storage.afterrayBytes, StorageDiskBar.afterrayColor)
-                        storageLegend("Other files on this disk", model.storage.otherBytes, StorageDiskBar.otherColor)
-                        storageLegend("Free space", model.storage.volumeFree, StorageDiskBar.freeColor)
-                    }
-                    Text(model.storage.diskShareText)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(16)
-            }
+    // MARK: Models
 
-            SettingsGroup(title: "Inside AfterRay") {
-                VStack(spacing: 0) {
-                    storageLine("Memories", model.storage.vaultBytes)
-                    Divider().overlay(Color.white.opacity(0.06))
-                    storageLine("Models", model.storage.modelBytes)
-                    Divider().overlay(Color.white.opacity(0.06))
-                    storageLine("Runtime", model.storage.runtimeBytes)
+    @ViewBuilder
+    private var modelsPage: some View {
+        SettingsSection(
+            title: "Assistant source",
+            footnote: providerFootnote,
+            contentPadding: 14
+        ) {
+            VStack(alignment: .leading, spacing: 14) {
+                Picker("Assistant source", selection: llmProviderBinding) {
+                    ForEach(LlmProvider.allCases) { provider in
+                        Text(provider.title).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(model.isUpdatingLlm)
+                llmProviderPanel
+            }
+        }
+
+        SettingsSection(title: "Model packs") {
+            SettingsRow(title: "On-device OCR", subtitle: "Apple Vision") {
+                SettingsPill("Built in", tone: .neutral)
+            }
+            if let library = model.library {
+                ForEach(library.packs) { pack in
+                    SettingsSeparator()
+                    modelPackRow(pack)
+                }
+            } else if model.message == nil {
+                SettingsSeparator()
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Reading the model folder…")
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Spacer()
+                }
+                .padding(.horizontal, SettingsMetrics.rowInset)
+                .padding(.vertical, 14)
+            }
+            SettingsSeparator()
+            packsFooter
+        }
+
+        if !model.recentJobs.isEmpty {
+            SettingsSection(title: "Recent inference") {
+                ForEach(Array(model.recentJobs.enumerated()), id: \.element.id) { index, job in
+                    if index > 0 { SettingsSeparator() }
+                    SettingsRow(title: jobTitle(job), subtitle: jobSubtitle(job)) {
+                        SettingsPill(jobStateLabel(job.state), tone: jobTone(job.state))
+                    }
                 }
             }
-
-            HStack(spacing: 16) {
-                Button("Show Vault") { model.reveal(model.dataDirectoryPath) }
-                Button("Show Models") { model.reveal(model.modelDirectoryPath) }
-                Spacer()
-                Button("Refresh") { Task { await model.refresh() } }
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(.white.opacity(0.7))
         }
     }
 
-    private var modelsSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("The Qwen3.8 assistant pack powers overlay Q&A. Capture, OCR, and search still work if it is missing.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if model.downloadingID != nil, let status = model.downloadStatus {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(status)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                        Spacer()
-                        if let percent = percentLabel(model.downloadProgress) {
-                            Text(percent)
-                                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.82))
-                                .monospacedDigit()
-                        }
-                    }
-                    ProgressView(value: model.downloadProgress ?? 0)
-                        .progressViewStyle(.linear)
-                }
-            }
-
-            if !model.recentJobs.isEmpty {
-                SettingsGroup(title: "Recent inference") {
-                    VStack(spacing: 0) {
-                        ForEach(Array(model.recentJobs.enumerated()), id: \.element.id) { index, job in
-                            if index > 0 {
-                                Divider().overlay(Color.white.opacity(0.06))
-                            }
-                            SettingsRow(
-                                title: jobTitle(job),
-                                subtitle: jobSubtitle(job)
-                            ) {
-                                Text(jobStateLabel(job.state))
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(job.state == "done" ? Color.secondary : Color.white.opacity(0.78))
-                            }
-                        }
+    @ViewBuilder
+    private var packsFooter: some View {
+        if model.downloadingID != nil, let status = model.downloadStatus {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(status)
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if let percent = percentLabel(model.downloadProgress) {
+                        Text(percent)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(SettingsPalette.label)
+                            .monospacedDigit()
                     }
                 }
+                ProgressView(value: model.downloadProgress ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(SettingsPalette.accent)
             }
-
-            SettingsGroup(title: nil) {
-                VStack(spacing: 0) {
-                    SettingsRow(title: "On-device OCR", subtitle: "Apple Vision") {
-                        Text("Built in")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let library = model.library {
-                        ForEach(library.packs) { pack in
-                            Divider().overlay(Color.white.opacity(0.06))
-                            modelPackRow(pack)
-                        }
-                    } else if model.message == nil {
-                        ProgressView().controlSize(.small).padding(16)
-                    }
-                }
-            }
-
-            HStack {
-                Spacer()
-                Button(model.downloadingID == "all" ? "Downloading…" : "Download Missing") {
+            .padding(.horizontal, SettingsMetrics.rowInset)
+            .padding(.vertical, 12)
+        } else {
+            SettingsFooterBar {
+                Button(missingPackCount > 0 ? "Download Missing (\(missingPackCount))" : "All Packs Installed") {
                     Task { await model.download(packID: nil) }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(RecallPalette.ray.opacity(0.88))
-                .controlSize(.small)
-                .disabled(model.downloadingID != nil || missingRequiredCount == 0)
+                .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                .disabled(model.downloadingID != nil || missingPackCount == 0)
             }
         }
     }
 
-    private var advancedSection: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            SettingsGroup(title: "Capture speed") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Picker("Capture speed", selection: .constant(AfterRayCaptureSpeedPlaceholder.fast)) {
-                        ForEach(AfterRayCaptureSpeedPlaceholder.allCases) { speed in
-                            Text(speed.label).tag(speed)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(true)
-                    Text("Fast is the current default: a still every 10 seconds.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+    private var missingRequiredCount: Int {
+        model.library?.packs.filter { $0.required && !$0.present }.count ?? 0
+    }
+
+    /// Every absent pack, optional ones included: the daemon downloads those
+    /// too, so gating the button on required-only packs left it dead.
+    private var missingPackCount: Int {
+        model.library?.packs.filter { !$0.present }.count ?? 0
+    }
+
+    private var providerFootnote: String {
+        switch model.settings?.llmProvider ?? .builtin {
+        case .builtin:
+            "Downloads Qwen3.6-27B Q4 (~17 GB) and runs it on this Mac. Capture keeps working without it."
+        case .ollama:
+            "AfterRay talks to Ollama over HTTP on this Mac. Nothing leaves the machine."
+        case .openaiCompatible:
+            "Any server that speaks OpenAI chat completions. Use this for a hosted Qwen 3.7."
+        }
+    }
+
+    private var llmProviderBinding: Binding<LlmProvider> {
+        Binding(
+            get: { model.settings?.llmProvider ?? .builtin },
+            set: { provider in
+                Task { await model.setLlmProvider(provider) }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var llmProviderPanel: some View {
+        switch model.settings?.llmProvider ?? .builtin {
+        case .builtin:
+            EmptyView()
+        case .ollama:
+            ollamaPanel
+        case .openaiCompatible:
+            openaiPanel
+        }
+    }
+
+    private var ollamaPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.llmProbe?.reachable == true
+                        ? SettingsPalette.positive
+                        : SettingsPalette.tertiaryLabel)
+                    .frame(width: 6, height: 6)
+                Text(ollamaStatusText)
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                if model.isProbingLlm {
+                    ProgressView().controlSize(.mini)
                 }
-                .padding(16)
+                Button("Check Again") {
+                    Task { await model.probeLlm() }
+                }
+                .buttonStyle(SettingsButtonStyle())
+                .disabled(model.isProbingLlm)
             }
 
-            SettingsGroup(title: "Vault") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(model.dataDirectoryPath)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    HStack {
-                        Button("Open in Finder") { model.reveal(model.dataDirectoryPath) }
-                        Button("Change Location…") {}
-                            .disabled(true)
+            SettingsField(label: "Model") {
+                if let models = model.llmProbe?.models, !models.isEmpty {
+                    Picker("Ollama model", selection: ollamaModelBinding) {
+                        ForEach(ollamaPickerModels(models)) { remote in
+                            Text(remote.name).tag(remote.id)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
-                    Text("Changing the database path is not available yet.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                    .disabled(model.isUpdatingLlm)
+                } else {
+                    TextField("qwen3.6:latest", text: $model.draftLlmModel)
+                        .settingsFieldStyle()
+                        .onSubmit { Task { await model.saveLlmConnection() } }
                 }
-                .padding(16)
+            }
+
+            SettingsField(label: "Server URL") {
+                TextField(
+                    model.llmProbe?.defaultBaseUrl ?? "http://127.0.0.1:11434",
+                    text: $model.draftLlmBaseUrl
+                )
+                .settingsFieldStyle()
+                .onSubmit { Task { await model.saveLlmConnection() } }
+            }
+
+            if ollamaHasUnsavedChanges {
+                HStack {
+                    Spacer()
+                    Button("Save Connection") {
+                        Task { await model.saveLlmConnection() }
+                    }
+                    .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                    .disabled(model.isUpdatingLlm)
+                }
             }
         }
     }
 
-    private var diagnosticsSection: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            SettingsGroup(title: "Logs") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(model.logFilePath)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    Text("AfterRay appends app and daemon output here. Attach this file when reporting a bug.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 16) {
-                        Button("Reveal Log Folder") { model.revealLogs() }
-                        Button(copied ? "Copied" : "Copy Report") {
-                            model.copyDiagnostics()
-                            copied = true
-                        }
+    private var ollamaHasUnsavedChanges: Bool {
+        model.draftLlmBaseUrl != (model.settings?.llmBaseUrl ?? "")
+            || model.draftLlmModel != (model.settings?.llmModel ?? "")
+            || (model.llmProbe?.models.isEmpty ?? true)
+    }
+
+    private var openaiPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SettingsField(label: "Server URL") {
+                TextField("https://dashscope.aliyuncs.com/compatible-mode/v1", text: $model.draftLlmBaseUrl)
+                    .settingsFieldStyle()
+            }
+            SettingsField(label: "Model") {
+                TextField("qwen3.7-max", text: $model.draftLlmModel)
+                    .settingsFieldStyle()
+            }
+            SettingsField(label: "API key") {
+                SecureField(
+                    model.settings?.llmApiKeySet == true
+                        ? "Saved — leave blank to keep it"
+                        : "Optional",
+                    text: $model.draftLlmApiKey
+                )
+                .settingsFieldStyle()
+            }
+            HStack(spacing: 10) {
+                if model.isProbingLlm {
+                    ProgressView().controlSize(.mini)
+                } else if let probe = model.llmProbe {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(probe.reachable ? SettingsPalette.positive : SettingsPalette.danger)
+                            .frame(width: 6, height: 6)
+                        Text(probe.reachable ? "Endpoint reachable" : (probe.error ?? "Not reachable"))
+                            .font(.settingsCaption)
+                            .foregroundStyle(SettingsPalette.secondaryLabel)
+                            .lineLimit(2)
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
                 }
-                .padding(16)
+                Spacer(minLength: 8)
+                Button("Save Connection") {
+                    Task { await model.saveLlmConnection() }
+                }
+                .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                .disabled(model.isUpdatingLlm)
             }
         }
+    }
+
+    private var ollamaStatusText: String {
+        if model.isProbingLlm { return "Looking for Ollama…" }
+        guard let probe = model.llmProbe else { return "Ollama has not been probed yet." }
+        if probe.reachable {
+            let count = probe.models.count
+            return count == 1 ? "Ollama is running · 1 chat model" : "Ollama is running · \(count) chat models"
+        }
+        return probe.error ?? "Ollama is not reachable on this Mac."
+    }
+
+    private var ollamaModelBinding: Binding<String> {
+        Binding(
+            get: { model.draftLlmModel },
+            set: { next in
+                model.draftLlmModel = next
+                Task { await model.saveLlmConnection() }
+            }
+        )
+    }
+
+    private func ollamaPickerModels(_ models: [LlmRemoteModel]) -> [LlmRemoteModel] {
+        if models.contains(where: { $0.id == model.draftLlmModel }) || model.draftLlmModel.isEmpty {
+            return models
+        }
+        return [LlmRemoteModel(id: model.draftLlmModel)] + models
     }
 
     private func modelPackRow(_ pack: ModelPack) -> some View {
@@ -591,42 +859,42 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             || model.library?.download?.packId == pack.id
         return SettingsRow(
             title: pack.name,
-            subtitle: [
-                capabilityLabel(pack.capability),
-                pack.note,
-                pack.present ? AfterRayStorageSnapshot.byteCount(pack.bytes) : nil,
-            ]
-                .compactMap { $0 }
-                .filter { !$0.isEmpty }
-                .joined(separator: " · ")
+            subtitle: packSubtitle(pack),
+            subtitleLineLimit: 2
         ) {
             HStack(spacing: 8) {
                 if downloading {
                     ProgressView().controlSize(.mini)
                     Text(percentLabel(model.downloadProgress) ?? "Downloading")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
                         .monospacedDigit()
                 } else {
-                    Text(packStatus(pack))
-                        .font(.system(size: 12))
-                        .foregroundStyle(pack.present ? Color.secondary : Color.white.opacity(0.7))
-                }
-                if !pack.present, !downloading {
-                    Button("Download") {
-                        Task { await model.download(packID: pack.id) }
+                    SettingsPill(packStatus(pack), tone: packTone(pack))
+                    if pack.present {
+                        Button("Show") { model.reveal(pack.path) }
+                            .buttonStyle(SettingsButtonStyle())
+                    } else {
+                        Button("Download") {
+                            Task { await model.download(packID: pack.id) }
+                        }
+                        .buttonStyle(SettingsButtonStyle())
+                        .disabled(model.downloadingID != nil)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(model.downloadingID != nil)
-                } else if pack.present {
-                    Button("Show") { model.reveal(pack.path) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.7))
                 }
             }
         }
+    }
+
+    private func packSubtitle(_ pack: ModelPack) -> String {
+        [
+            capabilityLabel(pack.capability),
+            pack.present ? AfterRayStorageSnapshot.byteCount(pack.bytes) : nil,
+            pack.note,
+        ]
+        .compactMap { $0 }
+        .filter { !$0.isEmpty }
+        .joined(separator: " · ")
     }
 
     private func packStatus(_ pack: ModelPack) -> String {
@@ -635,12 +903,18 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         return pack.required ? "Needed" : "Optional"
     }
 
+    private func packTone(_ pack: ModelPack) -> SettingsTone {
+        if pack.present { return .positive }
+        if pack.bytes > 0 { return .warning }
+        return pack.required ? .warning : .neutral
+    }
+
     private func jobTitle(_ job: ModelJob) -> String {
         switch job.capability {
         case "asr": "Qwen3 ASR"
         case "ocr": "OCR"
         case "embedding": "Embeddings"
-        case "llm": "Qwen3.8 27B"
+        case "llm": "Assistant"
         default: job.capability
         }
     }
@@ -663,96 +937,559 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
+    private func jobTone(_ state: String) -> SettingsTone {
+        switch state {
+        case "done": .positive
+        case "failed": .danger
+        default: .neutral
+        }
+    }
+
+    // MARK: Advanced
+
+    @ViewBuilder
+    private var advancedPage: some View {
+        SettingsSection(
+            title: "CLI for agents",
+            footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history (read-only)."
+        ) {
+            SettingsRow(
+                title: model.cliInstalled ? "afterray is installed" : "afterray CLI",
+                subtitle: model.cliStatus,
+                subtitleLineLimit: 3
+            ) {
+                SettingsPill(
+                    model.cliInstalled ? "Ready" : "Missing",
+                    tone: model.cliInstalled ? .positive : .warning
+                )
+            }
+            SettingsSeparator()
+            SettingsFooterBar {
+                Button(model.cliInstalled ? "Reinstall CLI" : "Install CLI") {
+                    Task { await model.installCli() }
+                }
+                .buttonStyle(SettingsButtonStyle(kind: model.cliInstalled ? .standard : .prominent))
+                .disabled(model.isInstallingCli)
+                if model.isInstallingCli {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+        }
+
+        SettingsSection(
+            title: "Capture cadence",
+            footnote: "A selectable cadence is not available yet."
+        ) {
+            SettingsRow(
+                title: captureCadenceTitle,
+                subtitle: "AfterRay saves one still on this interval while it is recording."
+            ) {
+                SettingsPill("Fixed", tone: .neutral)
+            }
+        }
+
+        SettingsSection(
+            title: "Locations",
+            footnote: "Moving the vault to another disk is not available yet."
+        ) {
+            SettingsPathRow(title: "Vault", path: model.dataDirectoryPath) {
+                model.reveal(model.dataDirectoryPath)
+            }
+            SettingsSeparator()
+            SettingsPathRow(title: "Models", path: model.modelDirectoryPath) {
+                model.reveal(model.modelDirectoryPath)
+            }
+        }
+    }
+
+    private var captureCadenceTitle: String {
+        let seconds = model.settings?.captureIntervalSeconds ?? 10
+        return "One still every \(seconds) second\(seconds == 1 ? "" : "s")"
+    }
+
+    // MARK: Diagnostics
+
+    @ViewBuilder
+    private var diagnosticsPage: some View {
+        SettingsSection(
+            title: "Logs",
+            footnote: "AfterRay appends app and daemon output here. Attach this file when reporting a bug."
+        ) {
+            SettingsPathRow(title: "Log file", path: model.logFilePath, action: nil)
+            SettingsSeparator()
+            SettingsFooterBar {
+                Button("Reveal Log Folder") { model.revealLogs() }
+                    .buttonStyle(SettingsButtonStyle())
+                Button(copied ? "Copied" : "Copy Report") {
+                    model.copyDiagnostics()
+                    copied = true
+                }
+                .buttonStyle(SettingsButtonStyle(kind: copied ? .prominent : .standard))
+            }
+        }
+        .task(id: copied) {
+            guard copied else { return }
+            try? await Task.sleep(for: .seconds(2))
+            copied = false
+        }
+    }
+
+    // MARK: Shared pieces
+
     private func percentLabel(_ progress: Double?) -> String? {
         guard let progress else { return nil }
         return "\(Int((progress * 100).rounded(.down)))%"
     }
 
-    private func storageStat(_ title: String, _ value: String, align: HorizontalAlignment = .leading) -> some View {
+    private func storageStat(
+        _ title: String,
+        _ value: String,
+        align: HorizontalAlignment = .leading
+    ) -> some View {
         VStack(alignment: align, spacing: 2) {
             Text(title)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                .font(.settingsCaption)
+                .foregroundStyle(SettingsPalette.tertiaryLabel)
             Text(value)
-                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .font(.settingsStat)
+                .foregroundStyle(SettingsPalette.label)
+                .monospacedDigit()
         }
     }
 
-    private func storageLine(_ title: String, _ bytes: UInt64) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Text(AfterRayStorageSnapshot.byteCount(bytes))
-        }
-        .font(.system(size: 13))
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-    }
-
-    private func storageLegend(_ title: String, _ bytes: UInt64, _ color: Color) -> some View {
+    private func storageLegend(_ segment: StorageSegment) -> some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(color)
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(segment.color)
                 .frame(width: 8, height: 8)
-            Text(title)
-            Spacer()
-            Text(AfterRayStorageSnapshot.byteCount(bytes))
+            Text(segment.title)
+                .foregroundStyle(SettingsPalette.secondaryLabel)
+            Spacer(minLength: 12)
+            Text(AfterRayStorageSnapshot.byteCount(segment.bytes))
+                .foregroundStyle(SettingsPalette.secondaryLabel)
+                .monospacedDigit()
         }
-        .font(.system(size: 12))
-        .foregroundStyle(.secondary)
+        .font(.settingsCaption)
     }
 
     private func capabilityLabel(_ capability: String) -> String {
         switch capability {
         case "asr": "Transcription"
         case "embedding": "Search embeddings"
-        case "llm": "Local assistant"
+        case "llm": "Assistant"
         default: capability.capitalized
         }
     }
 }
 
-private enum AfterRayCaptureSpeedPlaceholder: String, CaseIterable, Identifiable {
-    case fast
-    case balanced
-    case light
+// MARK: - Building blocks
 
-    var id: String { rawValue }
+/// Header + one card. The card wraps `content` in a single container, so a
+/// section with several children stays one surface instead of one card each.
+private struct SettingsSection<Content: View>: View {
+    var title: String?
+    var footnote: String?
+    var contentPadding: CGFloat = 0
+    @ViewBuilder var content: Content
 
-    var label: String {
-        switch self {
-        case .fast: "Fast"
-        case .balanced: "Balanced"
-        case .light: "Light"
+    init(
+        title: String? = nil,
+        footnote: String? = nil,
+        contentPadding: CGFloat = 0,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.footnote = footnote
+        self.contentPadding = contentPadding
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let title {
+                Text(title.uppercased())
+                    .font(.settingsSectionTitle)
+                    .tracking(0.7)
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    .padding(.leading, 2)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                content
+            }
+            .padding(contentPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(SettingsPalette.cardFill, in: cardShape)
+            .overlay { cardShape.strokeBorder(SettingsPalette.cardStroke, lineWidth: 1) }
+            if let footnote {
+                Text(footnote)
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 2)
+            }
+        }
+    }
+
+    private var cardShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: SettingsMetrics.cardRadius, style: .continuous)
+    }
+}
+
+private struct SettingsRow<Trailing: View>: View {
+    let title: String
+    var subtitle: String?
+    var subtitleLineLimit: Int?
+    var trailing: Trailing
+
+    init(
+        title: String,
+        subtitle: String? = nil,
+        subtitleLineLimit: Int? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.subtitleLineLimit = subtitleLineLimit
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.settingsRowTitle)
+                    .foregroundStyle(SettingsPalette.label)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.settingsRowSubtitle)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                        .lineLimit(subtitleLineLimit)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 16)
+            trailing
+        }
+        .padding(.horizontal, SettingsMetrics.rowInset)
+        .padding(.vertical, 11)
+        .frame(minHeight: SettingsMetrics.rowMinHeight)
+    }
+}
+
+private extension SettingsRow where Trailing == EmptyView {
+    init(title: String, subtitle: String? = nil) {
+        self.init(title: title, subtitle: subtitle) { EmptyView() }
+    }
+}
+
+private struct SettingsPathRow: View {
+    let title: String
+    let path: String
+    var action: (() -> Void)?
+
+    init(title: String, path: String, action: (() -> Void)?) {
+        self.title = title
+        self.path = path
+        self.action = action
+    }
+
+    init(title: String, path: String, action: @escaping () -> Void) {
+        self.init(title: title, path: path, action: .some(action))
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.settingsRowTitle)
+                    .foregroundStyle(SettingsPalette.label)
+                Text(path)
+                    .font(.settingsMono)
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(path)
+            }
+            Spacer(minLength: 16)
+            if let action {
+                Button("Show") { action() }
+                    .buttonStyle(SettingsButtonStyle())
+            }
+        }
+        .padding(.horizontal, SettingsMetrics.rowInset)
+        .padding(.vertical, 11)
+        .frame(minHeight: SettingsMetrics.rowMinHeight)
+    }
+}
+
+/// Trailing action strip at the bottom of a card.
+private struct SettingsFooterBar<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            content
+        }
+        .padding(.horizontal, SettingsMetrics.rowInset)
+        .padding(.vertical, 10)
+    }
+}
+
+private struct SettingsSeparator: View {
+    var body: some View {
+        Rectangle()
+            .fill(SettingsPalette.separator)
+            .frame(height: 1)
+            .padding(.leading, SettingsMetrics.rowInset)
+    }
+}
+
+/// Label above a control. Field labels beat placeholder-only inputs: the
+/// placeholder disappears exactly when the user needs to know what they typed.
+private struct SettingsField<Content: View>: View {
+    let label: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label.uppercased())
+                .font(.settingsFieldLabel)
+                .tracking(0.6)
+                .foregroundStyle(SettingsPalette.tertiaryLabel)
+            content
         }
     }
 }
 
-private struct StorageDiskBar: View {
-    let snapshot: AfterRayStorageSnapshot
-
-    static let afterrayColor = RecallPalette.ray
-    static let otherColor = Color.white.opacity(0.28)
-    static let freeColor = Color.white.opacity(0.10)
-
-    var body: some View {
-        let slices = snapshot.barSlices
-        GeometryReader { geometry in
-            HStack(spacing: 1) {
-                slice(width: geometry.size.width * slices.afterray, color: Self.afterrayColor, minimum: snapshot.afterrayBytes > 0)
-                slice(width: geometry.size.width * slices.other, color: Self.otherColor, minimum: snapshot.otherBytes > 0)
-                slice(width: geometry.size.width * slices.free, color: Self.freeColor, minimum: snapshot.volumeFree > 0)
+private extension View {
+    func settingsFieldStyle() -> some View {
+        textFieldStyle(.plain)
+            .font(.settingsBody)
+            .foregroundStyle(SettingsPalette.label)
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .background(
+                SettingsPalette.controlFill,
+                in: RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius, style: .continuous)
+                    .strokeBorder(SettingsPalette.controlStroke, lineWidth: 1)
             }
-        }
-        .frame(height: 8)
-        .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
-        .accessibilityLabel(snapshot.diskShareText)
+    }
+}
+
+private struct SettingsPill: View {
+    let text: String
+    let tone: SettingsTone
+
+    init(_ text: String, tone: SettingsTone) {
+        self.text = text
+        self.tone = tone
     }
 
-    private func slice(width: CGFloat, color: Color, minimum: Bool) -> some View {
-        Rectangle()
-            .fill(color)
-            .frame(width: max(width, minimum ? 3 : 0), height: 8)
+    var body: some View {
+        Text(text)
+            .font(.settingsPill)
+            .foregroundStyle(tone == .neutral ? SettingsPalette.secondaryLabel : tone.color)
+            .padding(.horizontal, 8)
+            .frame(height: 19)
+            .background(
+                tone == .neutral ? Color.white.opacity(0.07) : tone.color.opacity(0.15),
+                in: Capsule()
+            )
+    }
+}
+
+private struct StorageSegment: Identifiable {
+    let id: String
+    let title: String
+    let bytes: UInt64
+    let color: Color
+}
+
+private struct StorageCompositionBar: View {
+    let segments: [StorageSegment]
+
+    private var total: UInt64 { segments.reduce(0) { $0 + $1.bytes } }
+
+    var body: some View {
+        GeometryReader { geometry in
+            HStack(spacing: 1.5) {
+                if total == 0 {
+                    Rectangle().fill(Color.white.opacity(0.06))
+                } else {
+                    ForEach(segments) { segment in
+                        Rectangle()
+                            .fill(segment.color)
+                            .frame(width: width(for: segment, in: geometry.size.width))
+                    }
+                }
+            }
+        }
+        .frame(height: 9)
+        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private func width(for segment: StorageSegment, in available: CGFloat) -> CGFloat {
+        guard total > 0 else { return 0 }
+        let gaps = CGFloat(max(segments.count - 1, 0)) * 1.5
+        let usable = max(available - gaps, 0)
+        let share = CGFloat(Double(segment.bytes) / Double(total))
+        return max(usable * share, 3)
+    }
+
+    private var accessibilityText: String {
+        segments
+            .map { "\($0.title) \(AfterRayStorageSnapshot.byteCount($0.bytes))" }
+            .joined(separator: ", ")
+    }
+}
+
+// MARK: - Controls
+
+private struct SettingsSidebarRow: View {
+    let page: AfterRaySettingsPage
+    let isSelected: Bool
+    let badge: Int
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? page.selectedIcon : page.icon)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 17)
+                Text(page.title)
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? SettingsPalette.label : SettingsPalette.secondaryLabel)
+                Spacer(minLength: 6)
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPalette.accent)
+                        .padding(.horizontal, 6)
+                        .frame(height: 16)
+                        .background(SettingsPalette.accent.opacity(0.18), in: Capsule())
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(rowFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SettingsPressStyle())
+        .onHover { isHovering = $0 }
+    }
+
+    private var iconColor: Color {
+        if isSelected { return SettingsPalette.accent }
+        return isHovering ? SettingsPalette.label : SettingsPalette.secondaryLabel
+    }
+
+    private var rowFill: Color {
+        if isSelected { return Color.white.opacity(0.085) }
+        return isHovering ? Color.white.opacity(0.045) : .clear
+    }
+}
+
+private struct SettingsIconButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(isHovering ? SettingsPalette.label : SettingsPalette.secondaryLabel)
+                .frame(width: 28, height: 28)
+                .background(
+                    isHovering ? SettingsPalette.controlFill : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(SettingsPressStyle())
+        .onHover { isHovering = $0 }
+        .help(help)
+    }
+}
+
+/// Real buttons instead of grey text: every action now reads as pressable, and
+/// destructive ones no longer look identical to `Refresh`.
+private struct SettingsButtonStyle: ButtonStyle {
+    enum Kind {
+        case standard
+        case prominent
+        case destructive
+    }
+
+    var kind: Kind = .standard
+
+    func makeBody(configuration: Configuration) -> some View {
+        StyledLabel(configuration: configuration, kind: kind)
+    }
+
+    private struct StyledLabel: View {
+        let configuration: Configuration
+        let kind: Kind
+        @Environment(\.isEnabled) private var isEnabled
+        @State private var isHovering = false
+
+        var body: some View {
+            configuration.label
+                .font(.settingsControl)
+                .foregroundStyle(labelColor)
+                .padding(.horizontal, 11)
+                .frame(height: 26)
+                .background(fill, in: shape)
+                .overlay { shape.strokeBorder(stroke, lineWidth: 1) }
+                .contentShape(Rectangle())
+                .opacity(isEnabled ? 1 : 0.42)
+                .scaleEffect(configuration.isPressed ? 0.96 : 1)
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+                .animation(.easeOut(duration: 0.12), value: isHovering)
+                .onHover { isHovering = isEnabled && $0 }
+        }
+
+        private var shape: RoundedRectangle {
+            RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius, style: .continuous)
+        }
+
+        private var labelColor: Color {
+            switch kind {
+            case .standard: SettingsPalette.label
+            case .prominent: .white
+            case .destructive: SettingsPalette.danger
+            }
+        }
+
+        private var fill: Color {
+            switch kind {
+            case .standard:
+                isHovering ? SettingsPalette.controlHover : SettingsPalette.controlFill
+            case .prominent:
+                SettingsPalette.accent.opacity(isHovering ? 1 : 0.88)
+            case .destructive:
+                isHovering ? SettingsPalette.danger.opacity(0.16) : Color.white.opacity(0.05)
+            }
+        }
+
+        private var stroke: Color {
+            switch kind {
+            case .standard: SettingsPalette.controlStroke
+            case .prominent: .clear
+            case .destructive: SettingsPalette.danger.opacity(0.35)
+            }
+        }
     }
 }
 
@@ -762,56 +1499,5 @@ private struct SettingsPressStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .opacity(configuration.isPressed ? 0.82 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-    }
-}
-
-private struct SettingsGroup<Content: View>: View {
-    let title: String?
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let title {
-                Text(title.uppercased())
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .tracking(1.0)
-                    .foregroundStyle(.white.opacity(0.48))
-                    .padding(.horizontal, 4)
-            }
-            content
-                .background(
-                    Color.white.opacity(0.035),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(.white.opacity(0.055), lineWidth: 1)
-                }
-        }
-    }
-}
-
-private struct SettingsRow<Trailing: View>: View {
-    let title: String
-    let subtitle: String
-    @ViewBuilder var trailing: Trailing
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                if !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Spacer(minLength: 12)
-            trailing
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
     }
 }
