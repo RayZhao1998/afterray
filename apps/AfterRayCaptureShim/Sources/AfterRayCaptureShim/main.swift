@@ -245,6 +245,7 @@ private struct AccessibilitySnapshot: Encodable {
     let url: String?
     let document: String?
     let truncated: Bool
+    let digest: AccessibilityDigest
     let root: AccessibilityNode
 
     enum CodingKeys: String, CodingKey {
@@ -253,7 +254,33 @@ private struct AccessibilitySnapshot: Encodable {
         case bundleIdentifier = "bundle_identifier"
         case applicationName = "application_name"
         case windowTitle = "window_title"
-        case url, document, truncated, root
+        case url, document, truncated, digest, root
+    }
+}
+
+private struct AccessibilityDigest: Encodable {
+    let applicationName: String?
+    let bundleIdentifier: String?
+    let windowTitle: String?
+    let url: String?
+    let document: String?
+    let focusedRole: String?
+    let focusedTitle: String?
+    let focusedValue: String?
+    let selectedText: String?
+    let headings: [String]
+    let visibleText: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case url, document, headings
+        case applicationName = "application_name"
+        case bundleIdentifier = "bundle_identifier"
+        case windowTitle = "window_title"
+        case focusedRole = "focused_role"
+        case focusedTitle = "focused_title"
+        case focusedValue = "focused_value"
+        case selectedText = "selected_text"
+        case visibleText = "visible_text"
     }
 }
 
@@ -266,6 +293,12 @@ private final class AccessibilityTreeEncoder {
     private(set) var document: String?
     private(set) var windowTitle: String?
     private var foundWebURL = false
+    private var focusedRole: String?
+    private var focusedTitle: String?
+    private var focusedValue: String?
+    private var selectedText: String?
+    private var headings: [String] = []
+    private var visibleTexts: [String] = []
 
     func encode(_ element: AXUIElement) -> AccessibilityNode {
         nodeCount += 1
@@ -294,6 +327,14 @@ private final class AccessibilityTreeEncoder {
         let nodeURL = secure ? nil : firstLocation(element, Self.urlAttributeNames)
         let nodeDocument = secure ? nil : normalizedDocument(firstLocation(element, Self.documentAttributeNames))
         considerActivityContext(role: role, title: title, url: nodeURL, document: nodeDocument)
+        considerDigest(
+            element: element,
+            role: role,
+            subrole: subrole,
+            title: title,
+            value: secure ? nil : scalarString(attribute(element, kAXValueAttribute)),
+            focused: boolValue(element, kAXFocusedAttribute)
+        )
         let children = (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [])
             .map(encode)
         return AccessibilityNode(
@@ -340,6 +381,57 @@ private final class AccessibilityTreeEncoder {
         "AXDocument",
         "Document",
     ]
+
+    func digest(
+        applicationName: String?,
+        bundleIdentifier: String?,
+        windowTitle: String?
+    ) -> AccessibilityDigest {
+        AccessibilityDigest(
+            applicationName: applicationName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle ?? self.windowTitle,
+            url: url,
+            document: document,
+            focusedRole: focusedRole,
+            focusedTitle: focusedTitle,
+            focusedValue: focusedValue,
+            selectedText: selectedText,
+            headings: headings,
+            visibleText: visibleTexts
+        )
+    }
+
+    private func considerDigest(
+        element: AXUIElement,
+        role: String?,
+        subrole: String?,
+        title: String?,
+        value: String?,
+        focused: Bool
+    ) {
+        if focused, focusedRole == nil {
+            focusedRole = nonempty(role)
+            focusedTitle = nonempty(title)
+            focusedValue = nonempty(value).map { clip($0, 280) }
+            selectedText = nonempty(string(element, kAXSelectedTextAttribute as String))
+        }
+        if (role == "AXHeading" || subrole == "AXHeading"), headings.count < 8,
+           let heading = nonempty(title) ?? nonempty(value)
+        {
+            appendUnique(&headings, clip(heading, 80), limit: 8)
+        }
+        if ["AXStaticText", "AXTextField", "AXTextArea", "AXLink"].contains(role ?? ""),
+           let text = nonempty(title) ?? nonempty(value)
+        {
+            appendUnique(&visibleTexts, clip(text, 80), limit: 16)
+        }
+    }
+
+    private func boolValue(_ element: AXUIElement, _ name: String) -> Bool {
+        guard let number = attribute(element, name) as? NSNumber else { return false }
+        return number.boolValue
+    }
 
     private func considerActivityContext(role: String?, title: String?, url: String?, document: String?) {
         if windowTitle == nil, isWindowRole(role), let title, !title.isEmpty {
@@ -441,6 +533,16 @@ private func nonempty(_ value: String?) -> String? {
     return trimmed.isEmpty ? nil : trimmed
 }
 
+private func clip(_ value: String, _ limit: Int) -> String {
+    if value.count <= limit { return value }
+    return String(value.prefix(max(limit - 1, 1))) + "…"
+}
+
+private func appendUnique(_ items: inout [String], _ value: String, limit: Int) {
+    guard items.count < limit, !items.contains(value) else { return }
+    items.append(value)
+}
+
 private func captureAccessibilityTree(
     requestId: String,
     capturedAtMs: Int64,
@@ -467,6 +569,15 @@ private func captureAccessibilityTree(
         url: encoder.url,
         document: encoder.document,
         truncated: encoder.truncated,
+        digest: encoder.digest(
+            applicationName: application.localizedName,
+            bundleIdentifier: application.bundleIdentifier,
+            windowTitle: frontWindowTitle(
+                appElement: appElement,
+                processId: application.processIdentifier,
+                treeTitle: encoder.windowTitle
+            )
+        ),
         root: root
     )
     let url = outputDirectory

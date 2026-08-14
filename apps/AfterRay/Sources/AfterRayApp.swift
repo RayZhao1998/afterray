@@ -174,6 +174,8 @@ private final class AfterRayMenuBar: NSObject {
     static let shared = AfterRayMenuBar()
 
     private var statusItem: NSStatusItem?
+    private var pauseItem: NSMenuItem?
+    private var isRecording = false
 
     private override init() {
         super.init()
@@ -208,6 +210,22 @@ private final class AfterRayMenuBar: NSObject {
         settingsItem.target = self
         menu.addItem(settingsItem)
         menu.addItem(.separator())
+        let pauseItem = NSMenuItem(
+            title: "Pause Capture",
+            action: #selector(toggleCapture),
+            keyEquivalent: ""
+        )
+        pauseItem.target = self
+        menu.addItem(pauseItem)
+        self.pauseItem = pauseItem
+        let clearHour = NSMenuItem(
+            title: "Delete Last Hour",
+            action: #selector(deleteLastHour),
+            keyEquivalent: ""
+        )
+        clearHour.target = self
+        menu.addItem(clearHour)
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
             action: #selector(quitAfterRay),
@@ -230,7 +248,10 @@ private final class AfterRayMenuBar: NSObject {
         statusItem = nil
     }
 
-    func setRecording(_: Bool) {}
+    func setRecording(_ isRecording: Bool) {
+        self.isRecording = isRecording
+        refresh()
+    }
 
     func setOverlayVisible(_: Bool) {}
 
@@ -242,6 +263,37 @@ private final class AfterRayMenuBar: NSObject {
         AfterRaySettingsController.shared.show()
     }
 
+    @objc private func toggleCapture() {
+        Task {
+            let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            do {
+                if isRecording {
+                    _ = try await daemon.recordStop(reason: "menu")
+                    isRecording = false
+                } else {
+                    _ = try await daemon.recordStart()
+                    isRecording = true
+                }
+                refresh()
+            } catch {
+                AfterRayLog.error(error.localizedDescription, source: "menu")
+            }
+        }
+    }
+
+    @objc private func deleteLastHour() {
+        Task {
+            do {
+                let result = try await UnixSocketDaemonClient(
+                    socketPath: DaemonSupervisor.shared.socketPath
+                ).clearHistory(scope: .lastHour)
+                AfterRayLog.info("deleted \(result.deleted) moments from the last hour", source: "menu")
+            } catch {
+                AfterRayLog.error(error.localizedDescription, source: "menu")
+            }
+        }
+    }
+
     @objc private func quitAfterRay() {
         NSApp.terminate(nil)
     }
@@ -250,7 +302,8 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
-        button.toolTip = "AfterRay"
+        button.toolTip = isRecording ? "AfterRay is recording" : "AfterRay is paused"
+        pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
     }
 
     private static func icon() -> NSImage {
@@ -1316,11 +1369,20 @@ private struct AskAnswerPanel: View {
                     .foregroundStyle(.white.opacity(0.88))
                     .fixedSize(horizontal: false, vertical: true)
             } else if let answer {
-                Text(answer.answer)
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.92))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                AskAnswerText(text: answer.answer) { momentID in
+                    if let citation = answer.citations.first(where: { $0.momentId == momentID }) {
+                        onSelectCitation(citation)
+                    } else {
+                        onSelectCitation(
+                            AskCitation(
+                                momentId: momentID,
+                                capturedAtMs: 0,
+                                label: "",
+                                excerpt: ""
+                            )
+                        )
+                    }
+                }
                 if !answer.citations.isEmpty {
                     HStack(spacing: 6) {
                         ForEach(Array(answer.citations.prefix(3))) { citation in
@@ -1362,6 +1424,47 @@ private struct AskAnswerPanel: View {
             return time
         }
         return "\(time) · \(citation.label)"
+    }
+}
+
+private struct AskAnswerText: View {
+    let text: String
+    let onOpenMoment: (String) -> Void
+
+    var body: some View {
+        Text(attributed)
+            .font(.system(size: 13, weight: .medium, design: .rounded))
+            .foregroundStyle(.white.opacity(0.92))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .environment(\.openURL, OpenURLAction { url in
+                if url.scheme == "afterray", url.host == "moment" {
+                    let momentID = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    if !momentID.isEmpty {
+                        onOpenMoment(momentID)
+                        return .handled
+                    }
+                }
+                return .systemAction
+            })
+    }
+
+    private var attributed: AttributedString {
+        var markdown = text
+        if !markdown.contains("](afterray://moment/") {
+            markdown = markdown.replacingOccurrences(
+                of: #"afterray://moment/([A-Za-z0-9\-]+)"#,
+                with: "[moment](afterray://moment/$1)",
+                options: .regularExpression
+            )
+        }
+        if let parsed = try? AttributedString(
+            markdown: markdown,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return parsed
+        }
+        return AttributedString(text)
     }
 }
 

@@ -13,6 +13,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadStatus: String? { get }
     var isUpdatingAudio: Bool { get }
     var recordAudio: Bool { get }
+    var excludedBundleIds: [String] { get }
+    var isUpdatingExclusions: Bool { get }
+    var isClearingHistory: Bool { get }
     var dataDirectoryPath: String { get }
     var modelDirectoryPath: String { get }
     var logDirectoryPath: String { get }
@@ -21,6 +24,10 @@ public protocol AfterRaySettingsModeling: ObservableObject {
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
+    func excludeBundle(_ bundleID: String) async
+    func includeBundle(_ bundleID: String) async
+    func excludeFrontmostApp() async
+    func clearHistory(_ scope: HistoryScope) async
     func reveal(_ path: String)
     func download(packID: String?) async
     func revealLogs()
@@ -304,20 +311,84 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var captureSection: some View {
-        SettingsGroup(title: "Capture") {
-            SettingsRow(
-                title: "Record audio",
-                subtitle: "System audio and microphone for transcripts. Already-saved recordings stay in the vault."
-            ) {
-                Toggle("", isOn: Binding(
-                    get: { model.recordAudio },
-                    set: { enabled in Task { await model.setRecordAudio(enabled) } }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-                .disabled(model.isUpdatingAudio)
+        VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(title: "Capture") {
+                SettingsRow(
+                    title: "Record audio",
+                    subtitle: "System audio and microphone for transcripts. Already-saved recordings stay in the vault."
+                ) {
+                    Toggle("", isOn: Binding(
+                        get: { model.recordAudio },
+                        set: { enabled in Task { await model.setRecordAudio(enabled) } }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(model.isUpdatingAudio)
+                }
+            }
+
+            SettingsGroup(title: "Excluded apps") {
+                VStack(spacing: 0) {
+                    if model.excludedBundleIds.isEmpty {
+                        SettingsRow(
+                            title: "None excluded",
+                            subtitle: "AfterRay records the frontmost app unless you exclude it."
+                        ) {
+                            EmptyView()
+                        }
+                    } else {
+                        ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
+                            if index > 0 {
+                                Divider().overlay(Color.white.opacity(0.06))
+                            }
+                            SettingsRow(
+                                title: appName(for: bundleID),
+                                subtitle: bundleID
+                            ) {
+                                Button("Include") {
+                                    Task { await model.includeBundle(bundleID) }
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.7))
+                                .disabled(model.isUpdatingExclusions)
+                            }
+                        }
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("Exclude Frontmost App") {
+                        Task { await model.excludeFrontmostApp() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .disabled(model.isUpdatingExclusions)
+                }
+                .padding(.top, 10)
+            }
+
+            SettingsGroup(title: "Delete history") {
+                HStack(spacing: 16) {
+                    Button("Last hour") { Task { await model.clearHistory(.lastHour) } }
+                    Button("Today") { Task { await model.clearHistory(.today) } }
+                    Button("Everything") { Task { await model.clearHistory(.all) } }
+                    Spacer()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.7))
+                .disabled(model.isClearingHistory)
             }
         }
+    }
+
+    private func appName(for bundleID: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: url.path)
+        }
+        return bundleID
     }
 
     private var storageSection: some View {

@@ -8,7 +8,7 @@
 
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
-    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Moment, SearchHit, Session,
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Memory, Moment, SearchHit, Session,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -45,14 +45,18 @@ use zeroize::{Zeroize, Zeroizing};
 mod activity;
 mod gop;
 mod jpeg;
+mod memory;
 
 pub use gop::{
     GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
     PackPolicy, fold_pack_runs,
 };
 pub use jpeg::jpeg_pixel_size;
+pub use memory::{
+    AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
+};
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -365,6 +369,7 @@ impl Vault {
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
+        let _ = vault.cleanup_unreferenced_gop_artifacts();
         Ok(vault)
     }
 
@@ -822,6 +827,87 @@ impl Vault {
         Ok(())
     }
 
+    pub fn insert_memory(&self, memory: &Memory) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO memories
+             (id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
+              window_title, url, document, summary, fingerprint, model_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                memory.id,
+                memory.start_ms,
+                memory.end_ms,
+                memory.moment_id,
+                memory.application_name,
+                memory.bundle_identifier,
+                memory.window_title,
+                memory.url,
+                memory.document,
+                memory.summary,
+                memory.fingerprint,
+                "local"
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn memories(&self, from_ms: i64, to_ms: i64, limit: usize) -> Result<Vec<Memory>, StoreError> {
+        if limit == 0 || from_ms > to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
+                    window_title, url, document, summary, fingerprint
+               FROM memories
+              WHERE start_ms <= ?2 AND end_ms >= ?1
+              ORDER BY start_ms ASC, id ASC
+              LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![from_ms, to_ms, i64::try_from(limit).unwrap_or(40)],
+            memory_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn latest_memory(&self) -> Result<Option<Memory>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
+                        window_title, url, document, summary, fingerprint
+                   FROM memories ORDER BY end_ms DESC, id DESC LIMIT 1",
+                [],
+                memory_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_history(&self, from_ms: i64, to_ms: i64) -> Result<usize, StoreError> {
+        if from_ms > to_ms {
+            return Ok(0);
+        }
+        let ids: Vec<String> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id FROM moments WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2",
+            )?;
+            let rows = statement.query_map(params![from_ms, to_ms], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let count = ids.len();
+        for id in ids {
+            self.delete_moment_and_artifacts(&id)?;
+        }
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM memories WHERE start_ms <= ?2 AND end_ms >= ?1",
+            params![from_ms, to_ms],
+        )?;
+        Ok(count)
+    }
+
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
@@ -1081,29 +1167,71 @@ impl Vault {
     }
 
     fn put_artifact(&self, content_type: &str, bytes: &[u8]) -> Result<String, StoreError> {
-        let id = Uuid::now_v7().to_string();
-        let encrypted = encrypt_artifact(&self.artifact_wrap_key, &id, content_type, bytes)?;
-        let final_path = self.artifact_path(&id);
-        let _artifact_guard = self.artifact_io.lock().unwrap();
-        atomic_write_private(&final_path, &encrypted.bytes)?;
+        let staged = self.stage_artifact(content_type, bytes)?;
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO artifacts (
                  id, content_type, byte_length, format_version, wrapped_key, wrapping_nonce
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                id,
-                content_type,
-                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                staged.id,
+                staged.content_type,
+                staged.byte_length,
                 ARTIFACT_FORMAT_VERSION,
-                encrypted.wrapped_dek,
-                encrypted.wrapping_nonce,
+                staged.wrapped_dek,
+                staged.wrapping_nonce,
             ],
         );
         if let Err(error) = result {
-            let _ = fs::remove_file(final_path);
+            self.discard_staged_artifact(&staged.id);
             return Err(error.into());
         }
-        Ok(id)
+        Ok(staged.id)
+    }
+
+    /// Encrypt and write the artifact file. The DEK is not in SQL until the
+    /// caller inserts `artifacts` in the same transaction as the claim.
+    pub(crate) fn stage_artifact(
+        &self,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<StagedArtifact, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let encrypted = encrypt_artifact(&self.artifact_wrap_key, &id, content_type, bytes)?;
+        let final_path = self.artifact_path(&id);
+        let _artifact_guard = self.artifact_io.lock().unwrap();
+        atomic_write_private(&final_path, &encrypted.bytes)?;
+        Ok(StagedArtifact {
+            id,
+            content_type: content_type.to_owned(),
+            byte_length: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            wrapped_dek: encrypted.wrapped_dek,
+            wrapping_nonce: encrypted.wrapping_nonce.to_vec(),
+        })
+    }
+
+    pub(crate) fn discard_staged_artifact(&self, id: &str) {
+        let _ = fs::remove_file(self.artifact_path(id));
+    }
+
+    /// Drop IVF artifacts whose wrapped DEK never made it into a GOP segment.
+    pub fn cleanup_unreferenced_gop_artifacts(&self) -> Result<usize, StoreError> {
+        let orphan_ids: Vec<String> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id FROM artifacts
+                  WHERE content_type LIKE 'video/x-ivf%'
+                    AND id NOT IN (
+                        SELECT artifact_id FROM gop_segments WHERE artifact_id IS NOT NULL
+                    )",
+            )?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &orphan_ids {
+            let _ = self.delete_artifact_record_and_file(id);
+        }
+        Ok(orphan_ids.len())
     }
 
     /// Re-encrypts legacy artifacts one at a time without blocking Vault startup.
@@ -1165,6 +1293,7 @@ impl Vault {
     /// Completes file-level startup work after the daemon is already serving.
     pub fn run_artifact_maintenance(&self) -> Result<usize, StoreError> {
         let migrated = self.migrate_legacy_artifacts()?;
+        let _ = self.cleanup_unreferenced_gop_artifacts();
         self.cleanup_orphaned_artifact_files()?;
         Ok(migrated)
     }
@@ -1548,6 +1677,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_7(connection)?;
     migrate_legacy_moment_columns(connection)?;
     migrate_schema_8(connection)?;
+    migrate_schema_9(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -1707,18 +1837,75 @@ fn migrate_schema_6(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, StoreError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn table_row_count(connection: &Connection, name: &str) -> Result<i64, StoreError> {
+    let sql = format!("SELECT COUNT(*) FROM {name}");
+    connection
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn image_artifact_not_null(connection: &Connection) -> Result<bool, StoreError> {
+    if !table_exists(connection, "moments")? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|(name, notnull)| name == "image_artifact_id" && notnull == 1))
+}
+
+fn rebuild_moments_indexes(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS moments_session_time ON moments(session_id, captured_at_ms);
+         CREATE INDEX IF NOT EXISTS moments_gop ON moments(gop_segment_id, gop_index);
+         CREATE INDEX IF NOT EXISTS moments_hot_pack
+           ON moments(captured_at_ms, gop_segment_id, is_favorite);
+         CREATE INDEX IF NOT EXISTS moments_time_id ON moments(captured_at_ms, id);",
+    )?;
+    Ok(())
+}
+
 fn migrate_schema_7(connection: &Connection) -> Result<(), StoreError> {
-    let not_null = {
-        let mut statement = connection.prepare("PRAGMA table_info(moments)")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .any(|(name, notnull)| name == "image_artifact_id" && notnull == 1)
-    };
-    if !not_null {
+    let has_moments = table_exists(connection, "moments")?;
+    let has_v7 = table_exists(connection, "moments_v7")?;
+    if has_v7 && has_moments {
+        let moments_n = table_row_count(connection, "moments")?;
+        let v7_n = table_row_count(connection, "moments_v7")?;
+        if moments_n == 0 && v7_n > 0 {
+            // Crash after DROP moments; migrate() recreated an empty old table.
+            connection.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE moments;
+                 ALTER TABLE moments_v7 RENAME TO moments;
+                 PRAGMA foreign_keys = ON;",
+            )?;
+            rebuild_moments_indexes(connection)?;
+        } else {
+            connection.execute("DROP TABLE moments_v7", [])?;
+        }
+    } else if has_v7 && !has_moments {
+        connection.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             ALTER TABLE moments_v7 RENAME TO moments;
+             PRAGMA foreign_keys = ON;",
+        )?;
+        rebuild_moments_indexes(connection)?;
+    }
+
+    if !image_artifact_not_null(connection)? {
         return Ok(());
     }
     connection.execute_batch(
@@ -1750,13 +1937,9 @@ fn migrate_schema_7(connection: &Connection) -> Result<(), StoreError> {
            FROM moments;
          DROP TABLE moments;
          ALTER TABLE moments_v7 RENAME TO moments;
-         CREATE INDEX IF NOT EXISTS moments_session_time ON moments(session_id, captured_at_ms);
-         CREATE INDEX IF NOT EXISTS moments_gop ON moments(gop_segment_id, gop_index);
-         CREATE INDEX IF NOT EXISTS moments_hot_pack
-           ON moments(captured_at_ms, gop_segment_id, is_favorite);
-         CREATE INDEX IF NOT EXISTS moments_time_id ON moments(captured_at_ms, id);
          PRAGMA foreign_keys = ON;",
     )?;
+    rebuild_moments_indexes(connection)?;
     Ok(())
 }
 
@@ -1768,6 +1951,44 @@ fn migrate_schema_8(connection: &Connection) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+fn migrate_schema_9(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memories (
+           id TEXT PRIMARY KEY,
+           start_ms INTEGER NOT NULL,
+           end_ms INTEGER NOT NULL,
+           moment_id TEXT,
+           application_name TEXT,
+           bundle_identifier TEXT,
+           window_title TEXT,
+           url TEXT,
+           document TEXT,
+           summary TEXT NOT NULL,
+           fingerprint TEXT NOT NULL,
+           model_version TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS memories_time ON memories(start_ms, end_ms);
+         CREATE INDEX IF NOT EXISTS memories_fingerprint ON memories(fingerprint);",
+    )?;
+    Ok(())
+}
+
+fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: row.get(0)?,
+        start_ms: row.get(1)?,
+        end_ms: row.get(2)?,
+        moment_id: row.get(3)?,
+        application_name: row.get(4)?,
+        bundle_identifier: row.get(5)?,
+        window_title: row.get(6)?,
+        url: row.get(7)?,
+        document: row.get(8)?,
+        summary: row.get(9)?,
+        fingerprint: row.get(10)?,
+    })
 }
 
 fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
@@ -1874,6 +2095,14 @@ struct EncryptedArtifact {
     bytes: Vec<u8>,
     wrapped_dek: Vec<u8>,
     wrapping_nonce: [u8; NONCE_LENGTH],
+}
+
+pub(crate) struct StagedArtifact {
+    pub id: String,
+    pub content_type: String,
+    pub byte_length: i64,
+    pub wrapped_dek: Vec<u8>,
+    pub wrapping_nonce: Vec<u8>,
 }
 
 fn decrypt_artifact(
@@ -2951,6 +3180,123 @@ mod tests {
     }
 
     #[test]
+    fn commit_gop_stale_does_not_leave_a_dek() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let first = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", &jpeg)
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 20_000, "image/jpeg", &jpeg)
+            .unwrap();
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM moments WHERE id = ?1", [&second.id])
+            .unwrap();
+        let frames = [
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 8,
+                content_hash: [1; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 8,
+                byte_length: 8,
+                content_hash: [2; 32],
+            },
+        ];
+        let error = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &[first.id, second.id],
+                ivf: b"DKIF-stale",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                started_at_ms: 10_000,
+                ended_at_ms: 20_000,
+                content_hash: "abc",
+                frames: &frames,
+            })
+            .unwrap_err();
+        assert!(matches!(error, StoreError::GopStale));
+        let ivf_rows: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE content_type LIKE 'video/x-ivf%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ivf_rows, 0);
+        assert_eq!(vault.cleanup_unreferenced_gop_artifacts().unwrap(), 0);
+    }
+
+    #[test]
+    fn cleanup_drops_ivf_artifacts_without_a_segment() {
+        let (_directory, vault) = test_vault(10);
+        let orphan = vault
+            .put_artifact("video/x-ivf; codec=av01", b"DKIF-orphan")
+            .unwrap();
+        assert_eq!(vault.cleanup_unreferenced_gop_artifacts().unwrap(), 1);
+        let leftover: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE id = ?1",
+                [&orphan],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
+        assert!(!vault.artifact_path(&orphan).exists());
+    }
+
+    #[test]
+    fn schema_7_recovers_when_moments_was_emptied_mid_rebuild() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        let moment = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", &jpeg)
+            .unwrap();
+        {
+            let connection = vault.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     CREATE TABLE moments_v7 AS SELECT * FROM moments;
+                     DELETE FROM moments;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+            migrate_schema_7(&connection).unwrap();
+        }
+        let restored = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, moment.id);
+        assert!(restored[0].image_artifact_id.is_some());
+    }
+
+    #[test]
     fn loginwindow_accessibility_deletes_the_moment() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
@@ -3145,6 +3491,36 @@ mod tests {
         );
         assert_eq!(spans[1].moment_ids, [fourth.id]);
         assert!(vault.activity_spans(2_000_000, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn memories_round_trip_and_delete_with_history() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .insert_memory(&Memory {
+                id: "mem-1".into(),
+                start_ms: 1_000,
+                end_ms: 70_000,
+                moment_id: Some(moment.id.clone()),
+                application_name: Some("Safari".into()),
+                bundle_identifier: Some("com.apple.Safari".into()),
+                window_title: Some("Example".into()),
+                url: Some("https://example.com/".into()),
+                document: None,
+                summary: "Read example.com in Safari.".into(),
+                fingerprint: "abc".into(),
+            })
+            .unwrap();
+        let listed = vault.memories(0, 80_000, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary, "Read example.com in Safari.");
+        assert_eq!(vault.delete_history(0, 80_000).unwrap(), 1);
+        assert!(vault.memories(0, 80_000, 10).unwrap().is_empty());
+        assert!(vault.moments_sync(&session.id).unwrap().is_empty());
     }
 
     #[test]

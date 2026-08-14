@@ -52,6 +52,18 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    Memories {
+        #[arg(long)]
+        from_ms: i64,
+        #[arg(long)]
+        to_ms: i64,
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     Favorite {
         #[command(subcommand)]
         command: FavoriteCommand,
@@ -118,6 +130,21 @@ enum JobsCommand {
 #[derive(Subcommand)]
 enum PackCommand {
     Status,
+}
+
+#[derive(Subcommand)]
+enum HistoryCommand {
+    Clear {
+        #[arg(long, value_enum)]
+        scope: HistoryScopeArg,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum HistoryScopeArg {
+    LastHour,
+    Today,
+    All,
 }
 
 #[tokio::main]
@@ -188,6 +215,24 @@ async fn request_from_command(
             from_ms,
             to_ms,
             limit,
+        },
+        Command::Memories {
+            from_ms,
+            to_ms,
+            limit,
+        } => Request::MemoriesList {
+            from_ms,
+            to_ms,
+            limit,
+        },
+        Command::History {
+            command: HistoryCommand::Clear { scope },
+        } => Request::ClearHistory {
+            scope: match scope {
+                HistoryScopeArg::LastHour => afterray_protocol::HistoryScope::LastHour,
+                HistoryScopeArg::Today => afterray_protocol::HistoryScope::Today,
+                HistoryScopeArg::All => afterray_protocol::HistoryScope::All,
+            },
         },
         Command::Favorite {
             command: FavoriteCommand::Add { moment_id },

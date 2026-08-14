@@ -135,6 +135,13 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.modelDir, "/tmp/models")
         XCTAssertFalse(settings.recordAudio)
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
+        XCTAssertTrue(settings.excludedBundleIds.isEmpty)
+    }
+
+    func testAppSettingsDecodesExcludedApps() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_bundle_ids":["com.apple.Safari"]}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari"])
     }
 
     func testModelLibraryDecodesInstalledPack() throws {

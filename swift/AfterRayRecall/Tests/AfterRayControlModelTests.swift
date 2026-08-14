@@ -171,13 +171,17 @@ private actor ControlDaemon: AfterRayDaemonServing {
         )
     }
 
-    func updateSettings(recordAudio: Bool) async throws -> AppSettings {
+    func updateSettings(recordAudio: Bool?, excludedBundleIds _: [String]?) async throws -> AppSettings {
         AppSettings(
             dataDir: "/tmp/afterray-data",
             modelDir: "/tmp/afterray-models",
-            recordAudio: recordAudio,
+            recordAudio: recordAudio ?? true,
             captureIntervalSeconds: 10
         )
+    }
+
+    func clearHistory(scope _: HistoryScope) async throws -> HistoryClearResult {
+        HistoryClearResult(deleted: 0, scope: "today")
     }
 
     func downloadModels(packID: String?) async throws -> ModelLibrary {

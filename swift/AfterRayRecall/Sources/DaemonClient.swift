@@ -50,9 +50,16 @@ public protocol AfterRayDaemonServing: RecallDaemonServing {
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
-    func updateSettings(recordAudio: Bool) async throws -> AppSettings
+    func updateSettings(recordAudio: Bool?, excludedBundleIds: [String]?) async throws -> AppSettings
     func downloadModels(packID: String?) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
+    func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
+}
+
+public extension AfterRayDaemonServing {
+    func updateSettings(recordAudio: Bool) async throws -> AppSettings {
+        try await updateSettings(recordAudio: recordAudio, excludedBundleIds: nil)
+    }
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
@@ -104,10 +111,24 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         try await request(WireRequest(type: "settings"), as: AppSettings.self)
     }
 
-    public func updateSettings(recordAudio: Bool) async throws -> AppSettings {
+    public func updateSettings(
+        recordAudio: Bool?,
+        excludedBundleIds: [String]?
+    ) async throws -> AppSettings {
         try await request(
-            WireRequest(type: "update_settings", recordAudio: recordAudio),
+            WireRequest(
+                type: "update_settings",
+                recordAudio: recordAudio,
+                excludedBundleIds: excludedBundleIds
+            ),
             as: AppSettings.self
+        )
+    }
+
+    public func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult {
+        try await request(
+            WireRequest(type: "clear_history", historyScope: scope.rawValue),
+            as: HistoryClearResult.self
         )
     }
 
@@ -233,6 +254,8 @@ struct WireRequest: Encodable, Equatable {
     var segmentID: String?
     var gopIndex: UInt16?
     var gopMode: String?
+    var excludedBundleIds: [String]?
+    var historyScope: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -253,6 +276,8 @@ struct WireRequest: Encodable, Equatable {
         case segmentID = "segment_id"
         case gopIndex = "index"
         case gopMode = "mode"
+        case excludedBundleIds = "excluded_bundle_ids"
+        case historyScope = "scope"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -275,6 +300,8 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(segmentID, forKey: .segmentID)
         try container.encodeIfPresent(gopIndex, forKey: .gopIndex)
         try container.encodeIfPresent(gopMode, forKey: .gopMode)
+        try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
+        try container.encodeIfPresent(historyScope, forKey: .historyScope)
     }
 }
 
@@ -307,7 +334,7 @@ private enum UnixLineTransport {
         guard let metaObject = header.data else { throw DaemonClientError.missingData }
         let nested = try JSONSerialization.data(withJSONObject: metaObject)
         let meta = try JSONDecoder().decode(ArtifactMeta.self, from: nested)
-        guard meta.byteLength >= 0, meta.byteLength <= 64 * 1_024 * 1_024 else {
+        guard meta.byteLength >= 0, meta.byteLength <= 8 * 1_024 * 1_024 else {
             throw DaemonClientError.invalidResponse
         }
         let bytes = try readExact(

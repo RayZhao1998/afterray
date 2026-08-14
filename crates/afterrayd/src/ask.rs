@@ -1,6 +1,6 @@
 use afterray_models::{JobState, ModelInput, ModelOutput, ModelQueue, QueueError};
 use afterray_protocol::{
-    ActivitySpan, AskAnswer, AskCitation, ModelLibrary, Response, SearchHit,
+    ActivitySpan, AskAnswer, AskCitation, Memory, ModelLibrary, Response, SearchHit,
     local_calendar_day_bounds_ms,
 };
 use afterray_store::Vault;
@@ -15,7 +15,8 @@ const CITATION_LIMIT: usize = 3;
 const EXCERPT_CHAR_CAP: usize = 180;
 const ASK_SYSTEM_PROMPT: &str = "You are AfterRay, a local memory assistant for this computer. \
 Answer only from the provided evidence. If the evidence does not contain the answer, say you do not know. \
-When you refer to a specific time or event, cite its moment id. Be concise. Never invent missing evidence.";
+When you mention a specific activity, cite it as a markdown link using the exact moment URL from the evidence, \
+for example [2:14 Safari](afterray://moment/MOMENT_ID). Be concise. Never invent missing evidence.";
 
 const MODEL_MISSING_MESSAGE: &str = "The local language model is not installed. Open Settings to download the LLM pack, then ask again.";
 
@@ -99,10 +100,15 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{taken}…")
 }
 
+pub(crate) fn moment_href(moment_id: &str) -> String {
+    format!("afterray://moment/{moment_id}")
+}
+
 pub(crate) fn build_ask_context(
     question: &str,
     from_ms: i64,
     to_ms: i64,
+    memories: &[Memory],
     spans: &[ActivitySpan],
     hits: &[SearchHit],
 ) -> String {
@@ -114,6 +120,31 @@ pub(crate) fn build_ask_context(
     body.push_str(" – ");
     body.push_str(&format_local_ms(to_ms));
     body.push('\n');
+
+    if memories.is_empty() {
+        if !push_capped(&mut body, "\nMemories: none yet for this range.\n") {
+            return body;
+        }
+    } else if !push_capped(&mut body, "\nMemories:\n") {
+        return body;
+    } else {
+        for memory in memories {
+            let mut line = format!(
+                "- [{}–{}] {}",
+                format_clock_ms(memory.start_ms),
+                format_clock_ms(memory.end_ms),
+                memory.summary
+            );
+            if let Some(moment_id) = &memory.moment_id {
+                line.push_str(" ");
+                line.push_str(&moment_href(moment_id));
+            }
+            line.push('\n');
+            if !push_capped(&mut body, &line) {
+                return body;
+            }
+        }
+    }
 
     if spans.is_empty() {
         if !push_capped(&mut body, "\nActivity: none recorded in this range.\n") {
@@ -135,8 +166,8 @@ pub(crate) fn build_ask_context(
                 line.push_str(detail);
             }
             if let Some(moment_id) = span_moment_id(span) {
-                line.push_str(" moment=");
-                line.push_str(moment_id);
+                line.push(' ');
+                line.push_str(&moment_href(moment_id));
             }
             line.push('\n');
             if !push_capped(&mut body, &line) {
@@ -150,8 +181,8 @@ pub(crate) fn build_ask_context(
     } else if push_capped(&mut body, "\nEvidence:\n") {
         for hit in hits.iter().take(SEARCH_HIT_LIMIT) {
             let line = format!(
-                "- moment={} at {} ({}): {}\n",
-                hit.moment_id,
+                "- {} at {} ({}): {}\n",
+                moment_href(&hit.moment_id),
                 format_clock_ms(hit.captured_at_ms),
                 hit.source,
                 truncate_chars(hit.text.trim(), EXCERPT_CHAR_CAP)
@@ -179,10 +210,28 @@ fn push_capped(buffer: &mut String, addition: &str) -> bool {
 }
 
 pub(crate) fn citations_from_evidence(
+    memories: &[Memory],
     spans: &[ActivitySpan],
     hits: &[SearchHit],
 ) -> Vec<AskCitation> {
     let mut citations = Vec::new();
+    for memory in memories {
+        let Some(moment_id) = memory.moment_id.as_deref() else {
+            continue;
+        };
+        citations.push(AskCitation {
+            moment_id: moment_id.to_owned(),
+            captured_at_ms: memory.start_ms,
+            label: memory
+                .application_name
+                .clone()
+                .unwrap_or_else(|| "Memory".to_owned()),
+            excerpt: memory.summary.clone(),
+        });
+        if citations.len() >= CITATION_LIMIT {
+            return citations;
+        }
+    }
     for hit in hits.iter().take(SEARCH_HIT_LIMIT) {
         if hit.moment_id.is_empty() {
             continue;
@@ -255,9 +304,20 @@ fn model_missing_error(message: &str) -> bool {
         || lower.contains("set afterray_llm_model")
 }
 
-fn missing_model_answer(spans: &[ActivitySpan]) -> AskAnswer {
+fn missing_model_answer(memories: &[Memory], spans: &[ActivitySpan]) -> AskAnswer {
     let mut answer = MODEL_MISSING_MESSAGE.to_owned();
-    if !spans.is_empty() {
+    if !memories.is_empty() {
+        answer.push_str("\n\nRemembered in this range:");
+        for memory in memories.iter().take(6) {
+            let _ = write!(
+                answer,
+                "\n• {}–{} {}",
+                format_clock_ms(memory.start_ms),
+                format_clock_ms(memory.end_ms),
+                memory.summary
+            );
+        }
+    } else if !spans.is_empty() {
         answer.push_str("\n\nRecorded in this range:");
         for span in spans.iter().take(8) {
             let _ = write!(
@@ -274,7 +334,7 @@ fn missing_model_answer(spans: &[ActivitySpan]) -> AskAnswer {
     }
     AskAnswer {
         answer,
-        citations: citations_from_evidence(spans, &[]),
+        citations: citations_from_evidence(memories, spans, &[]),
         model_missing: true,
     }
 }
@@ -298,6 +358,13 @@ pub(crate) async fn handle_ask(
         Ok(spans) => spans,
         Err(error) => return Response::failure(error.to_string()),
     };
+    let memories = match store.memories(from_ms, to_ms, 40) {
+        Ok(memories) => memories,
+        Err(error) => {
+            eprintln!("ask memories unavailable: {error}");
+            Vec::new()
+        }
+    };
 
     let search =
         match search_hits(store, models, question, SEARCH_HIT_LIMIT.saturating_mul(2)).await {
@@ -308,13 +375,13 @@ pub(crate) async fn handle_ask(
             }
         };
     let hits: Vec<SearchHit> = search.into_iter().take(SEARCH_HIT_LIMIT).collect();
-    let citations = citations_from_evidence(&spans, &hits);
+    let citations = citations_from_evidence(&memories, &spans, &hits);
 
     if !llm_present {
-        return Response::success(missing_model_answer(&spans));
+        return Response::success(missing_model_answer(&memories, &spans));
     }
 
-    if spans.is_empty() && hits.is_empty() {
+    if memories.is_empty() && spans.is_empty() && hits.is_empty() {
         return Response::success(AskAnswer {
             answer: "I don't have any recorded moments for this time range yet.".to_owned(),
             citations,
@@ -322,7 +389,7 @@ pub(crate) async fn handle_ask(
         });
     }
 
-    let prompt = build_ask_context(question, from_ms, to_ms, &spans, &hits);
+    let prompt = build_ask_context(question, from_ms, to_ms, &memories, &spans, &hits);
     let job_id = match models
         .submit(ModelInput::Llm {
             prompt,
@@ -332,7 +399,7 @@ pub(crate) async fn handle_ask(
     {
         Ok(id) => id,
         Err(QueueError::MissingAdapter(_)) => {
-            return Response::success(missing_model_answer(&spans));
+            return Response::success(missing_model_answer(&memories, &spans));
         }
         Err(error) => return Response::failure(error.to_string()),
     };
@@ -359,7 +426,7 @@ pub(crate) async fn handle_ask(
                 .last_error
                 .unwrap_or_else(|| "ask job did not complete".to_owned());
             if model_missing_error(&error) {
-                Response::success(missing_model_answer(&spans))
+                Response::success(missing_model_answer(&memories, &spans))
             } else {
                 Response::failure(error)
             }
@@ -459,7 +526,7 @@ mod tests {
                 score: 1.0,
             })
             .collect();
-        let context = build_ask_context("what", 0, 10, &spans, &hits);
+        let context = build_ask_context("what", 0, 10, &[], &spans, &hits);
         assert!(context.chars().count() <= CONTEXT_CHAR_CAP);
         assert!(context.contains("Question: what"));
     }
@@ -485,7 +552,7 @@ mod tests {
             text: "design review notes".into(),
             score: 2.0,
         }];
-        let citations = citations_from_evidence(&spans, &hits);
+        let citations = citations_from_evidence(&[], &spans, &hits);
         assert_eq!(citations.len(), 2);
         assert_eq!(citations[0].moment_id, "m2");
         assert_eq!(citations[0].excerpt, "design review notes");

@@ -58,9 +58,12 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadProgress: Double?
     @Published var downloadStatus: String?
     @Published var isUpdatingAudio = false
+    @Published var isUpdatingExclusions = false
+    @Published var isClearingHistory = false
     @Published var recentJobs: [ModelJob] = []
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
+    var excludedBundleIds: [String] { settings?.excludedBundleIds ?? [] }
     var dataDirectoryPath: String {
         settings?.dataDir ?? DaemonSupervisor.shared.dataDirectory.path
     }
@@ -99,6 +102,55 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         }
     }
 
+    func excludeBundle(_ bundleID: String) async {
+        var next = excludedBundleIds
+        guard !bundleID.isEmpty, !next.contains(bundleID) else { return }
+        next.append(bundleID)
+        await saveExclusions(next, message: "Excluded \(bundleID).")
+    }
+
+    func includeBundle(_ bundleID: String) async {
+        await saveExclusions(excludedBundleIds.filter { $0 != bundleID }, message: "Included \(bundleID) again.")
+    }
+
+    func excludeFrontmostApp() async {
+        guard
+            let application = NSWorkspace.shared.frontmostApplication,
+            let bundleID = application.bundleIdentifier,
+            bundleID != "dev.afterray.app"
+        else {
+            message = "Could not read the frontmost app."
+            return
+        }
+        await excludeBundle(bundleID)
+    }
+
+    func clearHistory(_ scope: HistoryScope) async {
+        isClearingHistory = true
+        defer { isClearingHistory = false }
+        do {
+            let result = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).clearHistory(scope: scope)
+            message = "Deleted \(result.deleted) moment\(result.deleted == 1 ? "" : "s")."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func saveExclusions(_ ids: [String], message: String) async {
+        isUpdatingExclusions = true
+        defer { isUpdatingExclusions = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(recordAudio: nil, excludedBundleIds: ids)
+            self.message = message
+        } catch {
+            self.message = error.localizedDescription
+        }
+    }
+
     func setRecordAudio(_ enabled: Bool) async {
         guard enabled != recordAudio else { return }
         isUpdatingAudio = true
@@ -107,7 +159,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         do {
             settings = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
-            ).updateSettings(recordAudio: enabled)
+            ).updateSettings(recordAudio: enabled, excludedBundleIds: nil)
             message = enabled
                 ? "Audio recording is on."
                 : "Audio recording is off. Existing recordings stay in your vault."

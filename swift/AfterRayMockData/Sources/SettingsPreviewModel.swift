@@ -24,7 +24,10 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadProgress: Double?
     @Published public var downloadStatus: String?
     @Published public var isUpdatingAudio = false
+    @Published public var isUpdatingExclusions = false
+    @Published public var isClearingHistory = false
     @Published public var recordAudio = true
+    @Published public var excludedBundleIds: [String] = []
     @Published public var recentJobs: [ModelJob] = [
         ModelJob(
             id: "job-asr",
@@ -97,6 +100,24 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     public func setRecordAudio(_ enabled: Bool) async {
         recordAudio = enabled
         message = enabled ? "Audio recording is on." : "Audio recording is off."
+    }
+
+    public func excludeBundle(_ bundleID: String) async {
+        if !excludedBundleIds.contains(bundleID) {
+            excludedBundleIds.append(bundleID)
+        }
+    }
+
+    public func includeBundle(_ bundleID: String) async {
+        excludedBundleIds.removeAll { $0 == bundleID }
+    }
+
+    public func excludeFrontmostApp() async {
+        await excludeBundle("com.apple.Safari")
+    }
+
+    public func clearHistory(_: HistoryScope) async {
+        message = "Deleted preview history."
     }
 
     public func reveal(_ path: String) {

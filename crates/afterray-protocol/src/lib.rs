@@ -84,6 +84,17 @@ pub enum Request {
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded_bundle_ids: Option<Vec<String>>,
+    },
+    ClearHistory {
+        scope: HistoryScope,
+    },
+    MemoriesList {
+        from_ms: i64,
+        to_ms: i64,
+        #[serde(default = "default_memories_limit")]
+        limit: usize,
     },
     DownloadModels {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +183,41 @@ pub struct AppSettings {
     pub model_dir: String,
     pub record_audio: bool,
     pub capture_interval_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_bundle_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryScope {
+    LastHour,
+    Today,
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Memory {
+    pub id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    pub summary: String,
+    pub fingerprint: String,
+}
+
+fn default_memories_limit() -> usize {
+    40
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,7 +505,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
-                record_audio: Some(false)
+                record_audio: Some(false),
+                excluded_bundle_ids: None,
             })
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
@@ -576,6 +623,17 @@ mod tests {
         let decoded: ActivitySpan = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, span);
         assert!(!json.contains("document"));
+    }
+
+    #[test]
+    fn clear_history_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ClearHistory {
+                scope: HistoryScope::LastHour
+            })
+            .unwrap(),
+            r#"{"type":"clear_history","scope":"last_hour"}"#
+        );
     }
 
     #[test]

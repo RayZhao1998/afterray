@@ -1,5 +1,6 @@
 mod ask;
 mod gop_packer;
+mod memory;
 
 use afterray_codec::CONTENT_TYPE_IVF_AV01;
 use afterray_models::{
@@ -11,12 +12,12 @@ use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus,
-    RecordingState, Request, Response, SearchHit, Status,
+    AppSettings, ArtifactPayload, HistoryScope, ModelDownloadProgress, PROTOCOL_VERSION,
+    PackStatus, RecordingState, Request, Response, SearchHit, Status, local_calendar_day_bounds_ms,
 };
 use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
 use anyhow::Context;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -110,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         gop_packer::GopPackerConfig::from_env(),
     ));
     let capture_busy = Arc::new(AtomicBool::new(false));
+    let last_capture_ms = Arc::new(AtomicI64::new(0));
     let state = Arc::new(AppState {
         store,
         capture,
@@ -126,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
         shutdown: shutdown_tx,
         packer,
         capture_busy,
+        last_capture_ms,
+        excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
+        memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -228,12 +233,17 @@ struct AppState {
     shutdown: tokio::sync::watch::Sender<bool>,
     packer: Arc<gop_packer::GopPacker>,
     capture_busy: Arc<AtomicBool>,
+    last_capture_ms: Arc<AtomicI64>,
+    excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
+    memories: std::sync::Mutex<memory::MemoryRuntime>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedSettings {
     #[serde(default = "default_record_audio")]
     record_audio: bool,
+    #[serde(default)]
+    excluded_bundle_ids: Vec<String>,
 }
 
 const fn default_record_audio() -> bool {
@@ -242,7 +252,10 @@ const fn default_record_audio() -> bool {
 
 impl Default for PersistedSettings {
     fn default() -> Self {
-        Self { record_audio: true }
+        Self {
+            record_audio: true,
+            excluded_bundle_ids: Vec::new(),
+        }
     }
 }
 
@@ -412,7 +425,16 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             .await
         }
         Request::Settings => Response::success(current_settings(state)),
-        Request::UpdateSettings { record_audio } => update_settings(state, record_audio).await,
+        Request::UpdateSettings {
+            record_audio,
+            excluded_bundle_ids,
+        } => update_settings(state, record_audio, excluded_bundle_ids).await,
+        Request::ClearHistory { scope } => clear_history(state, scope).await,
+        Request::MemoriesList {
+            from_ms,
+            to_ms,
+            limit,
+        } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
         Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
@@ -503,11 +525,13 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
     let capture_busy = Arc::clone(&state.capture_busy);
+    let last_capture_ms = Arc::clone(&state.last_capture_ms);
     let scheduler = tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         loop {
             timer.tick().await;
             capture_busy.store(true, Ordering::SeqCst);
+            last_capture_ms.store(now_ms(), Ordering::SeqCst);
             let request_id = Uuid::now_v7().to_string();
             let result = capture.capture_screen(&request_id).await;
             capture_busy.store(false, Ordering::SeqCst);
@@ -561,19 +585,37 @@ fn current_settings(state: &AppState) -> AppSettings {
         model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
+        excluded_bundle_ids: state
+            .excluded_bundle_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default(),
     }
 }
 
-async fn update_settings(state: &Arc<AppState>, record_audio: Option<bool>) -> Response {
+fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
+    save_persisted_settings(
+        &state.data_dir,
+        &PersistedSettings {
+            record_audio: state.capture.record_audio(),
+            excluded_bundle_ids: state
+                .excluded_bundle_ids
+                .lock()
+                .map(|ids| ids.clone())
+                .unwrap_or_default(),
+        },
+    )
+}
+
+async fn update_settings(
+    state: &Arc<AppState>,
+    record_audio: Option<bool>,
+    excluded_bundle_ids: Option<Vec<String>>,
+) -> Response {
     if let Some(enabled) = record_audio {
         let previous = state.capture.record_audio();
         state.capture.set_record_audio(enabled);
-        if let Err(error) = save_persisted_settings(
-            &state.data_dir,
-            &PersistedSettings {
-                record_audio: enabled,
-            },
-        ) {
+        if let Err(error) = persist_current_settings(state) {
             state.capture.set_record_audio(previous);
             return Response::failure(format!("could not save settings: {error}"));
         }
@@ -585,7 +627,67 @@ async fn update_settings(state: &Arc<AppState>, record_audio: Option<bool>) -> R
             ));
         }
     }
+    if let Some(ids) = excluded_bundle_ids {
+        let cleaned = normalize_bundle_ids(ids);
+        {
+            let mut excluded = state
+                .excluded_bundle_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *excluded = cleaned;
+        }
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save settings: {error}"));
+        }
+    }
     Response::success(current_settings(state))
+}
+
+fn normalize_bundle_ids(ids: Vec<String>) -> Vec<String> {
+    let mut cleaned = ids
+        .into_iter()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
+}
+
+fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
+    let Some(bundle_id) = bundle_id else {
+        return false;
+    };
+    state
+        .excluded_bundle_ids
+        .lock()
+        .map(|ids| ids.iter().any(|id| id == bundle_id))
+        .unwrap_or(false)
+}
+
+async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
+    let now = now_ms();
+    let (from_ms, to_ms) = match scope {
+        HistoryScope::LastHour => (now.saturating_sub(60 * 60 * 1000), now),
+        HistoryScope::Today => local_calendar_day_bounds_ms(now),
+        HistoryScope::All => (0, now),
+    };
+    memory::flush(
+        &state.store,
+        &state.models,
+        &state.memories,
+        ask::llm_pack_present(&model_library(state)),
+    )
+    .await;
+    match state.store.delete_history(from_ms, to_ms) {
+        Ok(deleted) => Response::success(serde_json::json!({
+            "scope": scope,
+            "deleted": deleted,
+            "from_ms": from_ms,
+            "to_ms": to_ms,
+        })),
+        Err(error) => Response::failure(error.to_string()),
+    }
 }
 
 fn settings_path(data_dir: &Path) -> PathBuf {
@@ -608,6 +710,8 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
+    let llm_present = ask::llm_pack_present(&model_library(state));
+    memory::flush(&state.store, &state.models, &state.memories, llm_present).await;
     let _ = state
         .store
         .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
@@ -616,6 +720,7 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
         let Some(session_id) = recording.active_session_id.take() else {
             return Response::success(serde_json::json!({"already_stopped": true}));
         };
+        state.last_capture_ms.store(0, Ordering::SeqCst);
         (
             session_id,
             recording.scheduler.take(),
@@ -814,6 +919,14 @@ async fn import_artifact(
             });
         }
         ArtifactKind::Accessibility => {
+            let metadata = serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
+            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref()) {
+                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms) {
+                    let _ = state.store.delete_moment_and_artifacts(&moment_id);
+                }
+                tokio::fs::remove_file(path).await?;
+                return Ok(());
+            }
             let attached = attach_accessibility_artifact(
                 &state.store,
                 session_id,
@@ -821,7 +934,21 @@ async fn import_artifact(
                 content_type,
                 &bytes,
             )?;
-            if attached.is_none() {
+            if attached.is_some() {
+                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
+                {
+                    memory::observe_and_maybe_commit(
+                        &state.store,
+                        &state.models,
+                        &state.memories,
+                        started_at_ms,
+                        &moment_id,
+                        &bytes,
+                        ask::llm_pack_present(&model_library(state)),
+                    )
+                    .await;
+                }
+            } else {
                 eprintln!(
                     "accessibility snapshot had no screen moment within the two-second alignment window"
                 );
@@ -854,6 +981,16 @@ fn attach_accessibility_artifact(
         metadata.application_name.as_deref(),
         metadata.bundle_identifier.as_deref(),
     )
+}
+
+fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Option<String> {
+    store
+        .moments_sync(session_id)
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
+        .map(|moment| moment.id)
 }
 
 async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {
@@ -1034,9 +1171,20 @@ fn spawn_gop_packer(state: Arc<AppState>) {
         let mut timer = tokio::time::interval(Duration::from_secs(5));
         loop {
             timer.tick().await;
+            let recording = match state.recording.try_lock() {
+                Ok(runtime) => runtime.active_session_id.is_some(),
+                Err(_) => true,
+            };
             if state.capture_busy.load(Ordering::SeqCst)
                 || state.packer.encode_busy()
                 || state.models.ocr_in_flight()
+                || gop_packer::should_yield_to_capture(
+                    false,
+                    recording,
+                    state.last_capture_ms.load(Ordering::SeqCst),
+                    now_ms(),
+                    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
+                )
             {
                 continue;
             }
@@ -1474,5 +1622,349 @@ print(json.dumps({
         let packed = vault.moments_sync(&session.id).unwrap();
         assert!(packed[0].gop.is_some());
         assert!(packed[0].image_artifact_id.is_none());
+    }
+
+    fn live_socket() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("AFTERRAY_SOCKET") {
+            return Some(std::path::PathBuf::from(path));
+        }
+        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.afterray-dev/afterray.sock");
+        dev.exists().then_some(dev)
+    }
+
+    fn daemon_rpc(
+        socket: &std::path::Path,
+        request: afterray_protocol::Request,
+    ) -> afterray_protocol::Response {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)
+            .unwrap_or_else(|error| panic!("connect {}: {error}", socket.display()));
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn daemon_read_artifact(socket: &std::path::Path, artifact_id: &str) -> Vec<u8> {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        let mut bytes = serde_json::to_vec(&afterray_protocol::Request::ReadArtifact {
+            artifact_id: artifact_id.to_owned(),
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let header: afterray_protocol::Response = serde_json::from_str(&line).unwrap();
+        assert!(header.ok, "read_artifact {artifact_id}: {:?}", header.error);
+        let meta: afterray_protocol::ArtifactMeta =
+            serde_json::from_value(header.data.unwrap()).unwrap();
+        assert!(meta.byte_length > 0 && meta.byte_length <= 8 * 1024 * 1024);
+        let mut body = vec![0_u8; usize::try_from(meta.byte_length).unwrap()];
+        reader.read_exact(&mut body).unwrap();
+        assert!(
+            body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "live still {artifact_id} is not JPEG"
+        );
+        body
+    }
+
+    fn is_loginwindow(moment: &afterray_protocol::Moment) -> bool {
+        moment
+            .application_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("loginwindow"))
+            || moment
+                .bundle_identifier
+                .as_deref()
+                .is_some_and(|bundle| bundle.to_ascii_lowercase().contains("loginwindow"))
+    }
+
+    #[test]
+    fn verify_production_stills_end_to_end() {
+        if std::env::var_os("AFTERRAY_GOP_VERIFY").is_none() {
+            eprintln!("skip: set AFTERRAY_GOP_VERIFY=1 to pull live stills");
+            return;
+        }
+        let Some(socket) = live_socket() else {
+            eprintln!("skip: live afterrayd socket not found");
+            return;
+        };
+        let max_segments: usize = std::env::var("AFTERRAY_GOP_VERIFY_MAX")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(6);
+        let status = daemon_rpc(&socket, afterray_protocol::Request::Status);
+        assert!(status.ok, "live daemon status failed: {:?}", status.error);
+        let status: afterray_protocol::Status =
+            serde_json::from_value(status.data.unwrap()).unwrap();
+        assert_eq!(status.protocol_version, afterray_protocol::PROTOCOL_VERSION);
+        assert_eq!(status.schema_version, afterray_store::SCHEMA_VERSION);
+
+        let pack = daemon_rpc(&socket, afterray_protocol::Request::PackStatus);
+        let pack: afterray_protocol::PackStatus =
+            serde_json::from_value(pack.data.unwrap()).unwrap();
+        assert!(!pack.keep_stills, "Dual keep_stills must stay off");
+        assert_eq!(pack.keyint, 12);
+        assert_eq!(pack.hot_window_seconds, 7200);
+
+        let timeline = daemon_rpc(&socket, afterray_protocol::Request::TimelineList);
+        assert!(timeline.ok, "timeline_list failed: {:?}", timeline.error);
+        let moments: Vec<afterray_protocol::Moment> =
+            serde_json::from_value(timeline.data.unwrap()).unwrap();
+        assert!(!moments.is_empty(), "live vault has no moments");
+
+        let now = now_ms();
+        let cutoff = now.saturating_sub(7_200_000);
+        let mut hot_jpeg = 0_usize;
+        let mut cold_jpeg = 0_usize;
+        let mut already_gop = 0_usize;
+        let mut favorites = 0_usize;
+        let mut loginwindow = 0_usize;
+        let mut missing_still = 0_usize;
+        for moment in &moments {
+            if is_loginwindow(moment) {
+                loginwindow += 1;
+                assert!(
+                    moment.gop.is_none(),
+                    "live loginwindow {} is packed",
+                    moment.id
+                );
+            }
+            if moment.is_favorite {
+                favorites += 1;
+            }
+            if moment.gop.is_some() {
+                already_gop += 1;
+                if !moment.is_favorite {
+                    assert!(
+                        moment.image_artifact_id.is_none(),
+                        "live Dual leftover {}",
+                        moment.id
+                    );
+                }
+            } else if moment.image_artifact_id.is_some() {
+                if moment.captured_at_ms > cutoff {
+                    hot_jpeg += 1;
+                } else {
+                    cold_jpeg += 1;
+                }
+            } else {
+                missing_still += 1;
+            }
+        }
+        eprintln!(
+            "live vault: moments={} hot_jpeg={} cold_jpeg={} gop={} favorites={} loginwindow={} missing={}",
+            moments.len(),
+            hot_jpeg,
+            cold_jpeg,
+            already_gop,
+            favorites,
+            loginwindow,
+            missing_still
+        );
+        assert_eq!(missing_still, 0, "live unpacked moment has no JPEG");
+        assert!(
+            cold_jpeg > 0,
+            "need cold production JPEGs outside the 2h window"
+        );
+
+        let mut dense: Vec<&afterray_protocol::Moment> = Vec::new();
+        for moment in &moments {
+            if moment.gop.is_some()
+                || moment.image_artifact_id.is_none()
+                || is_loginwindow(moment)
+                || moment.captured_at_ms > cutoff
+            {
+                continue;
+            }
+            if let Some(previous) = dense.last()
+                && moment
+                    .captured_at_ms
+                    .saturating_sub(previous.captured_at_ms)
+                    > 30_000
+            {
+                if dense.len() >= 12 {
+                    break;
+                }
+                dense.clear();
+            }
+            dense.push(moment);
+            if dense.len() >= max_segments.saturating_mul(12) {
+                break;
+            }
+        }
+        assert!(
+            dense.len() >= 2,
+            "could not find a dense cold run in production timeline"
+        );
+        eprintln!(
+            "sampling {} cold stills from {} → {}",
+            dense.len(),
+            dense
+                .first()
+                .unwrap()
+                .application_name
+                .as_deref()
+                .unwrap_or("?"),
+            dense
+                .last()
+                .unwrap()
+                .application_name
+                .as_deref()
+                .unwrap_or("?")
+        );
+
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let mut want = 0_usize;
+        for moment in &dense {
+            let jpeg = daemon_read_artifact(
+                socket.as_path(),
+                moment.image_artifact_id.as_deref().unwrap(),
+            );
+            want += jpeg.len();
+            let inserted = vault
+                .insert_moment(&session.id, moment.captured_at_ms, "image/jpeg", &jpeg)
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&inserted.id),
+                    None,
+                    "ocr",
+                    "prod",
+                    moment.captured_at_ms,
+                    None,
+                    "ocr",
+                )
+                .unwrap();
+        }
+        eprintln!("imported {want} JPEG bytes into an isolated vault");
+
+        let policy = afterray_store::PackPolicy {
+            hot_window_ms: 0,
+            hot_min_stills: 0,
+            ocr_grace_ms: 0,
+            keyint: 12,
+        };
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            require_ac: false,
+            policy: policy.clone(),
+        });
+        let mut packed = 0_usize;
+        let mut ivf_bytes = 0_usize;
+        let mut jpeg_bytes = 0_usize;
+        let mut multi_frame = None;
+        for _ in 0..max_segments {
+            let candidates = vault.list_pack_candidates(now, &policy).unwrap();
+            let Some(run) = afterray_store::fold_pack_runs(&candidates, 12)
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            for frame in &run {
+                jpeg_bytes += vault
+                    .read_artifact(&frame.image_artifact_id)
+                    .unwrap()
+                    .bytes
+                    .len();
+            }
+            let segment = packer
+                .pack_one(&vault, now)
+                .unwrap_or_else(|error| panic!("pack failed: {error:#}"))
+                .expect("production stills should pack");
+            let view = vault.gop_segment_view(&segment).unwrap();
+            assert_eq!(view.codec, "av01");
+            assert_eq!(view.encoder, "rav1e");
+            assert_eq!(view.frames.len(), run.len());
+            let payload = vault.read_gop_artifact(&segment).unwrap();
+            assert!(payload.bytes.starts_with(b"DKIF"));
+            assert_eq!(
+                afterray_codec::parse_ivf(&payload.bytes)
+                    .unwrap()
+                    .frames
+                    .len(),
+                view.frames.len()
+            );
+            ivf_bytes += payload.bytes.len();
+            let poster = gop_packer::read_gop_frame(
+                &vault,
+                &segment,
+                0,
+                afterray_protocol::GopReadMode::Poster,
+            )
+            .unwrap();
+            assert_eq!(
+                afterray_codec::parse_ivf(&poster.bytes)
+                    .unwrap()
+                    .frames
+                    .len(),
+                1
+            );
+            let last = u16::try_from(view.frames.len() - 1).unwrap();
+            let exact = gop_packer::read_gop_frame(
+                &vault,
+                &segment,
+                last,
+                afterray_protocol::GopReadMode::Exact,
+            )
+            .unwrap();
+            assert_eq!(
+                afterray_codec::parse_ivf(&exact.bytes)
+                    .unwrap()
+                    .frames
+                    .len(),
+                view.frames.len()
+            );
+            for moment in vault.moments_sync(&session.id).unwrap() {
+                if moment
+                    .gop
+                    .as_ref()
+                    .is_some_and(|gop| gop.segment_id == segment)
+                {
+                    assert!(moment.image_artifact_id.is_none(), "Dual JPEG leftover");
+                }
+            }
+            if view.frames.len() > 1 {
+                multi_frame = Some((segment.clone(), payload.bytes.clone()));
+            }
+            packed += 1;
+        }
+        assert!(packed > 0, "no GOP packed from production stills");
+        let ratio = ivf_bytes as f64 / jpeg_bytes.max(1) as f64;
+        eprintln!(
+            "packed {packed} GOP(s) jpeg={jpeg_bytes} ivf={ivf_bytes} ratio={ratio:.4} ({:.1}x)",
+            1.0 / ratio
+        );
+        assert!(
+            ratio < 0.20,
+            "GOP should beat 5x vs JPEG, got {:.1}%",
+            ratio * 100.0
+        );
+        assert_eq!(vault.cleanup_unreferenced_gop_artifacts().unwrap(), 0);
+
+        let Some((segment, ivf)) = multi_frame else {
+            panic!("expected at least one multi-frame production GOP");
+        };
+        let ivf_path = std::path::Path::new("/tmp/afterray-gop-verify-prod.ivf");
+        std::fs::write(ivf_path, &ivf).unwrap();
+        let status = std::process::Command::new("swift")
+            .arg("scripts/prove-av1-decode.swift")
+            .arg(ivf_path)
+            .current_dir(env!("CARGO_MANIFEST_DIR").to_owned() + "/../..")
+            .status()
+            .expect("run prove-av1-decode.swift");
+        assert!(
+            status.success(),
+            "VideoToolbox failed to decode production GOP {segment}"
+        );
     }
 }
