@@ -219,9 +219,13 @@ public struct RecallView: View {
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
                             hasMore: summaryHistoryHasMore,
                             isLoadingMore: isLoadingSummaryHistory,
+                            thumbnailLoader: thumbnailLoader,
                             onSelectSlot: { selectPlayhead(playheadMs: $0) },
                             onLoadMore: { onLoadOlderSummaryHistory?() }
                         )
+                        // The panel owns every scroll that starts over it —
+                        // vertical reads there must not scrub the timeline.
+                        .background(ScrollFenceView())
                         Spacer(minLength: 0)
                     }
                     .padding(.horizontal, RecallGeometry.overlayChromeMargin)
@@ -1475,34 +1479,7 @@ private struct ApplicationIcon: View {
     }
 
     private var icon: NSImage? {
-        AppIconCache.icon(bundleIdentifier: bundleIdentifier)
-    }
-}
-
-/// Both halves of an app icon lookup — resolving the bundle id to a URL and
-/// reading the icon — go through Launch Services and the disk. This used to
-/// be a computed property on the view, so every drawn timeline segment
-/// repeated both on every frame of a scroll.
-private enum AppIconCache {
-    private static let cache = NSCache<NSString, NSImage>()
-    /// Marks "looked it up, there is no icon", so a missing app does not
-    /// re-query Launch Services forever.
-    private static let absent = NSImage(size: .zero)
-
-    static func icon(bundleIdentifier: String?) -> NSImage? {
-        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
-        let key = bundleIdentifier as NSString
-        if let cached = cache.object(forKey: key) {
-            return cached === absent ? nil : cached
-        }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
-        else {
-            cache.setObject(absent, forKey: key)
-            return nil
-        }
-        let icon = NSWorkspace.shared.icon(forFile: url.path)
-        cache.setObject(icon, forKey: key)
-        return icon
+        AppIconLookup.icon(bundleIdentifier: bundleIdentifier)
     }
 }
 
@@ -1557,11 +1534,20 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         var onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
         private var monitor: Any?
         private var displayLink: CADisplayLink?
-        private var pendingDelta: CGFloat = 0
+        /// Gesture deltas awaiting the next frame — emitted 1:1, uncapped.
+        /// The old ±160 accumulator with a 40-point/frame drain threw away
+        /// most of every hard flick; that ceiling was the "sticky" feel.
+        private var pendingDirect: CGFloat = 0
         private var pendingIsPrecise = true
         private var pendingEnd = false
         private var isScrolling = false
         private var lastEventTime: CFTimeInterval = 0
+        private var lastFrameTime: CFTimeInterval = 0
+        /// Our own deceleration. System momentum events are swallowed:
+        /// macOS restarts momentum on every flick, whereas stacking releases
+        /// is exactly the accelerate-by-repeated-swipes feel being asked for.
+        private var inertia = ScrubInertia()
+        private var flick = FlickSampler()
 
         init(onScroll: @escaping (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void) {
             self.onScroll = onScroll
@@ -1570,27 +1556,56 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         func start() {
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
                 guard let self, self.shouldHandle(event) else { return event }
+                guard let window = self.hostView?.window else { return event }
+                let location = self.locationInOverlay(event, window: window)
+                // Fenced regions (the history panel) own their scrolls on
+                // both axes — a vertical read-scroll there must never scrub,
+                // and neither must its diagonal component.
+                if ScrollFenceRegistry.shared.contains(windowPoint: location, in: window) {
+                    return event
+                }
                 let horizontal = abs(event.scrollingDeltaX) >= abs(event.scrollingDeltaY)
                 // Horizontal scrubs always belong to the timeline. A trailing
                 // details/search NSScrollView was swallowing those events and
                 // doing nothing with them — the right side felt dead.
                 if !horizontal,
-                   let window = self.hostView?.window,
-                   self.shouldDeferToDocumentScroll(
-                       at: self.locationInOverlay(event, window: window),
-                       in: window
-                   )
+                   self.shouldDeferToDocumentScroll(at: location, in: window)
                 {
                     return event
                 }
                 let delta = horizontal ? event.scrollingDeltaX : event.scrollingDeltaY
-                pendingDelta = RecallGeometry.accumulatedScrollDelta(
-                    current: pendingDelta,
-                    incoming: delta
-                )
-                pendingIsPrecise = event.hasPreciseScrollingDeltas
-                pendingEnd = event.phase == .ended || event.momentumPhase == .ended
-                lastEventTime = CACurrentMediaTime()
+                let now = CACurrentMediaTime()
+
+                if event.hasPreciseScrollingDeltas {
+                    if event.momentumPhase != [] {
+                        // Swallow system momentum entirely; ours replaces it.
+                        return nil
+                    }
+                    switch event.phase {
+                    case .began:
+                        flick.reset()
+                        inertia.fingerMoved(delta: Double(delta))
+                    case .changed:
+                        inertia.fingerMoved(delta: Double(delta))
+                        pendingDirect += delta
+                        flick.record(delta: Double(delta), at: now)
+                    case .ended:
+                        inertia.release(pointsPerSecond: flick.releaseVelocity(at: now))
+                        pendingEnd = true
+                    case .cancelled:
+                        flick.reset()
+                        pendingEnd = true
+                    default:
+                        // Precise deltas without phases (some mice): direct.
+                        pendingDirect += delta
+                    }
+                    pendingIsPrecise = true
+                } else {
+                    pendingDirect += delta
+                    pendingIsPrecise = false
+                    pendingEnd = true
+                }
+                lastEventTime = now
                 isScrolling = true
                 return nil
             }
@@ -1649,19 +1664,26 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             displayLink = nil
         }
 
-        @objc private func displayLinkDidFire(_: CADisplayLink) {
-            let drained = RecallGeometry.drainScrollDelta(pendingDelta)
-            let delta = drained.emitted
-            pendingDelta = drained.remaining
+        @objc private func displayLinkDidFire(_ link: CADisplayLink) {
+            let now = link.timestamp
+            let dt = lastFrameTime == 0 ? 1.0 / 120.0 : min(now - lastFrameTime, 0.05)
+            lastFrameTime = now
+
+            // Direct gesture movement passes through whole — the finger is
+            // the authority — and the glide integrates on top.
+            let direct = pendingDirect
+            pendingDirect = 0
+            let glide = CGFloat(inertia.step(dt: dt))
+            let delta = direct + glide
             if delta != 0 {
                 onScroll(delta, pendingIsPrecise, false)
             }
 
-            let drainedCompletely = abs(pendingDelta) < 0.001
+            let quiet = direct == 0 && !inertia.isCoasting
             let wentIdle = isScrolling
-                && drainedCompletely
+                && quiet
                 && CACurrentMediaTime() - lastEventTime >= 0.075
-            if drainedCompletely, pendingEnd || wentIdle {
+            if quiet, pendingEnd || wentIdle {
                 pendingEnd = false
                 isScrolling = false
                 onScroll(0, pendingIsPrecise, true)

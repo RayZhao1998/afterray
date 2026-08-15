@@ -9,6 +9,7 @@ struct DaySummaryPanel: View {
     let nowMs: Int64
     let hasMore: Bool
     let isLoadingMore: Bool
+    let thumbnailLoader: RecallThumbnailLoader?
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
 
@@ -90,6 +91,7 @@ struct DaySummaryPanel: View {
                             summary: summary,
                             playheadMs: playheadMs,
                             nowMs: nowMs,
+                            thumbnailLoader: thumbnailLoader,
                             onSelectSlot: onSelectSlot
                         )
                     }
@@ -110,6 +112,9 @@ struct DaySummaryPanel: View {
 
     private func scrollToCurrent(_ proxy: ScrollViewProxy) {
         guard let highlightedStart else { return }
+        // The user reading the panel outranks the playhead: yanking the list
+        // to the highlighted slot mid-read is the jank being reported.
+        if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -122,6 +127,7 @@ private struct DaySummarySection: View {
     let summary: DaySummary
     let playheadMs: Int64
     let nowMs: Int64
+    let thumbnailLoader: RecallThumbnailLoader?
     let onSelectSlot: (Int64) -> Void
 
     private var heading: DaySummaryHeading {
@@ -163,6 +169,7 @@ private struct DaySummarySection: View {
                     DaySummaryRow(
                         slot: slot,
                         isCurrent: slot.slotStartMs == highlightedStart,
+                        thumbnailLoader: thumbnailLoader,
                         onSelect: { onSelectSlot(slot.slotStartMs) }
                     )
                     .id(slot.slotStartMs)
@@ -199,6 +206,7 @@ private struct HistorySummaryLoadTrigger: View {
 private struct DaySummaryRow: View {
     let slot: DaySlotSummary
     let isCurrent: Bool
+    let thumbnailLoader: RecallThumbnailLoader?
     let onSelect: () -> Void
     @State private var isHovering = false
 
@@ -250,6 +258,18 @@ private struct DaySummaryRow: View {
                             .background(badgeTint(badge).opacity(0.14), in: Capsule())
                             .accessibilityLabel("Summary status: \(badge)")
                     }
+
+                    if !slot.facts.apps.isEmpty {
+                        SlotAppIconStrip(apps: slot.facts.apps)
+                            .padding(.top, 2)
+                    }
+                }
+
+                if let anchorMomentId = slot.anchorMomentId, let thumbnailLoader {
+                    SlotAnchorThumbnail(
+                        momentID: anchorMomentId,
+                        loader: thumbnailLoader
+                    )
                 }
             }
             .padding(.leading, 12)
@@ -282,5 +302,66 @@ private struct DaySummaryRow: View {
         if isCurrent { return RecallPalette.ray.opacity(0.13) }
         if isHovering { return Color.white.opacity(0.05) }
         return .clear
+    }
+}
+
+/// The slot's opening frame, so a row is recognisable at a glance rather
+/// than only describable. Loads through the shared thumbnail cache; a slot
+/// scrolled past twice costs one decode.
+private struct SlotAnchorThumbnail: View {
+    let momentID: String
+    let loader: RecallThumbnailLoader
+    @State private var image: CGImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.white.opacity(0.05)
+            }
+        }
+        .frame(width: 56, height: 36)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .strokeBorder(.white.opacity(0.1), lineWidth: 1)
+        }
+        .task(id: momentID) {
+            image = RecallThumbnailCache.shared.cached(momentID: momentID)
+            if image == nil {
+                image = await RecallThumbnailCache.shared.image(momentID: momentID, loader: loader)
+            }
+        }
+    }
+}
+
+/// Every application the half hour touched, as icons in time order — the
+/// fastest possible "what was going on here" read, under the prose.
+private struct SlotAppIconStrip: View {
+    let apps: [DayAppFact]
+    private static let iconLimit = 8
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(apps.prefix(Self.iconLimit), id: \.name) { app in
+                if let icon = AppIconLookup.icon(bundleIdentifier: app.bundleIdentifier) {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .interpolation(.medium)
+                        .frame(width: 14, height: 14)
+                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                        .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
+                }
+            }
+            if apps.count > Self.iconLimit {
+                Text("+\(apps.count - Self.iconLimit)")
+                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.35))
+            }
+        }
+        .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
     }
 }

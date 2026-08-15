@@ -44,6 +44,8 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
     public let slotStartMs: Int64
     public let slotEndMs: Int64
     public let state: String
+    /// First captured frame of the slot; the row's thumbnail anchor.
+    public let anchorMomentId: String?
     public let facts: DaySlotFacts
     public let title: String?
     public let bullets: [String]?
@@ -53,6 +55,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         slotStartMs: Int64,
         slotEndMs: Int64,
         state: String,
+        anchorMomentId: String? = nil,
         facts: DaySlotFacts,
         title: String? = nil,
         bullets: [String]? = nil,
@@ -61,6 +64,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         self.slotStartMs = slotStartMs
         self.slotEndMs = slotEndMs
         self.state = state
+        self.anchorMomentId = anchorMomentId
         self.facts = facts
         self.title = title
         self.bullets = bullets
@@ -71,10 +75,24 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         case slotStartMs = "slot_start_ms"
         case slotEndMs = "slot_end_ms"
         case state
+        case anchorMomentId = "anchor_moment_id"
         case facts
         case title
         case bullets
         case category
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        slotStartMs = try container.decode(Int64.self, forKey: .slotStartMs)
+        slotEndMs = try container.decode(Int64.self, forKey: .slotEndMs)
+        state = try container.decode(String.self, forKey: .state)
+        anchorMomentId = try container.decodeIfPresent(String.self, forKey: .anchorMomentId)
+        facts = try container.decodeIfPresent(DaySlotFacts.self, forKey: .facts)
+            ?? DaySlotFacts(apps: [])
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        bullets = try container.decodeIfPresent([String].self, forKey: .bullets)
+        category = try container.decodeIfPresent(String.self, forKey: .category)
     }
 }
 

@@ -529,6 +529,10 @@ pub struct DaySlot {
     pub slot_start_ms: i64,
     pub slot_end_ms: i64,
     pub state: SlotSummaryState,
+    /// First captured frame of the slot — the thumbnail anchor the panel
+    /// shows so a row is recognisable at a glance, not just describable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_moment_id: Option<String>,
     pub facts: SlotFacts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -653,6 +657,7 @@ pub fn assemble_day_summary(
             slot_start_ms: start,
             slot_end_ms: card.map_or(start + SLOT_DURATION_MS, |card| card.slot_end_ms),
             state,
+            anchor_moment_id: card.and_then(|card| card.evidence.moment_ids.first().cloned()),
             facts,
             title,
             bullets: overlay.and_then(|row| row.bullets.clone()),
@@ -2112,6 +2117,10 @@ mod tests {
         assert!(summary.slots[0].title.is_none());
         assert!(!summary.slots[0].facts.apps.is_empty());
         assert_eq!(summary.slots[1].title.as_deref(), Some("GOP header still stuck"));
+        assert!(
+            summary.slots[0].anchor_moment_id.is_some(),
+            "a slot with captures must expose its opening frame as the thumbnail anchor"
+        );
         assert_eq!(summary.slots[1].state, SlotSummaryState::Done);
         assert_eq!(summary.slots[1].category.as_deref(), Some("coding"));
     }

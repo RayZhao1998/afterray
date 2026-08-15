@@ -2870,6 +2870,7 @@ mod tests {
             slot_start_ms: start_ms,
             slot_end_ms: start_ms + afterray_store::SLOT_DURATION_MS,
             state,
+            anchor_moment_id: None,
             facts: afterray_store::SlotFacts {
                 apps: Vec::new(),
                 top_windows: Vec::new(),
