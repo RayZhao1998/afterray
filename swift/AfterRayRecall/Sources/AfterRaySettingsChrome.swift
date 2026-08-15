@@ -930,13 +930,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         if let pack = model.library?.packs.first(where: { $0.id == selectedPackID }) {
             VStack(alignment: .leading, spacing: 12) {
                 SettingsField(label: "Model") {
-                    Picker("AfterRay MLX model", selection: mlxModelBinding) {
-                        Text("Recommended · Qwen3.5 4B").tag(qwen35MlxPackID)
-                        Text("Higher quality · Qwen3.5 9B").tag(qwen35Mlx9BPackID)
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .disabled(model.isUpdatingLlm)
+                    SettingsMenuPicker(
+                        options: [
+                            .init(id: qwen35MlxPackID, title: "Recommended · Qwen3.5 4B"),
+                            .init(id: qwen35Mlx9BPackID, title: "Higher quality · Qwen3.5 9B"),
+                        ],
+                        selection: mlxModelBinding,
+                        disabled: model.isUpdatingLlm
+                    )
                 }
                 HStack(spacing: 8) {
                     SettingsPill(mlxStateLabel(pack.state), tone: mlxStateTone(pack.state))
@@ -1094,14 +1095,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
             SettingsField(label: "Model") {
                 if let models = model.llmProbe?.models, !models.isEmpty {
-                    Picker("Ollama model", selection: ollamaModelBinding) {
-                        ForEach(ollamaPickerModels(models)) { remote in
-                            Text(remote.name).tag(remote.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity)
-                    .disabled(model.isUpdatingLlm)
+                    SettingsMenuPicker(
+                        options: ollamaPickerModels(models).map {
+                            .init(id: $0.id, title: $0.name)
+                        },
+                        selection: ollamaModelBinding,
+                        disabled: model.isUpdatingLlm
+                    )
                 } else {
                     TextField("qwen3.6:latest", text: $model.draftLlmModel)
                         .settingsFieldStyle()
@@ -1619,6 +1619,71 @@ private struct SettingsField<Content: View>: View {
                 .foregroundStyle(SettingsPalette.tertiaryLabel)
             content
         }
+    }
+}
+
+/// A popup that wears the same box as the text fields around it.
+///
+/// SwiftUI's stock menu picker draws its own chrome and, given a wide field,
+/// parks itself in the middle of it — so the model row sat centred above a
+/// full-width server field and read as a different kind of control.
+private struct SettingsMenuPicker: View {
+    struct Option: Identifiable {
+        let id: String
+        let title: String
+    }
+
+    let options: [Option]
+    @Binding var selection: String
+    var disabled = false
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Menu {
+            Picker("", selection: $selection) {
+                ForEach(options) { option in
+                    Text(option.title).tag(option.id)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 8) {
+                Text(selectedTitle)
+                    .font(.settingsBody)
+                    .foregroundStyle(SettingsPalette.label)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+            }
+            .padding(.horizontal, 9)
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            isHovering ? SettingsPalette.controlHover : SettingsPalette.controlFill,
+            in: RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius, style: .continuous)
+                .strokeBorder(SettingsPalette.controlStroke, lineWidth: 1)
+        }
+        .opacity(disabled ? 0.42 : 1)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .onHover { isHovering = !disabled && $0 }
+        .disabled(disabled)
+    }
+
+    private var selectedTitle: String {
+        options.first { $0.id == selection }?.title ?? selection
     }
 }
 
