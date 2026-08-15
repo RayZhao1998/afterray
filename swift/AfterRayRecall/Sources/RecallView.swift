@@ -35,6 +35,9 @@ public struct RecallView: View {
     public var summaryHistoryHasMore: Bool
     public var isLoadingSummaryHistory: Bool
     public var onLoadOlderSummaryHistory: (() -> Void)?
+    /// Detach the history panel into a standalone window; nil hides the
+    /// affordance (Visual Lab, snapshots).
+    public var onPopOutHistory: (() -> Void)?
     public var onVisibleDayChange: ((Int64) -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
@@ -90,6 +93,7 @@ public struct RecallView: View {
         summaryHistoryHasMore: Bool = false,
         isLoadingSummaryHistory: Bool = false,
         onLoadOlderSummaryHistory: (() -> Void)? = nil,
+        onPopOutHistory: (() -> Void)? = nil,
         onVisibleDayChange: ((Int64) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
@@ -120,6 +124,7 @@ public struct RecallView: View {
         self.summaryHistoryHasMore = summaryHistoryHasMore
         self.isLoadingSummaryHistory = isLoadingSummaryHistory
         self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
+        self.onPopOutHistory = onPopOutHistory
         self.onVisibleDayChange = onVisibleDayChange
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
@@ -219,6 +224,12 @@ public struct RecallView: View {
                 if daySummaryExpanded {
                     HStack(alignment: .bottom, spacing: 0) {
                         DaySummaryPanel(
+                            onPopOut: onPopOutHistory.map { popOut in
+                                {
+                                    daySummaryExpanded = false
+                                    popOut()
+                                }
+                            },
                             summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
                             playheadMs: playheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),

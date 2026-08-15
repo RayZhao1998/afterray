@@ -1,9 +1,18 @@
 import SwiftUI
 
+/// How the panel is being hosted. The overlay pins its size and wears
+/// glass; a standalone window fills whatever the user resizes it to.
+public enum DaySummaryPanelStyle: Sendable {
+    case overlay
+    case window
+}
+
 /// The history-summary panel is deliberately a single lazy scroll view: it
 /// can keep walking toward the earliest capture without retaining every row
 /// in the SwiftUI view tree or asking each row to hit the daemon.
-struct DaySummaryPanel: View {
+public struct DaySummaryPanel: View {
+    var style: DaySummaryPanelStyle = .overlay
+    var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
     let playheadMs: Int64
     let nowMs: Int64
@@ -18,6 +27,32 @@ struct DaySummaryPanel: View {
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
 
+    public init(
+        style: DaySummaryPanelStyle = .overlay,
+        onPopOut: (() -> Void)? = nil,
+        summaries: [DaySummary],
+        playheadMs: Int64,
+        nowMs: Int64,
+        hasMore: Bool,
+        isLoadingMore: Bool,
+        followPulse: Int,
+        thumbnailLoader: RecallThumbnailLoader?,
+        onSelectSlot: @escaping (Int64) -> Void,
+        onLoadMore: @escaping () -> Void
+    ) {
+        self.style = style
+        self.onPopOut = onPopOut
+        self.summaries = summaries
+        self.playheadMs = playheadMs
+        self.nowMs = nowMs
+        self.hasMore = hasMore
+        self.isLoadingMore = isLoadingMore
+        self.followPulse = followPulse
+        self.thumbnailLoader = thumbnailLoader
+        self.onSelectSlot = onSelectSlot
+        self.onLoadMore = onLoadMore
+    }
+
     private var highlightedStart: Int64? {
         summaries.lazy.compactMap {
             DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
@@ -29,7 +64,7 @@ struct DaySummaryPanel: View {
         return count == 1 ? "1 DAY" : "\(count) DAYS"
     }
 
-    var body: some View {
+    public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             if summaries.isEmpty {
@@ -38,14 +73,7 @@ struct DaySummaryPanel: View {
                 historyList
             }
         }
-        .frame(width: RecallGeometry.daySummaryPanelWidth, alignment: .topLeading)
-        .frame(maxHeight: RecallGeometry.daySummaryMaxHeight, alignment: .top)
-        .recallGlass(in: .rounded(RecallGeometry.daySummaryCornerRadius))
-        .overlay {
-            RoundedRectangle(cornerRadius: RecallGeometry.daySummaryCornerRadius, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 18, y: 10)
+        .modifier(DaySummaryPanelChrome(style: style))
         .accessibilityIdentifier("history-summary-panel")
     }
 
@@ -66,6 +94,17 @@ struct DaySummaryPanel: View {
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .tracking(0.8)
                     .foregroundStyle(.white.opacity(0.38))
+            }
+            if let onPopOut {
+                Button(action: onPopOut) {
+                    Image(systemName: "macwindow.on.rectangle")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open as a window")
             }
         }
         .padding(.horizontal, 14)
@@ -89,8 +128,11 @@ struct DaySummaryPanel: View {
 
     private var historyList: some View {
         ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 10) {
+            ScrollView(.vertical, showsIndicators: style == .window) {
+                // Pinned headers: while a day's rows scroll, its date stays
+                // put at the top of the list — the reader always knows which
+                // day they are inside.
+                LazyVStack(alignment: .leading, spacing: 10, pinnedViews: [.sectionHeaders]) {
                     ForEach(summaries, id: \.dayStartMs) { summary in
                         DaySummarySection(
                             summary: summary,
@@ -108,7 +150,7 @@ struct DaySummaryPanel: View {
                 .padding(.horizontal, 6)
                 .padding(.bottom, 8)
             }
-            .frame(maxHeight: RecallGeometry.daySummaryListMaxHeight)
+            .frame(maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity)
             .onAppear { scrollToCurrent(proxy) }
             .onChange(of: followPulse) { _, _ in
                 scrollToCurrent(proxy)
@@ -152,7 +194,13 @@ private struct DaySummarySection: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
+        // A real Section: `pinnedViews: [.sectionHeaders]` can only pin a
+        // Section's header, so the date stays visible while its rows scroll
+        // beneath it. The header wears an opaque backdrop for exactly that
+        // moment of overlap.
+        Section {
+            content
+        } header: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(heading.kicker)
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -168,9 +216,15 @@ private struct DaySummarySection: View {
                     .foregroundStyle(.white.opacity(0.32))
             }
             .padding(.horizontal, 8)
-            .padding(.top, 5)
-            .padding(.bottom, 4)
+            .padding(.vertical, 5)
+            .background(Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
 
+    @ViewBuilder
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 1) {
             if summary.slots.isEmpty {
                 Text("No recordings")
                     .font(.system(size: 11))
@@ -191,6 +245,34 @@ private struct DaySummarySection: View {
         }
         .padding(.vertical, 2)
         .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Overlay hosting wears the glass card; a real window supplies its own
+/// chrome, so the panel just fills it.
+private struct DaySummaryPanelChrome: ViewModifier {
+    let style: DaySummaryPanelStyle
+
+    func body(content: Content) -> some View {
+        switch style {
+        case .overlay:
+            content
+                .frame(width: RecallGeometry.daySummaryPanelWidth, alignment: .topLeading)
+                .frame(maxHeight: RecallGeometry.daySummaryMaxHeight, alignment: .top)
+                .recallGlass(in: .rounded(RecallGeometry.daySummaryCornerRadius))
+                .overlay {
+                    RoundedRectangle(
+                        cornerRadius: RecallGeometry.daySummaryCornerRadius,
+                        style: .continuous
+                    )
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.28), radius: 18, y: 10)
+        case .window:
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(red: 0.045, green: 0.04, blue: 0.05))
+        }
     }
 }
 

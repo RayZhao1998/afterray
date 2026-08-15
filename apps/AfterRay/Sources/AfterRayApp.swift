@@ -869,27 +869,21 @@ private final class ApplicationBundleDragSourceView: NSView, NSDraggingSource {
 }
 
 private struct AfterRayRootView: View {
-    @StateObject private var store: RecallStore
-    @StateObject private var control: AfterRayControlModel
-    @StateObject private var audioPlayer: ArtifactAudioPlayer
+    // Shared with the standalone history window: both faces must observe
+    // the same store, or the popped-out panel drifts from the overlay.
+    @ObservedObject private var store = AfterRayServices.shared.store
+    @ObservedObject private var control = AfterRayServices.shared.control
+    @ObservedObject private var audioPlayer = AfterRayServices.shared.audioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
-    @StateObject private var chat: AfterRayChatModel
+    @ObservedObject private var chat = AfterRayServices.shared.chat
     @State private var isLive = true
     @State private var isChatPresented = false
     @State private var queryMode = ImmersiveQueryMode.search
-    private let images: RecallImageRepository
+    private let images = AfterRayServices.shared.images
 
-    init() {
-        let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
-        let repository = RecallImageRepository(daemon: daemon)
-        _store = StateObject(wrappedValue: RecallStore(daemon: daemon))
-        _control = StateObject(wrappedValue: AfterRayControlModel(daemon: daemon))
-        _chat = StateObject(wrappedValue: AfterRayChatModel(daemon: daemon))
-        _audioPlayer = StateObject(wrappedValue: ArtifactAudioPlayer(repository: repository))
-        images = repository
-    }
+    init() {}
 
     var body: some View {
         RecallView(
@@ -925,6 +919,7 @@ private struct AfterRayRootView: View {
             onLoadOlderSummaryHistory: {
                 Task { await store.loadOlderSummaryHistory() }
             },
+            onPopOutHistory: { HistoryWindowController.shared.show() },
             onVisibleDayChange: { dayMs in
                 Task { await store.loadDaySummary(dayMs: dayMs) }
             },
