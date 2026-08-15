@@ -158,7 +158,13 @@ resolve_sign_update() {
     return
   fi
   local cached="$repo_root/.afterray-dev/sparkle-tools/bin/sign_update"
-  [[ -x "$cached" ]] && printf '%s\n' "$cached"
+  # An `if`, not `[[ … ]] &&`: a missing tool is a normal outcome here — a
+  # local build has nothing to sign — but as the function's last command that
+  # test would return non-zero, and `set -e` would end the run at the
+  # assignment below, before the message that explains it.
+  if [[ -x "$cached" ]]; then
+    printf '%s\n' "$cached"
+  fi
 }
 
 sign_update_bin="$(resolve_sign_update)"
