@@ -328,27 +328,42 @@ WORKTREE = REPO / ".scratch/baseline-2c202fa"
 DATA_DIR = REPO / ".afterray/v0-data"
 
 
-def worktree_prompt(at_ms: int) -> dict:
-    """The baseline pipeline's card+prompt for one slot, via the pinned
-    `slot_cards --json` example. No daemon, no persistence."""
+def worktree_prompts(slot_ids: list[int]) -> dict[int, dict]:
+    """Baseline card+prompt for every wanted slot, in ONE `slot_cards`
+    process. One process means at most one keychain consent dialog; the
+    per-slot version re-prompted on every spawn when the user granted
+    "Allow" rather than "Always Allow"."""
+    newest = max(slot_ids)
+    reach = max((newest - min(slot_ids)) // (30 * 60 * 1000) + 2, len(slot_ids))
     out = subprocess.run(
         [
             str(WORKTREE / "target/debug/examples/slot_cards"),
             "--data-dir", str(DATA_DIR),
-            "--at-ms", str(at_ms),
-            "--slots", "1",
+            "--at-ms", str(newest),
+            "--slots", str(reach),
             "--json",
             "--language", "English",
         ],
         cwd=WORKTREE,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=900,
     )
-    line = next((l for l in out.stdout.splitlines() if l.startswith("{")), None)
-    if not line:
-        raise RuntimeError(f"slot_cards produced no JSON: {out.stderr[-400:]}")
-    return json.loads(line)
+    wanted = set(slot_ids)
+    records = {}
+    for line in out.stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        record = json.loads(line)
+        start = ((record.get("card") or {}).get("slot_start_ms"))
+        if start in wanted:
+            records[start] = record
+    missing = wanted - set(records)
+    if missing:
+        raise RuntimeError(
+            f"slot_cards missed slots {sorted(missing)}: {out.stderr[-400:]}"
+        )
+    return records
 
 
 def ollama_generate(model: str, system: str, user: str) -> tuple[str, int]:
@@ -415,9 +430,8 @@ def cmd_run_worktree(args: argparse.Namespace) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     results = {"tag": args.tag, "stamp": stamp, "models": {}, "slot_ids": args.slots}
-    prompts = {}
+    prompts = worktree_prompts(args.slots)
     for at_ms in args.slots:
-        prompts[at_ms] = worktree_prompt(at_ms)
         print(f"prompt {hhmm(at_ms)}: {len(prompts[at_ms]['user'])} chars")
     for model in args.models:
         print(f"\n=== {model} ===")
