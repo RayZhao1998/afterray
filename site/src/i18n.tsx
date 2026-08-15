@@ -9,32 +9,239 @@ import {
 export type Lang = 'en' | 'zh'
 export type Part = string | { em: string }
 
+/** Every locale the switcher offers, labelled in its own language.
+ *  Adding one means adding an entry here plus a `copy` block. */
+export const LANGS: { code: Lang; label: string }[] = [
+  { code: 'en', label: 'English' },
+  { code: 'zh', label: '中文' },
+]
+
 const en = {
   meta: {
-    title: 'AfterRay — Total recall. Zero upload.',
+    title: 'AfterRay — Remember everything you see and hear on your Mac.',
     htmlLang: 'en',
   },
   nav: {
-    features: 'Features',
-    skills: 'Skills',
-    privacy: 'Privacy',
-    download: 'Download',
+    language: 'Language',
+    skip: 'Skip to content',
   },
   hero: {
-    eyebrow: 'AFTERRAY — LOCAL-FIRST AI MEMORY',
-    titleA: ['Total ', { em: 'recall.' }] as Part[],
-    titleB: [{ em: 'Zero' }, ' upload.'] as Part[],
-    sub: 'AfterRay records what you see and hear on your Mac, and turns it into memory you can rewind, search, and build on — with AI that runs entirely on-device. No cloud. No account. No exceptions.',
+    eyebrow: 'Local-first computer history',
+    titleA: ['Remember'] as Part[],
+    titleB: [{ em: 'everything.' }] as Part[],
+    sub: 'AfterRay records your screen and audio all day — so you and your agent can find anything you saw or heard.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
-    scroll: 'SCROLL',
-    scrollHint: 'past the event horizon',
+    facts: ['macOS 15+', 'Exclude apps and sites', 'Pause or delete anytime', 'Nothing leaves this Mac'],
+  },
+  jtbd: [
+    {
+      title: 'Pick up where you dropped it',
+      body: 'Ask it to finish the migration you left half-done on Tuesday. It can see which files you touched, and when.',
+    },
+    {
+      title: 'Answer from what happened',
+      body: '“What did we decide about retention?” comes back with the moment it came from, not a guess.',
+    },
+    {
+      title: 'Draft from what you did',
+      body: 'The standup note, the PR description, the handoff — written from the week, not from memory.',
+    },
+  ],
+  recall: {
+    body: '⇧⌘Space from any app. Drag the timeline back to any moment.',
+    mock: {
+      status: 'Recording',
+      searchHint: 'Search your day — Tab for AI chat',
+      date: 'Friday, Aug 14',
+      hint: 'Drag to zoom · Swipe to travel · Esc to close',
+      heardLabel: 'Heard',
+      // speech only exists where there was a call, so every line sits inside
+      // one of the Zoom spans above — the panel appears and vanishes with them
+      transcript: [
+        { pos: 0.35, time: '12:09 PM', who: 'Alex', text: 'The timeline zoom has to feel like a camera, not a scrollbar.' },
+        { pos: 0.39, time: '12:30 PM', who: 'Jo', text: 'Can we keep the playhead fixed and move the track underneath?' },
+        { pos: 0.42, time: '12:46 PM', who: 'You', text: 'Yes — that is the part that makes it feel like a camera.' },
+        { pos: 0.46, time: '1:08 PM', who: 'Alex', text: 'Then scrubbing only needs the poster frame. Settle can come after.' },
+        { pos: 0.755, time: '3:47 PM', who: 'Chen', text: 'The spike is a duplicate copy in cold-still packing.' },
+        { pos: 0.775, time: '3:58 PM', who: 'Alex', text: 'Favorites never expire. Everything else stays bounded.' },
+        { pos: 0.79, time: '4:06 PM', who: 'You', text: 'Bench says HEIF forty-one milliseconds, JPEG sixty-three.' },
+      ],
+      segments: [
+        { app: 'Xcode', from: 0, to: 0.08, dur: '43m', c: '#ff5f4a' },
+        { app: 'Slack', from: 0.08, to: 0.11, dur: '16m', c: '#b8576b' },
+        { app: 'Safari', from: 0.11, to: 0.2, dur: '49m', c: '#e58a4d' },
+        { app: 'Xcode', from: 0.2, to: 0.26, dur: '32m', c: '#ff5f4a' },
+        { app: 'Notes', from: 0.26, to: 0.32, dur: '32m', c: '#c9a05a' },
+        { app: 'Zoom', from: 0.32, to: 0.5, dur: '1h 37m', c: '#a96b60' },
+        { app: 'Slack', from: 0.5, to: 0.54, dur: '22m', c: '#b8576b' },
+        { app: 'Safari', from: 0.54, to: 0.62, dur: '43m', c: '#e58a4d' },
+        { app: 'GitHub', from: 0.62, to: 0.74, dur: '1h 5m', c: '#8a7a70' },
+        { app: 'Zoom', from: 0.74, to: 0.8, dur: '32m', c: '#a96b60' },
+        { app: 'Xcode', from: 0.8, to: 0.93, dur: '1h 10m', c: '#ff5f4a' },
+        { app: 'Notes', from: 0.93, to: 1, dur: '38m', c: '#c9a05a' },
+      ],
+      records: [
+        { pos: 0.04, time: '9:24 AM', app: 'Xcode', title: 'afterrayd — agent.rs', c: '#ff5f4a' },
+        { pos: 0.15, time: '10:21 AM', app: 'Safari', title: 'hot-stills-cold-gop.md', c: '#e58a4d', url: 'docs.afterray.dev/hot-stills-cold-gop' },
+        { pos: 0.29, time: '11:37 AM', app: 'Notes', title: 'retention ideas', c: '#c9a05a' },
+        { pos: 0.4, time: '12:36 PM', app: 'Zoom', title: 'design review — recording', c: '#a96b60' },
+        { pos: 0.77, time: '3:56 PM', app: 'Zoom', title: 'design review — recording', c: '#a96b60' },
+        { pos: 0.68, time: '3:07 PM', app: 'GitHub', title: 'PR #128 — retention discussion', c: '#8a7a70' },
+        { pos: 0.92, time: '5:58 PM', app: 'Xcode', title: 'bench-codec — HEIF vs JPEG', c: '#ff5f4a' },
+      ],
+    },
+  },
+  memories: {
+    titleA: ['You did a lot today.'] as Part[],
+    titleB: ["Here's ", { em: 'what it was.' }] as Part[],
+    body: 'AfterRay writes your day back to you in half-hour slots. The model runs here, and it is told never to invent a file, a URL, or a task it did not see.',
+    points: [
+      'Written as you go, without being asked',
+      'Every line opens to the moment behind it',
+    ],
+    mock: {
+      head: 'Friday, Aug 14',
+      label: 'Memories',
+      rows: [
+        {
+          span: '9:00–9:30',
+          summary: 'Traced the agent loop in afterrayd, then started a note on retention.',
+          apps: 'Xcode · Notes',
+        },
+        {
+          span: '10:30–11:00',
+          summary: 'Read hot-stills-cold-gop.md and compared HEIF against the JPEG decode path.',
+          apps: 'Safari · Xcode',
+        },
+        {
+          span: '2:00–2:30 PM',
+          summary: 'Closed out the disk chapter of the v1 spec.',
+          apps: 'Notes · GitHub',
+        },
+        {
+          span: '3:30–4:00 PM',
+          summary: 'Debugged the GOP encoder memory spike on a call, then filed PR #128.',
+          apps: 'Zoom · GitHub',
+        },
+      ],
+    },
+  },
+  searchAsk: {
+    titleA: ['Half-remember it.'] as Part[],
+    titleB: ['Find it ', { em: 'exactly.' }] as Part[],
+    body: 'Forget the filename and the app. A half-remembered phrase is enough — or just ask.',
+    points: [
+      'Joint search across OCR text and transcripts',
+      'Semantic search: by meaning, not just keywords',
+      'Ask answers with citations to the original moments',
+    ],
+    mock: {
+      tryLabel: 'Try one',
+      searchHead: 'You half-remember',
+      foundHead: 'It finds',
+      askHead: 'Or just ask',
+      screenLabel: 'On screen',
+      heardLabel: 'Heard',
+      replay: 'Replay',
+      scenarios: [
+        {
+          chip: 'Keeping favorites',
+          keys: ['favorite', 'favourite', 'keep', 'star', 'retention'],
+          query: 'that thing about keeping favorites',
+          results: [
+            {
+              src: 'heard',
+              app: 'Zoom',
+              time: 'Wed 11:02 AM',
+              c: '#a96b60',
+              text: 'favorites never expire — everything else stays bounded',
+              match: 'favorites never expire',
+            },
+            {
+              src: 'screen',
+              app: 'GitHub',
+              time: 'Wed 3:15 PM',
+              c: '#8a7a70',
+              text: 'PR #128 — the storage budget applies to unstarred moments only',
+              match: 'storage budget',
+            },
+          ],
+          answer:
+            'Anything you star is exempt and never expires. Everything else lives inside the storage budget you set.',
+        },
+        {
+          chip: 'That memory spike',
+          keys: ['spike', 'memory', 'encoder', 'gop'],
+          query: 'the memory spike someone mentioned',
+          results: [
+            {
+              src: 'heard',
+              app: 'Zoom',
+              time: 'Thu 5:20 PM',
+              c: '#a96b60',
+              text: 'the spike is a duplicate copy in cold-still packing',
+              match: 'duplicate copy',
+            },
+            {
+              src: 'screen',
+              app: 'Xcode',
+              time: 'Thu 4:05 PM',
+              c: '#ff5f4a',
+              text: 'bench-codec — HEIF 41ms vs JPEG 63ms per frame',
+              match: 'bench-codec',
+            },
+          ],
+          answer:
+            'A duplicate copy in cold-still packing. Spotted Thursday afternoon, removed the same evening.',
+        },
+        {
+          chip: 'The vault key note',
+          keys: ['vault', 'key', 'note', 'wrote'],
+          query: 'where I wrote down the vault key idea',
+          results: [
+            {
+              src: 'screen',
+              app: 'Notes',
+              time: 'Tue 5:48 PM',
+              c: '#c9a05a',
+              text: 'todo: write the vault locking test first',
+              match: 'vault locking',
+            },
+            {
+              src: 'screen',
+              app: 'Safari',
+              time: 'Tue 6:12 PM',
+              c: '#e58a4d',
+              text: 'docs/vault-encryption-design.md — key hierarchy',
+              match: 'key hierarchy',
+            },
+          ],
+          answer:
+            'In Notes on Tuesday evening, while the vault-encryption design doc was open in Safari.',
+        },
+      ],
+    },
+  },
+  agents: {
+    titleA: ['One command,'] as Part[],
+    titleB: ['any ', { em: 'agent.' }] as Part[],
+    body: 'Install the skill once. Claude Code, Codex, and anything else that reads Agent Skills can then query your history — no MCP server, no credentials.',
+    toolsLabel: 'Drops into the agents you already use',
+    tools: ['Claude Code', 'Codex', 'Hermes', 'Cursor'],
+    install: 'npx skills add loro-dev/afterray -g',
+    installOut: 'installed afterray → Claude Code, Codex, Hermes',
+    note: 'Read-only. The vault key never leaves the daemon.',
+    mock: [
+      { cmd: 'afterray search "keeping favorites" --limit 1', out: '[ { "source": "transcript", "time": "Wed 11:02 AM",\n    "text": "favorites never expire…" } ]' },
+      { cmd: 'afterray ask "where did we land on retention?"', out: '{ "answer": "Stars are exempt; the rest fits the storage budget.",\n  "citations": [ "Wed 3:15 PM · GitHub" ] }' },
+      { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "3:00–4:00 PM",\n    "summary": "Debugged the GOP encoder memory spike" } ]' },
+      { cmd: 'afterray activity --from-ms … --to-ms …', out: '[ { "app": "Xcode", "duration": "2h 14m" },\n  { "app": "Zoom", "duration": "24m" } ]' },
+    ],
   },
   privacy: {
-    eyebrow: 'PRIVACY BY ARCHITECTURE',
     statementA: ' bytes',
     statementB: 'leave your Mac.',
-    sub: "Most AI memory products upload your life to someone else's server. AfterRay refuses by architecture: captures, indexes, model inputs, and model outputs stay on this machine.",
     pillars: [
       {
         title: 'Captured locally',
@@ -46,162 +253,34 @@ const en = {
       },
       {
         title: 'Modeled locally',
-        body: 'Summaries and answers come from a model running on your machine — a built-in GGUF or your own Ollama.',
+        body: 'Summaries and answers come from a model running on your machine — a built-in GGUF, an MLX pack, or your own Ollama.',
       },
       {
         title: 'Encrypted at rest',
-        body: 'SQLCipher + XChaCha20-Poly1305 encrypt every record. The key lives only in the macOS Keychain.',
+        body: 'SQLCipher + XChaCha20-Poly1305 encrypt every record. The key lives in the macOS Keychain.',
       },
     ],
-  },
-  rewind: {
-    eyebrow: '01 — REWIND · REWIND HISTORY',
-    titleA: ['From one second,'] as Part[],
-    titleB: ['to ', { em: 'one month.' }] as Part[],
-    body: "The main surface isn't a search box — it's a zoomable timeline with a sense of spectacle. Scrub from a single second out to a day, a week, a month, and land back on the exact screen, conversation, and sound of that moment.",
-    points: [
-      'Continuous zoom: second → hour → day → month',
-      'The screen and window structure at any instant',
-      'Ambient and meeting audio, replayed in place',
-    ],
-    mock: {
-      bar: 'RECALL — today',
-      cards: [
-        { time: '13:42', text: 'docs/afterray-v1-spec.md — editing' },
-        { time: '13:37', text: 'Zoom · design review (recording 24:10)' },
-        { time: '13:15', text: 'GitHub · PR #128 retention discussion' },
-      ],
-    },
-  },
-  search: {
-    eyebrow: '02 — RECALL · SEARCH HISTORY',
-    titleA: ['Half-remember it.'] as Part[],
-    titleB: ['Find it ', { em: 'exactly.' }] as Part[],
-    body: 'Forget the filename, forget the app. Full-text search plus on-device semantic embeddings take any word, concept, or half-remembered sentence and jump straight to the screen and audio evidence of that moment.',
-    points: [
-      'Joint search across OCR text and transcripts',
-      'Semantic search: by meaning, not just keywords',
-      'Every result replays the original evidence',
-    ],
-    mock: {
-      query: 'that retention ceiling discussion',
-      meta: 'full-text + semantic embedding · on-device index · 3 results',
-      results: [
-        {
-          app: 'GitHub',
-          time: 'Wed 13:15',
-          text: '…storage budget for unstarred memories — Settings → Storage…',
-          score: '0.91',
-        },
-        {
-          app: 'Zoom',
-          time: 'Wed 11:02',
-          text: '"retention should be bounded by disk budget, not item count" — meeting transcript',
-          score: '0.87',
-        },
-        {
-          app: 'Notes',
-          time: 'Tue 17:48',
-          text: 'todo: switch retention to a GB budget, 10/20GB tiers',
-          score: '0.82',
-        },
-      ],
-    },
-  },
-  summary: {
-    eyebrow: '03 — REFLECT · HOURLY DIGEST',
-    titleA: ['Every hour,'] as Part[],
-    titleB: ['already ', { em: 'written up.' }] as Part[],
-    body: "The on-device model reads your history and compresses each hour into a few lines: what happened, what was decided, what's next. No more 5pm archaeology of your own day — and the inference never leaves your Mac.",
-    points: [
-      'Hourly, daily, and weekly granularities',
-      'Every claim links back to replayable evidence',
-      'Built-in model or your own Ollama, switch anytime',
-    ],
-    mock: {
-      bar: 'HOURLY DIGEST — today',
-      hours: [
-        {
-          span: '14:00 — 15:00',
-          title: 'Closing out the disk chapter of the v1 spec',
-          points: [
-            'Finalized the 10/20GB disk budgets',
-            'Replied to three retention comments on PR #128',
-            '25-min design review: timeline zoom interaction confirmed',
-          ],
-          active: true,
-        },
-        {
-          span: '15:00 — 16:00',
-          title: 'Debugging the GOP encoder memory spike',
-          points: [
-            'Benchmarked HEIF vs JPEG decode paths',
-            'Traced the spike to a duplicate copy in cold-still packing',
-            'Read 4 docs on AV1 closed-GOP encoding',
-          ],
-          active: false,
-        },
-        {
-          span: '16:00 — 17:00',
-          title: 'Gaps: reading + replies',
-          points: [
-            'Finished two local-first architecture articles',
-            'Replied to 9 iMessage / email threads',
-            'Tomorrow: write the vault locking test first',
-          ],
-          active: false,
-        },
-      ],
-    },
-  },
-  skills: {
-    eyebrow: '04 — GROW · SKILL PROFILE',
-    titleA: ['Your history,'] as Part[],
-    titleB: ['distilled into ', { em: 'skills.' }] as Part[],
-    sub: "The skills on your résumé are self-reported. AfterRay's grow out of your actual workflow: the local model reads your screen and conversation history, extracts the skills you really use, and suggests the next one worth building. All analysis stays on-device.",
-    extractedLabel: 'EXTRACTED — from your history',
-    suggestedLabel: 'SUGGESTED — the next one',
-    extracted: [
-      { name: 'React performance tuning', level: 'deep use', hours: '6.5h this week', evidence: '34 related screen sessions' },
-      { name: 'Rust async debugging', level: 'proficient', hours: '4.2h this week', evidence: 'tokio logs × 12 sessions' },
-      { name: 'Technical writing', level: 'steady output', hours: '3.1h this week', evidence: 'spec docs × 2, PR comments × 19' },
-    ],
-    suggested: [
-      {
-        name: 'AV1 encoding pipeline',
-        tag: 'worth learning',
-        why: 'You re-read closed-GOP docs across 3 sessions — a systematic pass would make the next one much faster.',
-      },
-      {
-        name: 'SQLCipher key rotation',
-        tag: 'worth deepening',
-        why: 'Your vault design doc mentions key hierarchy repeatedly, but it has not landed in an experiment yet.',
-      },
-    ],
-    note: '* Every suggestion is grounded in replayable local evidence, not a cloud profile.',
   },
   specs: {
-    eyebrow: 'HOW IT WORKS',
-    title: ['One pipeline, ', { em: 'entirely local.' }] as Part[],
     steps: ['Capture', 'OCR / ASR', 'Embedding', 'Encrypted Vault', 'Local LLM', 'Recall'],
     rows: [
       ['Platform', 'macOS 15+ · Apple Silicon (M3 recommended)'],
       ['Storage', 'SQLCipher + XChaCha20-Poly1305, key in the Keychain'],
-      ['Models', 'On-device ASR / Embedding / LLM, or your own Ollama'],
-      ['Upload', 'None. No account, no telemetry, no cloud sync'],
+      ['On disk', 'Older captures repack to closed-GOP AV1 — 7–10% of the original JPEG'],
+      ['Retention', 'A storage budget you set, 100 GB by default — oldest unstarred go first, favorites never expire'],
+      ['Models', 'On-device ASR, embeddings, and LLM — or your own Ollama or OpenAI-compatible endpoint'],
+      ['Upload', 'No account, no telemetry, no cloud sync — nothing leaves unless you point it at a remote model'],
     ],
   },
   final: {
-    eyebrow: 'AFTERRAY',
     titleA: ['Give your Mac'] as Part[],
     titleB: ['a memory that ', { em: 'never forgets.' }] as Part[],
-    sub: 'Free download · Runs locally · Your data stays yours',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'GitHub',
   },
   footer: {
     tagline: 'A ray that persists after the day is gone.',
-    rights: '© 2026 · Local-first · Private by design',
+    rights: '© 2026',
   },
 }
 
@@ -209,30 +288,225 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 记住一切，止于本机',
+    title: 'AfterRay — 记住一切，你在 Mac 上看到和听到的',
     htmlLang: 'zh-CN',
   },
   nav: {
-    features: '功能',
-    skills: '技能',
-    privacy: '隐私',
-    download: '下载',
+    language: '语言',
+    skip: '跳到正文',
   },
   hero: {
-    eyebrow: 'AFTERRAY — LOCAL-FIRST AI MEMORY',
-    titleA: ['记住', { em: '一切。' }],
-    titleB: ['止于', { em: '本机。' }],
-    sub: 'AfterRay 持续记录你在 Mac 上看到与听到的一切，由完全在本机运行的 AI 整理成可回溯、可检索、可沉淀的记忆。无云端，无账号，无例外。',
+    eyebrow: '纯本地的 computer history',
+    titleA: ['记住'],
+    titleB: [{ em: '一切。' }],
+    sub: 'AfterRay 整天记录你的屏幕和声音——你看到、听到的一切，你和你的 agent 都能再找到。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
-    scroll: 'SCROLL',
-    scrollHint: '越过事件视界',
+    facts: ['macOS 15+', '可排除 App 和网站', '随时暂停或删除', '数据不出这台 Mac'],
+  },
+  jtbd: [
+    {
+      title: '接着上次的活干',
+      body: '让它继续周二没做完的那次迁移。你动过哪些文件、什么时候动的，它都看得到。',
+    },
+    {
+      title: '答案来自真实发生过的事',
+      body: '「retention 最后怎么定的？」回来的是出处，不是猜测。',
+    },
+    {
+      title: '替你起草',
+      body: '站会记录、PR 描述、交接文档——依据这一周真实发生的事，而不是你的记忆。',
+    },
+  ],
+  recall: {
+    body: '任意 App 里按 ⇧⌘Space。拖动时间线回到任意时刻。',
+    mock: {
+      status: '录制中',
+      searchHint: '搜索你的一天 — Tab 打开 AI 对话',
+      date: '8 月 14 日 周五',
+      hint: '拖动缩放 · 滑动穿梭 · Esc 关闭',
+      heardLabel: '听到的',
+      transcript: [
+        { pos: 0.35, time: '12:09', who: 'Alex', text: '时间线缩放要做得像相机运镜，而不是滚动条。' },
+        { pos: 0.39, time: '12:30', who: 'Jo', text: '能不能把播放头固定住，让轨道在下面滑？' },
+        { pos: 0.42, time: '12:46', who: '你', text: '对，就是这一点让它像运镜。' },
+        { pos: 0.46, time: '13:08', who: 'Alex', text: '那拖动时只要出关键帧就行，落点之后再补。' },
+        { pos: 0.755, time: '15:47', who: 'Chen', text: '峰值是 cold-still 打包里的重复拷贝。' },
+        { pos: 0.775, time: '15:58', who: 'Alex', text: '收藏的永不过期，其余的自动限额。' },
+        { pos: 0.79, time: '16:06', who: '你', text: 'bench 结果是 HEIF 41 毫秒，JPEG 63 毫秒。' },
+      ],
+      segments: [
+        { app: 'Xcode', from: 0, to: 0.08, dur: '43m', c: '#ff5f4a' },
+        { app: 'Slack', from: 0.08, to: 0.11, dur: '16m', c: '#b8576b' },
+        { app: 'Safari', from: 0.11, to: 0.2, dur: '49m', c: '#e58a4d' },
+        { app: 'Xcode', from: 0.2, to: 0.26, dur: '32m', c: '#ff5f4a' },
+        { app: 'Notes', from: 0.26, to: 0.32, dur: '32m', c: '#c9a05a' },
+        { app: 'Zoom', from: 0.32, to: 0.5, dur: '1h 37m', c: '#a96b60' },
+        { app: 'Slack', from: 0.5, to: 0.54, dur: '22m', c: '#b8576b' },
+        { app: 'Safari', from: 0.54, to: 0.62, dur: '43m', c: '#e58a4d' },
+        { app: 'GitHub', from: 0.62, to: 0.74, dur: '1h 5m', c: '#8a7a70' },
+        { app: 'Zoom', from: 0.74, to: 0.8, dur: '32m', c: '#a96b60' },
+        { app: 'Xcode', from: 0.8, to: 0.93, dur: '1h 10m', c: '#ff5f4a' },
+        { app: 'Notes', from: 0.93, to: 1, dur: '38m', c: '#c9a05a' },
+      ],
+      records: [
+        { pos: 0.04, time: '9:24', app: 'Xcode', title: 'afterrayd — agent.rs', c: '#ff5f4a' },
+        { pos: 0.15, time: '10:21', app: 'Safari', title: 'hot-stills-cold-gop.md', c: '#e58a4d', url: 'docs.afterray.dev/hot-stills-cold-gop' },
+        { pos: 0.29, time: '11:37', app: 'Notes', title: 'retention 点子', c: '#c9a05a' },
+        { pos: 0.4, time: '12:36', app: 'Zoom', title: '设计评审 — 录音', c: '#a96b60' },
+        { pos: 0.77, time: '15:56', app: 'Zoom', title: '设计评审 — 录音', c: '#a96b60' },
+        { pos: 0.68, time: '15:07', app: 'GitHub', title: 'PR #128 — retention 讨论', c: '#8a7a70' },
+        { pos: 0.92, time: '17:58', app: 'Xcode', title: 'bench-codec — HEIF vs JPEG', c: '#ff5f4a' },
+      ],
+    },
+  },
+  memories: {
+    titleA: ['今天你做了很多，'],
+    titleB: ['它都替你', { em: '记下来了。' }],
+    body: 'AfterRay 按半小时把这一天写回给你。模型跑在本机，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
+    points: [
+      '自动写好，不用你开口',
+      '每一行都能翻回背后那一刻',
+    ],
+    mock: {
+      head: '8 月 14 日 周五',
+      label: '记忆',
+      rows: [
+        {
+          span: '9:00–9:30',
+          summary: '通读 afterrayd 的 agent 循环，随后开了一篇 retention 的笔记。',
+          apps: 'Xcode · Notes',
+        },
+        {
+          span: '10:30–11:00',
+          summary: '读 hot-stills-cold-gop.md，对比 HEIF 与 JPEG 的解码路径。',
+          apps: 'Safari · Xcode',
+        },
+        {
+          span: '14:00–14:30',
+          summary: '收尾 v1 spec 的磁盘章节。',
+          apps: 'Notes · GitHub',
+        },
+        {
+          span: '15:30–16:00',
+          summary: '在会上调试 GOP 编码的内存峰值，之后提了 PR #128。',
+          apps: 'Zoom · GitHub',
+        },
+      ],
+    },
+  },
+  searchAsk: {
+    titleA: ['只记得大概，'],
+    titleB: ['也能找回', { em: '确切。' }],
+    body: '不记得文件名，不记得在哪个 App，只记得只言片语——够了。或者干脆问一句。',
+    points: [
+      'OCR 全文 + 语音转写联合检索',
+      '语义搜索：按「意思」而不只是关键字',
+      '问答的每条结论都附可回放的引用',
+    ],
+    mock: {
+      tryLabel: '试一个',
+      searchHead: '你只记得个大概',
+      foundHead: '它找到了',
+      askHead: '或者干脆问一句',
+      screenLabel: '屏幕上',
+      heardLabel: '听到的',
+      replay: '回放',
+      scenarios: [
+        {
+          chip: '收藏会不会被清掉',
+          keys: ['收藏', '清', '保留', 'star'],
+          query: '收藏的东西会不会被清掉来着',
+          results: [
+            {
+              src: 'heard',
+              app: 'Zoom',
+              time: '周三 11:02',
+              c: '#a96b60',
+              text: '收藏的永不过期，其余的自动限额',
+              match: '收藏的永不过期',
+            },
+            {
+              src: 'screen',
+              app: 'GitHub',
+              time: '周三 15:15',
+              c: '#8a7a70',
+              text: 'PR #128 —— 存储预算只作用于未收藏的时刻',
+              match: '存储预算',
+            },
+          ],
+          answer: '标了收藏的永远豁免，不会过期；其余的都在你设的存储预算之内。',
+        },
+        {
+          chip: '那个内存峰值',
+          keys: ['峰值', '内存', '编码', 'gop'],
+          query: '有人提过的那个内存峰值',
+          results: [
+            {
+              src: 'heard',
+              app: 'Zoom',
+              time: '周四 17:20',
+              c: '#a96b60',
+              text: '峰值是 cold-still 打包里的重复拷贝',
+              match: '重复拷贝',
+            },
+            {
+              src: 'screen',
+              app: 'Xcode',
+              time: '周四 16:05',
+              c: '#ff5f4a',
+              text: 'bench-codec —— HEIF 41ms vs JPEG 63ms 每帧',
+              match: 'bench-codec',
+            },
+          ],
+          answer: 'cold-still 打包里的一次重复拷贝。周四下午发现，当晚就去掉了。',
+        },
+        {
+          chip: 'vault 密钥那条笔记',
+          keys: ['vault', '密钥', '笔记', '记'],
+          query: '我把 vault 密钥那个想法记哪了',
+          results: [
+            {
+              src: 'screen',
+              app: 'Notes',
+              time: '周二 17:48',
+              c: '#c9a05a',
+              text: 'todo：先写 vault 锁定测试',
+              match: 'vault 锁定',
+            },
+            {
+              src: 'screen',
+              app: 'Safari',
+              time: '周二 18:12',
+              c: '#e58a4d',
+              text: 'docs/vault-encryption-design.md —— key hierarchy',
+              match: 'key hierarchy',
+            },
+          ],
+          answer: '在周二傍晚的 Notes 里，当时 Safari 开着 vault 加密的设计文档。',
+        },
+      ],
+    },
+  },
+  agents: {
+    titleA: ['一条命令，'],
+    titleB: ['任意 ', { em: 'Agent。' }],
+    body: '装一次 skill。Claude Code、Codex，以及任何能读 Agent Skills 的工具，就能查你本机的历史——不用配 MCP，也不用交凭据。',
+    toolsLabel: '装进你已经在用的 Agent',
+    tools: ['Claude Code', 'Codex', 'Hermes', 'Cursor'],
+    install: 'npx skills add loro-dev/afterray -g',
+    installOut: 'installed afterray → Claude Code, Codex, Hermes',
+    note: '只读。Vault 密钥永不离开守护进程。',
+    mock: [
+      { cmd: 'afterray search "收藏会不会被清掉" --limit 1', out: '[ { "source": "transcript", "time": "周三 11:02",\n    "text": "收藏的永不过期…" } ]' },
+      { cmd: 'afterray ask "retention 最后怎么定的？"', out: '{ "answer": "收藏豁免，其余的在存储预算内。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },
+      { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "15:00–16:00",\n    "summary": "调试 GOP 编码的内存峰值" } ]' },
+      { cmd: 'afterray activity --from-ms … --to-ms …', out: '[ { "app": "Xcode", "duration": "2h 14m" },\n  { "app": "Zoom", "duration": "24m" } ]' },
+    ],
   },
   privacy: {
-    eyebrow: 'PRIVACY BY ARCHITECTURE',
     statementA: ' 字节',
     statementB: '离开你的 Mac。',
-    sub: '大多数「AI 记忆」产品把你的生活上传到别人的服务器。AfterRay 从架构上拒绝这件事：数据、索引、模型输入、模型输出，全程留在本机。',
     pillars: [
       {
         title: '捕获在本地',
@@ -244,162 +518,34 @@ const zh: Copy = {
       },
       {
         title: '模型在本地',
-        body: '总结与问答由本机运行的大模型完成——内置 GGUF 或你自己的 Ollama。',
+        body: '总结与问答由本机运行的大模型完成——内置 GGUF、MLX 包，或你自己的 Ollama。',
       },
       {
         title: '存储已加密',
-        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密，密钥只存在于 macOS Keychain。',
+        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密，密钥存于 macOS Keychain。',
       },
     ],
-  },
-  rewind: {
-    eyebrow: '01 — REWIND · 回溯历史',
-    titleA: ['从一秒，'],
-    titleB: ['缩放到', { em: '一个月。' }],
-    body: '主入口不是搜索框，而是一条有「视觉奇观」感的可缩放时间线。拖动、缩放，从某一秒连续拉到一整天、一周、一个月——回到当时的屏幕、对话与上下文。',
-    points: [
-      '秒 / 小时 / 天 / 月连续缩放',
-      '任意时刻的屏幕截图与窗口结构',
-      '当时的环境音与会议录音回放',
-    ],
-    mock: {
-      bar: 'RECALL — 今天',
-      cards: [
-        { time: '13:42', text: 'docs/afterray-v1-spec.md — 编辑中' },
-        { time: '13:37', text: 'Zoom · 设计评审（录音 24:10）' },
-        { time: '13:15', text: 'GitHub · PR #128 retention 策略讨论' },
-      ],
-    },
-  },
-  search: {
-    eyebrow: '02 — RECALL · 检索历史',
-    titleA: ['只记得大概，'],
-    titleB: ['也能找回', { em: '确切。' }],
-    body: '不记得文件名，不记得在哪个 App——没关系。全文检索叠加本地语义 embedding，用你记住的任何一个词、一个概念，甚至一句别人说过的话，直接跳回那一刻的屏幕与音频证据。',
-    points: [
-      'OCR 全文 + 语音转写联合检索',
-      '语义搜索：按「意思」而不只是关键字',
-      '每条结果都可回放原始证据',
-    ],
-    mock: {
-      query: 'retention 上限那次讨论',
-      meta: '全文 + 语义 embedding · 本机索引 · 3 条证据',
-      results: [
-        {
-          app: 'GitHub',
-          time: '周三 13:15',
-          text: '…未收藏记忆的存储预算——设置 → 存储…',
-          score: '0.91',
-        },
-        {
-          app: 'Zoom',
-          time: '周三 11:02',
-          text: '「保留策略这块我们按磁盘上限来，不按条数」—— 会议语音转写',
-          score: '0.87',
-        },
-        {
-          app: 'Notes',
-          time: '周二 17:48',
-          text: 'todo: 把 retention 改成按 GB 预算，10/20GB 两档',
-          score: '0.82',
-        },
-      ],
-    },
-  },
-  summary: {
-    eyebrow: '03 — REFLECT · 每小时总结',
-    titleA: ['每个小时，'],
-    titleB: ['一段', { em: '写好的' }, '总结。'],
-    body: '本地大模型持续阅读你的历史，把每个小时压成几行：做了什么、定了什么、下一步是什么。下午五点不用再回想「我今天到底干了啥」——推理全部发生在你的 Mac 上。',
-    points: [
-      '按小时 / 按天 / 按周三个粒度',
-      '每条结论都附可回放的证据引用',
-      '内置模型或你自己的 Ollama，随时切换',
-    ],
-    mock: {
-      bar: 'HOURLY DIGEST — 今天',
-      hours: [
-        {
-          span: '14:00 — 15:00',
-          title: '收尾 v1 spec 的磁盘章节',
-          points: [
-            '定稿 10/20GB 两档磁盘预算',
-            '在 PR #128 回复了三条 retention 评论',
-            '25 分钟设计评审：确认时间线缩放交互',
-          ],
-          active: true,
-        },
-        {
-          span: '15:00 — 16:00',
-          title: '调试 GOP 编码的内存峰值',
-          points: [
-            'bench-codec 跑分对比 HEIF / JPEG',
-            '定位到 cold-still 打包的重复拷贝',
-            '查了 4 篇 AV1 closed-GOP 文档',
-          ],
-          active: false,
-        },
-        {
-          span: '16:00 — 17:00',
-          title: '碎片时间：阅读 + 沟通',
-          points: [
-            '读完两篇 local-first 架构文章',
-            '回复 iMessage / 邮件共 9 条',
-            '明天待办：先写 vault 锁定测试',
-          ],
-          active: false,
-        },
-      ],
-    },
-  },
-  skills: {
-    eyebrow: '04 — GROW · 技能画像',
-    titleA: ['AI 读过你的历史，'],
-    titleB: ['提炼出你的 ', { em: 'Skills。' }],
-    sub: '简历上的技能是自己写的，AfterRay 的技能是从你真实的工作流里长出来的。本地模型阅读你的屏幕与对话历史，提炼出你真正在用的技能画像，并建议值得补强的下一个 skill。分析全程在本机完成。',
-    extractedLabel: 'EXTRACTED — 从历史提炼',
-    suggestedLabel: 'SUGGESTED — 建议的下一个',
-    extracted: [
-      { name: 'React 性能调优', level: '深度使用', hours: '本周 6.5h', evidence: '34 次相关屏幕活动' },
-      { name: 'Rust 异步调试', level: '熟练', hours: '本周 4.2h', evidence: 'tokio 日志 × 12 段会话' },
-      { name: '技术写作', level: '持续输出', hours: '本周 3.1h', evidence: 'spec 文档 × 2，PR 评论 × 19' },
-    ],
-    suggested: [
-      {
-        name: 'AV1 编码流水线',
-        tag: '建议学习',
-        why: '你在 3 个会话里反复查 closed-GOP 文档——系统化的理解会让下次快得多。',
-      },
-      {
-        name: 'SQLCipher 密钥轮换',
-        tag: '建议深入',
-        why: '你的 vault 设计文档多次提到 key hierarchy，但还没有落到实验。',
-      },
-    ],
-    note: '* 每条建议都基于可回放的本地证据，而非云端画像。',
   },
   specs: {
-    eyebrow: 'HOW IT WORKS',
-    title: ['一条', { em: '全程本地' }, '的流水线'],
     steps: ['Capture', 'OCR / ASR', 'Embedding', 'Encrypted Vault', 'Local LLM', 'Recall'],
     rows: [
       ['平台', 'macOS 15+ · Apple Silicon（推荐 M3）'],
       ['存储', 'SQLCipher + XChaCha20-Poly1305，密钥存于 Keychain'],
-      ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama'],
-      ['上传', '无。没有账号，没有遥测，没有云端同步'],
+      ['磁盘', '较早的画面后台重打包成 closed-GOP AV1——原 JPEG 的 7–10%'],
+      ['保留', '你自己设的存储预算，默认 100 GB——先清最早的非收藏，收藏永不过期'],
+      ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama、OpenAI 兼容接口'],
+      ['上传', '没有账号，没有遥测，没有云端同步——除非你自己接了远程模型'],
     ],
   },
   final: {
-    eyebrow: 'AFTERRAY',
     titleA: ['让你的 Mac'],
     titleB: ['拥有', { em: '不会遗忘' }, '的记忆。'],
-    sub: '免费下载 · 本地运行 · 你的数据永远只是你的',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: 'GitHub',
   },
   footer: {
     tagline: 'A ray that persists after the day is gone.',
-    rights: '© 2026 · 纯本地 · 纯隐私',
+    rights: '© 2026',
   },
 }
 

@@ -1,39 +1,31 @@
-import { LangProvider, useLang, useCopy } from './i18n'
+import { LangProvider, useCopy } from './i18n'
+import LangMenu from './components/LangMenu'
 import Hero from './sections/Hero'
-import Privacy from './sections/Privacy'
-import Rewind from './sections/Rewind'
-import Search from './sections/Search'
-import Summary from './sections/Summary'
-import Skills from './sections/Skills'
-import Specs from './sections/Specs'
+import Agents from './sections/Agents'
+import Jtbd from './sections/Jtbd'
+import Memories from './sections/Memories'
+import SearchAsk from './sections/SearchAsk'
+import Closer from './sections/Closer'
 
 function Nav() {
-  const { lang, setLang } = useLang()
-  const t = useCopy().nav
   return (
     <nav className="nav">
       <a className="nav-logo" href="#top">
-        <img src="/logo.png" alt="AfterRay logo" className="logo-img" />
-        <span className="mono">AFTERRAY</span>
+        <img src="/logo.png" alt="" className="logo-img" />
+        <span className="mono">AfterRay</span>
       </a>
-      <div className="nav-links mono">
-        <a href="#features">{t.features}</a>
-        <a href="#skills">{t.skills}</a>
-        <a href="#privacy">{t.privacy}</a>
-      </div>
       <div className="nav-actions">
-        <button
-          className="lang-toggle mono"
-          onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
-          aria-label="Switch language"
-        >
-          {lang === 'en' ? '中文' : 'EN'}
-        </button>
-        <a className="btn btn-small" href="#download">
-          {t.download}
-        </a>
+        <LangMenu />
       </div>
     </nav>
+  )
+}
+
+function SkipLink() {
+  return (
+    <a className="skip-link" href="#main">
+      {useCopy().nav.skip}
+    </a>
   )
 }
 
@@ -41,15 +33,16 @@ export default function App() {
   return (
     <LangProvider>
       <div className="app" id="top">
+        <SkipLink />
         <Nav />
         <Hero />
-        <main>
-          <Privacy />
-          <Rewind />
-          <Search />
-          <Summary />
-          <Skills />
-          <Specs />
+        <main id="main">
+          {/* the hero promises the agent already knows; cash that out first */}
+          <Agents />
+          <Jtbd />
+          <Memories />
+          <SearchAsk />
+          <Closer />
         </main>
         <div className="grain" aria-hidden="true" />
       </div>
