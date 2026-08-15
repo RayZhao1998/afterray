@@ -32,6 +32,7 @@ impl ToolHost<'_> {
             "list_memories" => self.list_memories(args),
             "list_moments" => self.list_moments(args),
             "get_transcript" => self.get_transcript(args),
+            "get_day_summary" => self.get_day_summary(args),
             "get_slot_card" => self.get_slot_card(args),
             "get_moment" => self.get_moment(args),
             "get_ocr" => self.get_ocr(args),
@@ -175,6 +176,77 @@ impl ToolHost<'_> {
     /// The deterministic 30-minute card: application time, the run
     /// timeline with its deduplicated screen text, and revisits. One call
     /// covers a half hour that would otherwise take dozens of frame reads.
+    /// The whole day at half-hour resolution, already summarised.
+    ///
+    /// This is what the day panel shows. Without it the only way to answer
+    /// "what did I do today" was to pull T1 cards slot by slot — sixteen
+    /// thousand characters of raw evidence each, for work a model had already
+    /// summarised and written to the vault.
+    fn get_day_summary(&self, args: &Value) -> Result<String, String> {
+        let day_ms = args
+            .get("day_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(self.now_ms);
+        let (day_start, day_end) = local_calendar_day_bounds_ms(day_ms);
+        self.check_range(day_start, day_end.min(self.now_ms))?;
+
+        let summary = self
+            .store
+            .day_summary(day_ms, 10_000)
+            .map_err(|e| e.to_string())?;
+        if summary.slots.is_empty() {
+            return Ok(format!(
+                "Nothing was recorded on {}.",
+                summary.day
+            ));
+        }
+
+        let mut lines = vec![format!("Day {} — {} half-hours with activity.", summary.day, summary.slots.len())];
+        let mut unsummarised = 0_usize;
+        for slot in &summary.slots {
+            let clock = chrono::DateTime::from_timestamp_millis(slot.slot_start_ms).map_or_else(
+                || slot.slot_start_ms.to_string(),
+                |dt| dt.with_timezone(&Local).format("%H:%M").to_string(),
+            );
+            match slot.title.as_deref() {
+                Some(title) => {
+                    lines.push(format!("{clock} at_ms={} — {title}", slot.slot_start_ms));
+                    for bullet in slot.bullets.iter().flatten() {
+                        lines.push(format!("    · {bullet}"));
+                    }
+                }
+                None => {
+                    // Say so rather than presenting the app list as a finding.
+                    // A model handed "Zed 14m · Chrome 9m" with no marker will
+                    // report it as what the user did.
+                    unsummarised += 1;
+                    let apps = slot
+                        .facts
+                        .apps
+                        .iter()
+                        .take(3)
+                        .map(|app| app.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!(
+                        "{clock} at_ms={} — [not summarised: {}] apps: {}",
+                        slot.slot_start_ms,
+                        slot.state.as_str(),
+                        if apps.is_empty() { "none recorded".to_owned() } else { apps }
+                    ));
+                }
+            }
+        }
+        if unsummarised > 0 {
+            lines.push(format!(
+                "\n{unsummarised} of {} half-hours have no summary yet. For those, \
+                 call get_slot_card with the at_ms above to read the evidence directly.",
+                summary.slots.len()
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
     fn get_slot_card(&self, args: &Value) -> Result<String, String> {
         let at_ms = args
             .get("at_ms")
@@ -458,6 +530,13 @@ tool result, verbatim.
     question mentions a time, unless the numbers are already in front of you.
 
 Start wide, then narrow:
+- get_day_summary: {"day_ms":0}
+    Every half-hour of one local day, already summarised — a title and a few
+    bullets each, plus the at_ms to drill into. Omit day_ms for today. This
+    is the right first call for "what did I do today / yesterday", and it is
+    far cheaper than reading each half-hour's evidence. Half-hours no model
+    has reached yet are marked "not summarised"; treat those as unknown, not
+    as a finding, and use get_slot_card on them if they matter.
 - get_slot_card: {"at_ms":0}
     A whole 30-minute window at once: which apps for how long, a timeline of
     what was open, the screen text each stretch introduced, and what the
@@ -526,6 +605,81 @@ mod tests {
                 .insert_moment(&session.id, *stamp, "image/jpeg", b"frame")
                 .unwrap();
         }
+    }
+
+    /// Seeds one half-hour with moments and gives it a T2 card, leaving a
+    /// second half-hour with evidence but no summary.
+    fn seed_day(vault: &Vault, summarised_at: i64, bare_at: i64) {
+        seed_moments(vault, &[summarised_at, summarised_at + 60_000, bare_at]);
+        let card = vault.slot_card(summarised_at, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &afterray_store::T2Card {
+                    artifacts: Vec::new(),
+                    title: "Chased a GOP header bug".to_owned(),
+                    bullets: vec!["Read the IVF length check".to_owned()],
+                    category: Some("coding".to_owned()),
+                    confidence: Some(0.8),
+                },
+                "test",
+                summarised_at,
+                Some(1),
+            )
+            .unwrap();
+    }
+
+    /// The day panel's contents, reachable by the agent. Before this the only
+    /// route to "what did I do today" was a T1 card per half hour.
+    #[tokio::test]
+    async fn get_day_summary_returns_the_written_summaries() {
+        let (_dir, vault, models) = host_fixture();
+        // Inside today's local bounds: NOW is early morning, so subtracting
+        // hours would land on yesterday and the day tool would rightly refuse.
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        seed_day(&vault, noon, noon + 1_800_000);
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
+        assert!(text.contains("Chased a GOP header bug"), "{text}");
+        assert!(text.contains("Read the IVF length check"), "{text}");
+        // The at_ms has to come back or the model cannot drill in.
+        assert!(text.contains(&format!("at_ms={noon}")), "{text}");
+    }
+
+    /// A half-hour nothing has summarised must not present its app list as a
+    /// finding — a model handed a bare list will report it as what happened.
+    #[tokio::test]
+    async fn get_day_summary_marks_the_gaps() {
+        let (_dir, vault, models) = host_fixture();
+        // Inside today's local bounds: NOW is early morning, so subtracting
+        // hours would land on yesterday and the day tool would rightly refuse.
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        seed_day(&vault, noon, noon + 1_800_000);
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
+        assert!(text.contains("not summarised"), "{text}");
+        assert!(text.contains("get_slot_card"), "the gap note must say how to dig in: {text}");
+    }
+
+    /// A day with nothing in it, but inside the recorded span — a weekend
+    /// between two working days. The range guard cannot answer this one, so
+    /// the tool has to say it plainly instead of returning an empty list.
+    #[tokio::test]
+    async fn get_day_summary_says_so_when_a_day_is_empty() {
+        let (_dir, vault, models) = host_fixture();
+        let today = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        seed_day(&vault, today, today + 1_800_000);
+        // Push coverage back two days so yesterday sits inside the span.
+        seed_moments(&vault, &[today - 2 * DAY]);
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+
+        let text = host
+            .invoke("get_day_summary", &json!({"day_ms": NOW - DAY}))
+            .await
+            .unwrap();
+        assert!(text.contains("Nothing was recorded"), "{text}");
     }
 
     #[tokio::test]
