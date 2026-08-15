@@ -1237,6 +1237,26 @@ impl Vault {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
+    /// Oldest and newest capture held by the vault, or `None` when nothing has
+    /// been recorded. An agent needs this to tell a window that is genuinely
+    /// quiet from one that falls outside the recording altogether.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_time_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement =
+            connection.prepare("SELECT MIN(captured_at_ms), MAX(captured_at_ms) FROM moments")?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let first: Option<i64> = row.get(0)?;
+        let last: Option<i64> = row.get(1)?;
+        Ok(first.zip(last))
+    }
+
     /// Nearest moment to `at_ms`, in either direction.
     ///
     /// # Errors

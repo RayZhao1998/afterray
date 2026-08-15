@@ -73,15 +73,7 @@ pub async fn run_readonly_agent_traced(
     let mut tool_calls = Vec::new();
 
     for round in 0..MAX_ROUNDS {
-        let prompt = if transcript.chars().count() > MAX_HISTORY_CHARS {
-            let kept: String = transcript
-                .chars()
-                .skip(transcript.chars().count() - MAX_HISTORY_CHARS)
-                .collect();
-            format!("…(earlier tool transcript truncated)…\n{kept}")
-        } else {
-            transcript.clone()
-        };
+        let prompt = clip_transcript(&transcript);
 
         let text = generate(models, &prompt, &system).await?;
 
@@ -118,6 +110,20 @@ pub async fn run_readonly_agent_traced(
         return Err(AgentError::Failed("model returned empty output".into()));
     }
     Err(AgentError::Failed("agent loop exhausted".into()))
+}
+
+/// Drops the middle, not the head: the opening holds the task and the clock
+/// anchors the tools need.
+fn clip_transcript(transcript: &str) -> String {
+    let total = transcript.chars().count();
+    if total <= MAX_HISTORY_CHARS {
+        return transcript.to_owned();
+    }
+    let head_chars = MAX_HISTORY_CHARS / 3;
+    let tail_chars = MAX_HISTORY_CHARS - head_chars;
+    let head: String = transcript.chars().take(head_chars).collect();
+    let tail: String = transcript.chars().skip(total - tail_chars).collect();
+    format!("{head}\n…(middle of the tool transcript omitted)…\n{tail}")
 }
 
 async fn generate(models: &ModelQueue, prompt: &str, system: &str) -> Result<String, AgentError> {

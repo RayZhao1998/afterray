@@ -401,7 +401,11 @@ pub(crate) async fn handle_ask(
     let user = format!(
         "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
     );
-    let host = ToolHost { store, models };
+    let host = ToolHost {
+        store,
+        models,
+        now_ms,
+    };
     match agent::run_readonly_agent(models, &host, ASK_SYSTEM_PROMPT, &user).await {
         Ok(answer) => Response::success(AskAnswer {
             answer: answer.trim().to_owned(),
