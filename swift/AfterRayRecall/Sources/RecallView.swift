@@ -204,23 +204,6 @@ public struct RecallView: View {
 
                 Spacer(minLength: 100)
 
-                if !isLive {
-                    TranscriptCaption(
-                        text: selectedMoment?.transcriptText,
-                        canPlay: selectedMoment?.audioArtifactId != nil
-                            && (selectedMoment?.hasVisibleTranscript ?? false),
-                        isPlaying: isAudioPlaying && selectedAudioIsActive,
-                        isBuffering: isAudioBuffering && selectedAudioIsActive,
-                        onToggleAudio: {
-                            if let moment = selectedMoment {
-                                onToggleAudio?(moment)
-                            }
-                        }
-                    )
-                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                    .padding(.bottom, 12)
-                }
-
                 if daySummaryExpanded {
                     HStack(alignment: .bottom, spacing: 0) {
                         DaySummaryPanel(
@@ -247,6 +230,26 @@ public struct RecallView: View {
                     .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                     .padding(.bottom, 10)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
+                // Last thing above the timeline chrome, so the line you heard
+                // stays next to the moment it was heard at. Above the summary
+                // panel it drifted to the top of the screen whenever the panel
+                // was open, which is where a caption reads as unrelated.
+                if !isLive, selectedMoment?.hasVisibleTranscript == true {
+                    TranscriptCaption(
+                        text: selectedMoment?.transcriptText,
+                        canPlay: selectedMoment?.audioArtifactId != nil,
+                        isPlaying: isAudioPlaying && selectedAudioIsActive,
+                        isBuffering: isAudioBuffering && selectedAudioIsActive,
+                        onToggleAudio: {
+                            if let moment = selectedMoment {
+                                onToggleAudio?(moment)
+                            }
+                        }
+                    )
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.bottom, 12)
                 }
 
                 timelineChromeRow
