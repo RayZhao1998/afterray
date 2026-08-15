@@ -56,9 +56,16 @@ make release
 
 The default command performs release builds, checks that every binary is
 arm64 and has no checkout, Homebrew, `/usr/local`, or unresolved `@rpath`
-dependency, signs nested executables from the inside out, enables Hardened
-Runtime and a secure timestamp, builds and signs a DMG, submits it with
-`notarytool`, staples the ticket, and runs code-signing and Gatekeeper checks.
+dependency, signs nested executables from the inside out, and enables Hardened
+Runtime and a secure timestamp.
+
+It then notarizes twice, and the order matters. The signed application is
+submitted first and its ticket stapled to the bundle; only then is the DMG
+built from that stapled app, signed, submitted, and stapled in turn. A ticket
+on the DMG alone does not travel with the copy the user drags into
+`/Applications`, which leaves their first launch depending on an online check
+with Apple. Finally the script runs code-signing and Gatekeeper checks against
+both the app and the DMG.
 
 Outputs are written to `dist/`:
 
