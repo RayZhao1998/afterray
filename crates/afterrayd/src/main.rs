@@ -25,7 +25,8 @@ use afterray_protocol::{
     Response, SearchHit, Status, local_calendar_day_bounds_ms,
 };
 use afterray_store::{
-    MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig, fuse_search_results,
+    LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
+    fuse_search_results,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -42,11 +43,78 @@ use tokio::{
 };
 use uuid::Uuid;
 
-fn default_socket_path() -> PathBuf {
-    std::env::var_os("AFTERRAY_SOCKET").map_or_else(
-        || std::env::temp_dir().join("afterray-v0.sock"),
-        PathBuf::from,
-    )
+/// Binds the control socket without ever clobbering a path we do not own.
+///
+/// Everything reachable over this socket is plaintext history, so the socket
+/// is the vault's front door. The old code ran an unconditional
+/// `remove_file` on whatever sat at the path and bound with the process
+/// umask, which in a shared directory is a socket-hijacking primitive and in
+/// any directory left the socket group- and world-connectable.
+///
+/// Returns the listener and the uid that owns it, which is this process's own
+/// effective uid — read back from the filesystem so we stay clear of an
+/// `unsafe` `geteuid` call in a crate that denies unsafe code.
+fn bind_control_socket(socket: &Path) -> anyhow::Result<(UnixListener, u32)> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let parent = socket
+        .parent()
+        .context("daemon socket path has no parent directory")?;
+    std::fs::create_dir_all(parent).context("create daemon socket directory")?;
+    let metadata = std::fs::metadata(parent).context("inspect daemon socket directory")?;
+    let mode = metadata.permissions().mode() & 0o777;
+    // Only tighten a directory that other users can enter or write. Forcing
+    // `0700` unconditionally would silently re-permission whatever directory
+    // an `AFTERRAY_SOCKET` override happened to name.
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode & 0o700))
+            .with_context(|| {
+                format!(
+                    "{} can be reached by other users and could not be restricted",
+                    parent.display()
+                )
+            })?;
+    }
+    let our_uid = metadata.uid();
+
+    // `symlink_metadata` does not follow a symlink, so a link planted at the
+    // socket path is seen for what it is and refused instead of letting the
+    // unlink below land on its target.
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                anyhow::bail!(
+                    "{} exists and is not a socket; refusing to replace it",
+                    socket.display()
+                );
+            }
+            if metadata.uid() != our_uid {
+                anyhow::bail!(
+                    "{} is owned by uid {}; refusing to replace it",
+                    socket.display(),
+                    metadata.uid()
+                );
+            }
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+                anyhow::bail!(
+                    "another afterrayd is already listening on {}",
+                    socket.display()
+                );
+            }
+            std::fs::remove_file(socket).context("remove stale daemon socket")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect daemon socket path"),
+    }
+
+    let listener = UnixListener::bind(socket).context("bind daemon socket")?;
+    // The window between `bind` and this `chmod` is covered by the `0700`
+    // directory above: no other user can reach the path to connect through it.
+    // macOS enforces socket permissions on connect(2), so this is what keeps
+    // the door shut afterwards.
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .context("restrict daemon socket")?;
+    Ok((listener, our_uid))
 }
 
 fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
@@ -70,11 +138,9 @@ fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let socket = default_socket_path();
-    if socket.exists() {
-        std::fs::remove_file(&socket).context("remove stale daemon socket")?;
-    }
-    let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
+    let socket =
+        afterray_protocol::socket::default_socket_path().context("resolve daemon socket path")?;
+    let (listener, owner_uid) = bind_control_socket(&socket)?;
 
     let mut vault_config = VaultConfig::default();
     if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
@@ -85,7 +151,10 @@ async fn main() -> anyhow::Result<()> {
     if removed_staging_files > 0 {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
-    let persisted = load_persisted_settings(&vault_config.data_dir);
+    let persisted = migrate_api_key_to_keychain(
+        &vault_config.data_dir,
+        load_persisted_settings(&vault_config.data_dir),
+    );
     vault_config.max_storage_bytes = persisted.storage_limit_bytes;
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
@@ -176,6 +245,20 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                // Belt to the socket's `0600` braces: the permission bits are
+                // checked when the path is opened, this is checked on the
+                // connection we actually got.
+                match stream.peer_cred() {
+                    Ok(peer) if peer.uid() == owner_uid => {}
+                    Ok(peer) => {
+                        eprintln!("refused a connection from uid {}", peer.uid());
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("refused a connection with unreadable credentials: {error}");
+                        continue;
+                    }
+                }
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, state).await {
@@ -364,8 +447,10 @@ struct PersistedSettings {
     llm_base_url: String,
     #[serde(default)]
     llm_model: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    llm_api_key: String,
+    /// Read so a `settings.json` written before the key moved into the
+    /// Keychain can be migrated. Never written back.
+    #[serde(rename = "llm_api_key", default, skip_serializing)]
+    legacy_llm_api_key: String,
     #[serde(default = "default_language")]
     ui_language: String,
     #[serde(default = "default_language")]
@@ -423,7 +508,7 @@ impl Default for PersistedSettings {
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
             llm_model: String::new(),
-            llm_api_key: String::new(),
+            legacy_llm_api_key: String::new(),
             ui_language: default_language(),
             summary_language: default_language(),
         }
@@ -1036,7 +1121,8 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
         llm_model: llm.model,
-        llm_api_key: llm.api_key.unwrap_or_default(),
+        // The key itself lives in the Keychain; this file never carries it.
+        legacy_llm_api_key: String::new(),
         ui_language: state
             .languages
             .lock()
@@ -1150,6 +1236,27 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         || llm_model.is_some()
         || llm_api_key.is_some()
     {
+        // Validate and persist the credential before touching live config, so
+        // a rejected endpoint or a Keychain failure leaves the assistant
+        // exactly as the user last confirmed it.
+        if let Some(base_url) = llm_base_url.as_deref().map(str::trim)
+            && !base_url.is_empty()
+            && let Err(error) = afterray_models::check_origin(base_url)
+        {
+            return Response::failure(error);
+        }
+        if let Some(api_key) = llm_api_key.as_deref().map(str::trim) {
+            let stored = if api_key.is_empty() {
+                afterray_store::delete_secret(LLM_API_KEY_SECRET)
+            } else {
+                afterray_store::store_secret(LLM_API_KEY_SECRET, api_key)
+            };
+            if let Err(error) = stored {
+                return Response::failure(format!(
+                    "could not save the assistant API key to the Keychain: {error}"
+                ));
+            }
+        }
         let previous_llm = current_llm_config(state);
         let previous_mlx_pack = (previous_llm.provider == LlmProvider::MlxLocal)
             .then(|| previous_llm.mlx_pack_id().map(ToOwned::to_owned))
@@ -1208,14 +1315,25 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
             .unwrap_or_else(|| persisted.llm_base_url.clone()),
         model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL")
             .unwrap_or_else(|| persisted.llm_model.clone()),
-        api_key: env_nonempty("AFTERRAY_LLM_API_KEY").or_else(|| {
-            let key = persisted.llm_api_key.trim();
-            if key.is_empty() {
-                None
-            } else {
-                Some(key.to_owned())
-            }
-        }),
+        api_key: env_nonempty("AFTERRAY_LLM_API_KEY")
+            .or_else(stored_api_key)
+            // Only reachable when the Keychain refused the migration write.
+            .or_else(|| {
+                let key = persisted.legacy_llm_api_key.trim();
+                (!key.is_empty()).then(|| key.to_owned())
+            }),
+    }
+}
+
+fn stored_api_key() -> Option<String> {
+    match afterray_store::load_secret(LLM_API_KEY_SECRET) {
+        Ok(value) => value
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        Err(error) => {
+            eprintln!("could not read the assistant API key from the Keychain: {error}");
+            None
+        }
     }
 }
 
@@ -1340,12 +1458,57 @@ fn load_persisted_settings(data_dir: &Path) -> PersistedSettings {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// Written `0600` through a temporary file, the way the vault writes its own
+/// artifacts. A plain `std::fs::write` took the process umask, so this file —
+/// which carries the exclusion lists and, before the key moved to the
+/// Keychain, the API key — landed `0644` beside the encrypted vault.
 fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     std::fs::create_dir_all(data_dir)?;
-    std::fs::write(
-        settings_path(data_dir),
-        serde_json::to_vec_pretty(settings)?,
-    )
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = settings_path(data_dir);
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, &path)?;
+    // An upgrade inherits whatever mode the old writer left behind.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// V0 wrote the OpenAI-compatible API key in cleartext into `settings.json`.
+/// Move any such key into the Keychain on the first launch that can, and
+/// rewrite the file without it.
+fn migrate_api_key_to_keychain(
+    data_dir: &Path,
+    mut persisted: PersistedSettings,
+) -> PersistedSettings {
+    let legacy = std::mem::take(&mut persisted.legacy_llm_api_key);
+    let legacy = legacy.trim();
+    if legacy.is_empty() {
+        return persisted;
+    }
+    if let Err(error) = afterray_store::store_secret(LLM_API_KEY_SECRET, legacy) {
+        // Keep the key working this session rather than silently signing the
+        // user out of their own assistant; the file stays as it was.
+        eprintln!("could not move the assistant API key into the Keychain: {error}");
+        persisted.legacy_llm_api_key = legacy.to_owned();
+        return persisted;
+    }
+    if let Err(error) = save_persisted_settings(data_dir, &persisted) {
+        eprintln!("could not rewrite settings.json without the API key: {error}");
+    }
+    persisted
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
@@ -2687,6 +2850,106 @@ mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn a_bound_socket_is_private_to_its_owner() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("nested").join("afterray.sock");
+        let (listener, uid) = bind_control_socket(&socket).unwrap();
+
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "socket mode {mode:o}");
+        let parent_mode = std::fs::metadata(socket.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(parent_mode & 0o777, 0o700, "directory mode {parent_mode:o}");
+        assert_eq!(
+            uid,
+            std::fs::metadata(&socket).unwrap().uid(),
+            "the reported owner has to be the uid that bound the socket"
+        );
+        drop(listener);
+
+        // A directory other users can enter is tightened before the socket
+        // lands in it.
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (listener, _) = bind_control_socket(&shared.join("afterray.sock")).unwrap();
+        let shared_mode = std::fs::metadata(&shared).unwrap().permissions().mode();
+        assert_eq!(shared_mode & 0o777, 0o700, "shared mode {shared_mode:o}");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_live_daemon_is_never_evicted_from_its_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("afterray.sock");
+        let (listener, _) = bind_control_socket(&socket).unwrap();
+
+        let error = bind_control_socket(&socket).unwrap_err().to_string();
+        assert!(error.contains("already listening"), "{error}");
+        drop(listener);
+
+        // The dead socket left behind is ours to reclaim.
+        bind_control_socket(&socket).unwrap();
+    }
+
+    /// Unlinking whatever sits at the path was the old behaviour. A regular
+    /// file or a symlink there is a sign something else owns the name, and
+    /// following it would let that thing pick what we destroy.
+    #[tokio::test]
+    async fn a_path_that_is_not_our_socket_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("afterray.sock");
+        std::fs::write(&socket, b"not a socket").unwrap();
+        let error = bind_control_socket(&socket).unwrap_err().to_string();
+        assert!(error.contains("not a socket"), "{error}");
+        assert!(socket.exists(), "the file must survive the refusal");
+
+        let linked = directory.path().join("linked.sock");
+        std::os::unix::fs::symlink(&socket, &linked).unwrap();
+        let error = bind_control_socket(&linked).unwrap_err().to_string();
+        assert!(error.contains("not a socket"), "{error}");
+        assert!(socket.exists(), "the symlink target must survive too");
+    }
+
+    #[test]
+    fn settings_are_written_private_and_never_carry_the_api_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings = PersistedSettings {
+            legacy_llm_api_key: "sk-must-not-be-written".to_owned(),
+            ..PersistedSettings::default()
+        };
+        save_persisted_settings(directory.path(), &settings).unwrap();
+
+        let path = settings_path(directory.path());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "settings mode {mode:o}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("sk-must-not-be-written"), "{written}");
+        assert!(!written.contains("llm_api_key"), "{written}");
+    }
+
+    /// The field is gone from what we write but has to survive what we read,
+    /// or a user upgrading from V0 silently loses their configured key.
+    #[test]
+    fn a_settings_file_from_before_the_keychain_still_yields_its_key() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings_path(directory.path()),
+            br#"{"llm_api_key":"sk-legacy","llm_model":"gpt-4o-mini"}"#,
+        )
+        .unwrap();
+        let persisted = load_persisted_settings(directory.path());
+        assert_eq!(persisted.legacy_llm_api_key, "sk-legacy");
+        assert_eq!(persisted.llm_model, "gpt-4o-mini");
+    }
 
     /// People paste what is in the address bar. Every one of these means the
     /// same site, and rejecting any of them produces an exclusion that looks
