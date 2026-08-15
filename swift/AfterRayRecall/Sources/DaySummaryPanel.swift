@@ -122,13 +122,35 @@ private struct DaySummaryRow: View {
                     .monospacedDigit()
                     .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
                     .frame(width: 42, alignment: .leading)
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
+                    // No line limit anywhere in this row: the panel exists to
+                    // be read, and a clipped title is the one thing the user
+                    // cannot recover without opening the half hour itself.
                     Text(text.primary)
                         .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
                         .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.56))
                         .multilineTextAlignment(.leading)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if !text.detail.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(text.detail.enumerated()), id: \.offset) { _, line in
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Text("·")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.3))
+                                    Text(line)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.white.opacity(0.66))
+                                        .multilineTextAlignment(.leading)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                        .padding(.top, 1)
+                    }
 
                     if let badge = text.badge {
                         Text(badge)

@@ -800,9 +800,12 @@ public enum RecallGeometry {
     public static let overlayChromeMargin: CGFloat = 26
     /// Space between sibling buttons inside one chrome cluster.
     public static let overlayChromeItemGap: CGFloat = 10
-    public static let daySummaryPanelWidth: CGFloat = 308
-    public static let daySummaryMaxHeight: CGFloat = 304
-    public static let daySummaryListMaxHeight: CGFloat = 248
+    /// Sized for a whole slot card — title plus its bullets — rather than a
+    /// one-line index. Narrower than this and every summary wraps into a
+    /// column of fragments.
+    public static let daySummaryPanelWidth: CGFloat = 392
+    public static let daySummaryMaxHeight: CGFloat = 520
+    public static let daySummaryListMaxHeight: CGFloat = 460
     public static let daySummaryCornerRadius: CGFloat = 16
     /// Window titles run long. Cap the identity capsule so one verbose title
     /// cannot push the rest of the chrome row off screen.

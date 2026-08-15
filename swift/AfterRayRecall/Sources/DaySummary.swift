@@ -112,6 +112,10 @@ public struct DaySummaryHeading: Equatable, Sendable {
 public struct DaySummaryRowText: Equatable, Sendable {
     public let time: String
     public let primary: String
+    /// The written summary under the title. The panel is the only place a
+    /// half hour's card is ever read, so it carries the whole body — a
+    /// truncated one sends the user back to the timeline to guess.
+    public let detail: [String]
     public let isT2: Bool
     /// Why this row is showing raw activity instead of a summary. Nil once a
     /// model has written a card. Without it a fallback row reads as if the
@@ -119,9 +123,16 @@ public struct DaySummaryRowText: Equatable, Sendable {
     /// nothing has looked at it yet.
     public let badge: String?
 
-    public init(time: String, primary: String, isT2: Bool, badge: String? = nil) {
+    public init(
+        time: String,
+        primary: String,
+        detail: [String] = [],
+        isT2: Bool,
+        badge: String? = nil
+    ) {
         self.time = time
         self.primary = primary
+        self.detail = detail
         self.isT2 = isT2
         self.badge = badge
     }
@@ -231,12 +242,16 @@ public enum DaySummaryLayout {
 
     public static func rowText(slot: DaySlotSummary, timeZone: TimeZone = .current) -> DaySummaryRowText {
         let time = timeLabel(slotStartMs: slot.slotStartMs, timeZone: timeZone)
+        let detail = (slot.bullets ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         if let title = slot.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-            return DaySummaryRowText(time: time, primary: title, isT2: true)
+            return DaySummaryRowText(time: time, primary: title, detail: detail, isT2: true)
         }
         return DaySummaryRowText(
             time: time,
             primary: factLine(apps: slot.facts.apps),
+            detail: detail,
             isT2: false,
             badge: fallbackBadge(state: slot.state)
         )
