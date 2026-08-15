@@ -15,10 +15,13 @@ public enum DaySummaryPanelStyle: Sendable {
     case window
 }
 
-/// The history-summary panel is deliberately a single lazy scroll view: it
-/// can keep walking toward the earliest capture without retaining every row
-/// in the SwiftUI view tree or asking each row to hit the daemon.
+/// The history-summary panel renders as one attributed document in an
+/// `NSTextView`, so text selection is continuous across bullets, rows and
+/// days — a list of SwiftUI views can never extend a selection past a single
+/// `Text`. The date that used to pin as a section header becomes a chip
+/// under the panel header, tracking whichever day is scrolled into view.
 public struct DaySummaryPanel: View {
+    @State private var topDayHeading: String?
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
@@ -61,12 +64,6 @@ public struct DaySummaryPanel: View {
         self.onLoadMore = onLoadMore
     }
 
-    private var highlightedStart: Int64? {
-        summaries.lazy.compactMap {
-            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
-        }.first
-    }
-
     private var dayCountLabel: String {
         let count = summaries.count
         return count == 1 ? "1 DAY" : "\(count) DAYS"
@@ -79,10 +76,38 @@ public struct DaySummaryPanel: View {
                 emptyState
             } else {
                 historyList
+                    .overlay(alignment: .topLeading) { dayChip }
             }
         }
         .modifier(DaySummaryPanelChrome(style: style))
         .accessibilityIdentifier("history-summary-panel")
+    }
+
+    /// The scroll-tracking replacement for the pinned section header: the
+    /// document flow cannot pin a view, so once a day's own heading scrolls
+    /// off the top, this chip floats over the list carrying the same text.
+    @ViewBuilder
+    private var dayChip: some View {
+        if let topDayHeading {
+            Text(topDayHeading)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .tracking(1.1)
+                .foregroundStyle(
+                    topDayHeading.hasPrefix("TODAY")
+                        ? RecallPalette.ray.opacity(0.85)
+                        : .white.opacity(0.7)
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+                .padding(.leading, 14)
+                .padding(.top, 2)
+                .animation(nil, value: topDayHeading)
+                .allowsHitTesting(false)
+        }
     }
 
     private var header: some View {
@@ -140,129 +165,23 @@ public struct DaySummaryPanel: View {
     }
 
     private var historyList: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: style == .window) {
-                // Pinned headers: while a day's rows scroll, its date stays
-                // put at the top of the list — the reader always knows which
-                // day they are inside.
-                LazyVStack(alignment: .leading, spacing: 10, pinnedViews: [.sectionHeaders]) {
-                    ForEach(summaries, id: \.dayStartMs) { summary in
-                        DaySummarySection(
-                            summary: summary,
-                            playheadMs: playheadMs,
-                            nowMs: nowMs,
-                            thumbnailLoader: thumbnailLoader,
-                            onSelectSlot: onSelectSlot
-                        )
-                        .id(summary.dayStartMs)
-                    }
-                    if hasMore {
-                        HistorySummaryLoadTrigger(isLoading: isLoadingMore, onAppear: onLoadMore)
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.bottom, 8)
+        HistoryDocumentView(
+            summaries: summaries,
+            playheadMs: playheadMs,
+            nowMs: nowMs,
+            hasMore: hasMore,
+            isLoadingMore: isLoadingMore,
+            followPulse: followPulse,
+            thumbnailLoader: thumbnailLoader,
+            onSelectSlot: onSelectSlot,
+            onLoadMore: onLoadMore,
+            onTopDayChange: { heading in
+                if topDayHeading != heading { topDayHeading = heading }
             }
-            .frame(maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity)
-            .onAppear { scrollToCurrent(proxy) }
-            .onChange(of: followPulse) { _, _ in
-                scrollToCurrent(proxy)
-            }
-        }
-    }
-
-    private func scrollToCurrent(_ proxy: ScrollViewProxy) {
-        guard let highlightedStart else { return }
-        // The user reading the panel outranks the playhead: yanking the list
-        // to the highlighted slot mid-read is the jank being reported.
-        if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
-        // LazyVStack cannot scroll to a row inside an unmaterialised day
-        // section; target the section first so its rows exist, then the row.
-        if let day = summaries.first(where: {
-            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots) != nil
-        }) {
-            proxy.scrollTo(day.dayStartMs, anchor: .top)
-        }
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            proxy.scrollTo(highlightedStart, anchor: .center)
-        }
-    }
-}
-
-private struct DaySummarySection: View {
-    let summary: DaySummary
-    let playheadMs: Int64
-    let nowMs: Int64
-    let thumbnailLoader: RecallThumbnailLoader?
-    let onSelectSlot: (Int64) -> Void
-
-    private var heading: DaySummaryHeading {
-        DaySummaryLayout.dateHeading(dayStartMs: summary.dayStartMs, nowMs: nowMs)
-    }
-
-    private var highlightedStart: Int64? {
-        DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: summary.slots)
-    }
-
-    var body: some View {
-        // A real Section: `pinnedViews: [.sectionHeaders]` can only pin a
-        // Section's header, so the date stays visible while its rows scroll
-        // beneath it. The header wears an opaque backdrop for exactly that
-        // moment of overlap.
-        Section {
-            content
-        } header: {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(heading.kicker)
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .tracking(1.25)
-                    .foregroundStyle(heading.isToday ? RecallPalette.ray.opacity(0.85) : .white.opacity(0.45))
-                Text(heading.title)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.8))
-                Spacer(minLength: 8)
-                Text("\(summary.slots.count)")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.white.opacity(0.32))
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94))
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .contextMenu {
-                Button("Copy This Day") {
-                    copyToPasteboard(DaySummaryClipboard.dayText(summary))
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            if summary.slots.isEmpty {
-                Text("No recordings")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.38))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 7)
-            } else {
-                ForEach(DaySummaryLayout.displayOrder(summary.slots)) { slot in
-                    DaySummaryRow(
-                        slot: slot,
-                        isCurrent: slot.slotStartMs == highlightedStart,
-                        thumbnailLoader: thumbnailLoader,
-                        onSelect: { onSelectSlot(slot.slotStartMs) }
-                    )
-                    .id(slot.slotStartMs)
-                }
-            }
-        }
-        .padding(.vertical, 2)
-        .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        )
+        .frame(maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity)
+        .padding(.horizontal, 6)
+        .padding(.bottom, 8)
     }
 }
 
@@ -294,252 +213,3 @@ private struct DaySummaryPanelChrome: ViewModifier {
     }
 }
 
-private struct HistorySummaryLoadTrigger: View {
-    let isLoading: Bool
-    let onAppear: () -> Void
-
-    var body: some View {
-        Group {
-            if isLoading {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(RecallPalette.ray)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            } else {
-                Color.clear
-                    .frame(height: 1)
-                    .onAppear(perform: onAppear)
-            }
-        }
-        .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")
-    }
-}
-
-private struct DaySummaryRow: View {
-    let slot: DaySlotSummary
-    let isCurrent: Bool
-    let thumbnailLoader: RecallThumbnailLoader?
-    let onSelect: () -> Void
-    @State private var isHovering = false
-
-    private var text: DaySummaryRowText {
-        DaySummaryLayout.rowText(slot: slot)
-    }
-
-    var body: some View {
-        // Not a button: the prose is content to read, select and copy. The
-        // two deliberate jump affordances — the time chip and the frame
-        // thumbnail — open the timeline; everything else leaves the text
-        // alone so selection works.
-        HStack(alignment: .top, spacing: 10) {
-                Button(action: onSelect) {
-                    Text(text.time)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
-                        .frame(width: 42, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Open this half hour in the timeline")
-                .padding(.top, 2) // optically align with the title's cap height
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(text.primary)
-                        .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
-                        .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.56))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-
-                    if !text.detail.isEmpty {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(Array(text.detail.enumerated()), id: \.offset) { _, line in
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text("·")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundStyle(.white.opacity(0.3))
-                                    Text(line)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.white.opacity(0.66))
-                                        .multilineTextAlignment(.leading)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .textSelection(.enabled)
-                                }
-                            }
-                        }
-                        .padding(.top, 1)
-                    }
-
-                    // One metadata line: status and app icons are both
-                    // "about this row", so they share a row instead of
-                    // stacking — grouped by proximity, and the row stays
-                    // short for unsummarised slots.
-                    if text.badge != nil || !slot.facts.apps.isEmpty {
-                        HStack(spacing: 8) {
-                            if let badge = text.badge {
-                                Text(badge)
-                                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(badgeTint(badge).opacity(0.9))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(badgeTint(badge).opacity(0.14), in: Capsule())
-                                    .accessibilityLabel("Summary status: \(badge)")
-                            }
-                            if !slot.facts.apps.isEmpty {
-                                SlotAppIconStrip(apps: slot.facts.apps)
-                            }
-                        }
-                        .padding(.top, 1)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                if let anchorMomentId = slot.anchorMomentId, let thumbnailLoader {
-                    Button(action: onSelect) {
-                        SlotAnchorThumbnail(
-                            momentID: anchorMomentId,
-                            loader: thumbnailLoader
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open this frame in the timeline")
-                    .padding(.top, 1)
-                }
-            }
-            .padding(.leading, 12)
-            .padding(.trailing, 12)
-            .padding(.vertical, 7)
-            .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(rowFill)
-            }
-            .overlay(alignment: .leading) {
-                if isCurrent {
-                    RoundedRectangle(cornerRadius: 1, style: .continuous)
-                        .fill(RecallPalette.ray)
-                        .frame(width: 2)
-                        .padding(.vertical, 6)
-                }
-            }
-        .padding(.horizontal, 6)
-        .onHover { isHovering = $0 }
-        .contextMenu {
-            Button("Copy This Half Hour") {
-                copyToPasteboard(DaySummaryClipboard.slotText(slot))
-            }
-        }
-    }
-
-    private func badgeTint(_ badge: String) -> Color {
-        badge == "Summary failed" ? RecallPalette.ray : .white.opacity(0.5)
-    }
-
-    private var rowFill: Color {
-        if isCurrent { return RecallPalette.ray.opacity(0.13) }
-        if isHovering { return Color.white.opacity(0.05) }
-        return .clear
-    }
-}
-
-/// The slot's opening frame, so a row is recognisable at a glance rather
-/// than only describable. Loads through the shared thumbnail cache; a slot
-/// scrolled past twice costs one decode.
-private struct SlotAnchorThumbnail: View {
-    let momentID: String
-    let loader: RecallThumbnailLoader
-    @State private var image: CGImage?
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                Color.white.opacity(0.05)
-            }
-        }
-        .frame(width: 56, height: 36)
-        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .strokeBorder(.white.opacity(0.1), lineWidth: 1)
-        }
-        .task(id: momentID) {
-            image = RecallThumbnailCache.shared.cached(momentID: momentID)
-            if image == nil {
-                image = await RecallThumbnailCache.shared.image(momentID: momentID, loader: loader)
-            }
-        }
-    }
-}
-
-/// Every application the half hour touched, as icons in time order — the
-/// fastest possible "what was going on here" read, under the prose.
-private struct SlotAppIconStrip: View {
-    let apps: [DayAppFact]
-    private static let iconLimit = 8
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(apps.prefix(Self.iconLimit), id: \.name) { app in
-                SlotAppIcon(app: app)
-            }
-            if apps.count > Self.iconLimit {
-                Text("+\(apps.count - Self.iconLimit)")
-                    .font(.system(size: 8, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.35))
-            }
-        }
-        .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
-    }
-}
-
-/// One icon, loaded off the main thread on first sight. A row scrolling in
-/// must never pay Launch Services on the render loop. An app whose icon
-/// cannot resolve (uninstalled since capture) collapses to nothing — an
-/// empty placeholder square communicates only "something failed here".
-private struct SlotAppIcon: View {
-    let app: DayAppFact
-
-    private enum Resolution: Equatable {
-        case loading
-        case loaded(NSImage)
-        case absent
-    }
-
-    @State private var resolution = Resolution.loading
-
-    var body: some View {
-        switch resolution {
-        case .loading:
-            Color.clear
-                .frame(width: 14, height: 14)
-                .task(id: app.bundleIdentifier) { await resolve() }
-        case .loaded(let icon):
-            Image(nsImage: icon)
-                .resizable()
-                .interpolation(.medium)
-                .frame(width: 14, height: 14)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
-        case .absent:
-            EmptyView()
-        }
-    }
-
-    private func resolve() async {
-        if let hit = AppIconLookup.cachedIcon(bundleIdentifier: app.bundleIdentifier) {
-            resolution = .loaded(hit)
-            return
-        }
-        if let icon = await AppIconLookup.iconAsync(bundleIdentifier: app.bundleIdentifier) {
-            resolution = .loaded(icon)
-        } else {
-            resolution = .absent
-        }
-    }
-}
