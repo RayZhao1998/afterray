@@ -169,6 +169,13 @@ build = int(build_text)
 for existing in releases:
     if int(existing["build"]) == build:
         sys.exit(f"build {build} is already published; bump CFBundleVersion")
+    # Release artifacts are immutable-cached. Reusing an object name could make
+    # a new appcast signature point at a CDN-cached archive from an older build.
+    if existing.get("archive") == archive_name or existing.get("installer") == installer_name:
+        sys.exit(
+            f"artifact name is already published ({archive_name} or {installer_name}); "
+            "bump the marketing version before building"
+        )
 highest = max((int(item["build"]) for item in releases), default=0)
 if build < highest:
     sys.exit(f"build {build} is older than the published {highest}; refusing to go backwards")

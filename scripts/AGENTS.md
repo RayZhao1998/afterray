@@ -27,7 +27,8 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 ## Commands
 
 - `make dev` / `make dev-ui` / `make v0` / `make v0-daemon` / `make open` / `make stop`
-- `make release` (needs `AFTERRAY_NOTARY_PROFILE`; the codesign identity is auto-detected, override with `AFTERRAY_CODESIGN_IDENTITY`) / `make release-local` (needs neither) / `make publish` / `make publish-dry-run`
+- `make release-preflight` (needs explicit `AFTERRAY_CODESIGN_IDENTITY` + `AFTERRAY_NOTARY_PROFILE`; checks remote release-index collisions before a costly build) / `make release` (runs that preflight) / `make release-local` (needs neither)
+- `make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json` / `make publish-dry-run MANIFEST=…` / `make publish MANIFEST=…` — production steps always use one explicit manifest; never select an artifact by `dist/` ordering.
 - `make models` → `download-models/download.sh` — pure wrapper over `afterray download` (builds the CLI first if missing); override pack with `AFTERRAY_DOWNLOAD_ONLY`, dir with `AFTERRAY_MODEL_DIR`.
 
 ## Watch out

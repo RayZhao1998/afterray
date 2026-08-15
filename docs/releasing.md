@@ -33,11 +33,11 @@ after building, and a release that skips it reaches nobody.
 - An Apple Silicon Mac with Xcode and the current Rust toolchain.
 - A `Developer ID Application` certificate installed in the login Keychain.
 - Notarization credentials stored in the Keychain. Store them once with a
-  local profile name; do not put credentials in the repository or shell
-  history:
+  local profile name; do not put the profile value, credentials, identity, or
+  team metadata in the repository or shell history:
 
   ```sh
-  xcrun notarytool store-credentials afterray-notary \
+  xcrun notarytool store-credentials <profile-name> \
     --apple-id YOUR_APPLE_ID \
     --team-id YOUR_TEAM_ID
   ```
@@ -52,8 +52,10 @@ after building, and a release that skips it reaches nobody.
   [The signing key](#the-signing-key).
 
 The marketing version in `apps/AfterRay/Resources/Info.plist` must match
-`workspace.package.version` in `Cargo.toml`. The release script also requires a
-clean Git worktree so the artifact maps to one source commit.
+`workspace.package.version` in `Cargo.toml`. It must also be new for every
+published release: versioned DMG and zip names are immutable-cached, so reusing
+a version could point a new appcast signature at an old archive. The release
+script requires a clean Git worktree so the artifact maps to one source commit.
 
 `CFBundleVersion` is not maintained by hand. The source plist holds a
 placeholder for development builds; the release script stamps the assembled
@@ -64,18 +66,30 @@ both.
 
 ## Production release
 
+First run the inexpensive preflight. It fetches `origin/main`, checks that the
+checked-out commit is exactly its tip, verifies signing/notarization access and
+Sparkle tooling, then confirms the next version and build cannot collide with
+the published release index.
+
 ```sh
-AFTERRAY_NOTARY_PROFILE=afterray-notary make release
+AFTERRAY_CODESIGN_IDENTITY='<Developer ID identity>' \
+AFTERRAY_NOTARY_PROFILE='<notary profile>' \
+make release-preflight
+```
+
+Build only after that passes:
+
+```sh
+AFTERRAY_CODESIGN_IDENTITY='<Developer ID identity>' \
+AFTERRAY_NOTARY_PROFILE='<notary profile>' \
+make release
 ```
 
 The script auto-detects the first `Developer ID Application` identity. To pick
 one explicitly, set `AFTERRAY_CODESIGN_IDENTITY` to its full name or SHA-1:
 
-```sh
-AFTERRAY_CODESIGN_IDENTITY='Developer ID Application: Example, Inc. (TEAMID)' \
-AFTERRAY_NOTARY_PROFILE=afterray-notary \
-make release
-```
+Do not commit the concrete values used above. They are local Keychain and
+certificate configuration, not project configuration.
 
 The default command performs release builds, checks that every binary is
 arm64 and has no checkout, Homebrew, `/usr/local`, or unresolved `@rpath`
@@ -145,9 +159,20 @@ touching releases.
 
 ### Publishing
 
+Verify the exact manifest after building. This mounts the DMG, copies the app
+out as a recipient would, validates its stapled ticket, applies a browser-like
+quarantine flag, checks Gatekeeper, and verifies both checksums.
+
 ```sh
-make publish-dry-run   # shows the uploads and the resulting index
-make publish           # uploads the zip and DMG, then the index
+make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json
+```
+
+Then always use the same explicit manifest for the dry run and publish. This
+avoids selecting an older artifact from `dist/` by filename ordering.
+
+```sh
+make publish-dry-run MANIFEST=dist/AfterRay-<version>-arm64.json
+make publish MANIFEST=dist/AfterRay-<version>-arm64.json
 ```
 
 The index is written last, so a failure part way through leaves installed
@@ -159,12 +184,17 @@ version, so shipping a release stays an upload — the site does not need
 redeploying to point at it.
 
 `publish-release.sh` refuses to publish an artifact that is not notarized, was
-built from a dirty worktree, has no EdDSA signature, or carries a build number
-that is already published or older than one that is. Each of those would fail
-silently at the user's end rather than at yours.
+built from a dirty worktree, has no EdDSA signature, reuses a published artifact
+name, or carries a build number that is already published or older than one
+that is. Each of those would fail silently at the user's end rather than at
+yours.
 
 Mark an urgent release with `--critical` so Sparkle offers it immediately
 instead of waiting for the next quit.
+
+After publishing, fetch `appcast.xml` and `/download/latest` to confirm that
+the feed contains the intended version, build, archive signature, and latest
+DMG redirect.
 
 ### The signing key
 

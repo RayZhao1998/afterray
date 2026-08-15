@@ -1,4 +1,4 @@
-.PHONY: check test test-repeat build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools publish publish-dry-run
+.PHONY: check test test-repeat build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -85,7 +85,7 @@ v0-build:
 v0-daemon:
 	./scripts/run-v0.sh --daemon-only
 
-release:
+release: release-preflight
 	./scripts/build-release.sh
 
 release-local:
@@ -96,8 +96,17 @@ release-local:
 sparkle-tools:
 	./scripts/fetch-sparkle-tools.sh
 
+release-preflight:
+	./scripts/release-preflight.sh
+
+verify-release:
+	@test -n "$(MANIFEST)" || (echo 'usage: make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json' >&2; exit 64)
+	./scripts/verify-release.sh "$(MANIFEST)"
+
 publish:
-	./scripts/publish-release.sh
+	@test -n "$(MANIFEST)" || (echo 'usage: make publish MANIFEST=dist/AfterRay-<version>-arm64.json' >&2; exit 64)
+	./scripts/publish-release.sh "$(MANIFEST)"
 
 publish-dry-run:
-	./scripts/publish-release.sh --dry-run
+	@test -n "$(MANIFEST)" || (echo 'usage: make publish-dry-run MANIFEST=dist/AfterRay-<version>-arm64.json' >&2; exit 64)
+	./scripts/publish-release.sh --dry-run "$(MANIFEST)"
