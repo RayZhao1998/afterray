@@ -121,6 +121,44 @@ final class DaySummaryDocumentTests: XCTestCase {
         XCTAssertTrue(shouted.isEmpty, "found all-caps words: \(shouted)")
     }
 
+    /// An attachment with no image is sized from its run's font instead of
+    /// its bounds, and the icon line's separators are hairline-thin — which
+    /// left every icon drawn as a two-pixel slice of itself. Both halves of
+    /// the guard are pinned here: the image is never nil, and the run
+    /// carries a font tall enough to hold an icon.
+    func testIconAttachmentsAreNeverSizedFromAHairlineFont() {
+        let attachment = DaySummaryDocument.AppIconAttachment(bundleIdentifier: nil)
+        XCTAssertNotNil(attachment.image, "an image-less attachment is sized from its font")
+        XCTAssertEqual(attachment.bounds.height, 14)
+
+        let summary = day(start: 0, titles: ["a slot"])
+        let (document, _) = DaySummaryDocument.build(
+            summaries: [summary],
+            nowMs: dayMs,
+            timeZone: utc
+        )
+        var iconRuns = 0
+        document.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: document.length)
+        ) { value, range, _ in
+            guard value is DaySummaryDocument.AppIconAttachment else { return }
+            iconRuns += 1
+            let font = document.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont
+            XCTAssertEqual(font?.pointSize, DaySummaryDocument.iconRunFont.pointSize)
+        }
+        XCTAssertGreaterThan(iconRuns, 0, "the fixture slot has apps, so it has icons")
+    }
+
+    /// Collapsing an unresolvable icon must leave nothing to draw: bounds
+    /// with no size, and an image so it cannot fall back to a glyph.
+    func testCollapsedIconsDrawNothing() {
+        let attachment = DaySummaryDocument.AppIconAttachment(bundleIdentifier: "com.example.gone")
+        attachment.collapse()
+        XCTAssertEqual(attachment.bounds, .zero)
+        XCTAssertNotNil(attachment.image)
+    }
+
     func testSlotLinkRoundTrips() {
         let url = DaySummaryDocument.slotLink(startMs: 1_786_698_000_000)
         XCTAssertEqual(DaySummaryDocument.slotStart(from: url), 1_786_698_000_000)

@@ -19,6 +19,13 @@ public enum DaySummaryDocument {
     /// carries the slot start in milliseconds.
     public static let slotLinkScheme = "afterray-slot"
 
+    /// Carried by each app-icon run, and shrunk to `hairlineFont` by the
+    /// hosting view when an icon proves unresolvable, so a line whose icons
+    /// all failed closes up instead of holding a blank strip.
+    public static let iconRunFont = NSFont.systemFont(ofSize: 11)
+    /// Thin enough to add nothing to a line's height.
+    public static let hairlineFont = NSFont.systemFont(ofSize: 1)
+
     /// Where the timeline rule is drawn, in text-container coordinates.
     public static let spineX: CGFloat = 44
     /// The single left edge every line of prose starts on.
@@ -67,10 +74,26 @@ public enum DaySummaryDocument {
             self.bundleIdentifier = bundleIdentifier
             super.init(data: nil, ofType: nil)
             bounds = CGRect(x: 0, y: -3, width: 14, height: 14)
+            // Always carries an image, even before one is looked up. An
+            // attachment with none falls back to the glyph for U+FFFC — a
+            // stray dot on the metadata line of every app that has no icon
+            // to find (no bundle id, or uninstalled since capture).
+            image = Self.blank
+        }
+
+        /// Marks the icon unresolvable: nothing drawn, no width taken.
+        public func collapse() {
+            image = Self.blank
+            bounds = .zero
         }
 
         @available(*, unavailable)
         required init?(coder _: NSCoder) { nil }
+
+        private static let blank = NSImage(
+            size: NSSize(width: 1, height: 1),
+            flipped: false
+        ) { _ in true }
     }
 
     // ------------------------------------------------------------ builder
@@ -192,9 +215,15 @@ public enum DaySummaryDocument {
                 let icon = NSMutableAttributedString(
                     attachment: AppIconAttachment(bundleIdentifier: app.bundleIdentifier)
                 )
-                icon.addAttribute(
-                    .toolTip,
-                    value: "\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))",
+                icon.addAttributes(
+                    [
+                        .toolTip: "\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))",
+                        // An explicit font on the attachment run, so a layout
+                        // that sizes the attachment from its text rather than
+                        // its bounds still leaves room for the icon instead of
+                        // slicing it to the height of the hairline separators.
+                        .font: iconRunFont,
+                    ],
                     range: NSRange(location: 0, length: icon.length)
                 )
                 icons.append(icon)
@@ -204,12 +233,12 @@ public enum DaySummaryDocument {
                 // the line closes up instead of leaving a blank strip.
                 icons.append(NSAttributedString(
                     string: " ",
-                    attributes: [.font: NSFont.systemFont(ofSize: 1), .kern: 5]
+                    attributes: [.font: hairlineFont, .kern: 5]
                 ))
             }
             icons.append(NSAttributedString(
                 string: "\n",
-                attributes: [.font: NSFont.systemFont(ofSize: 1)]
+                attributes: [.font: hairlineFont]
             ))
             icons.addAttribute(
                 .paragraphStyle,

@@ -305,6 +305,16 @@ struct HistoryDocumentView: NSViewRepresentable {
         private func fill(icon: DaySummaryDocument.AppIconAttachment, at range: NSRange) {
             if let cached = AppIconLookup.cachedIcon(bundleIdentifier: icon.bundleIdentifier) {
                 icon.image = cached
+                // Even the synchronous path re-measures: swapping an image
+                // into an already-laid-out line leaves the line the height it
+                // was measured at, and the icon draws clipped to it.
+                invalidate(range: range)
+                return
+            }
+            // Nothing to look up: an app captured without a bundle id can
+            // never resolve, so it takes no place on the line.
+            guard let bundleIdentifier = icon.bundleIdentifier, !bundleIdentifier.isEmpty else {
+                collapse(icon: icon, at: range)
                 return
             }
             let key = ObjectIdentifier(icon)
@@ -313,16 +323,34 @@ struct HistoryDocumentView: NSViewRepresentable {
             Task { @MainActor [weak self] in
                 defer { self?.loadingAttachments.remove(key) }
                 if let image = await AppIconLookup.iconAsync(
-                    bundleIdentifier: icon.bundleIdentifier
+                    bundleIdentifier: bundleIdentifier
                 ) {
                     icon.image = image
+                    self?.invalidate(range: range)
                 } else {
                     // Uninstalled app: collapse instead of holding an empty
                     // square — a blank box only says "something failed here".
-                    icon.bounds = .zero
+                    self?.collapse(icon: icon, at: range)
                 }
-                self?.invalidate(range: range)
             }
+        }
+
+        /// Takes an unresolvable icon out of the line entirely: no bounds, and
+        /// a hairline font on its run so a line of nothing but failures adds
+        /// no height of its own.
+        private func collapse(
+            icon: DaySummaryDocument.AppIconAttachment,
+            at range: NSRange
+        ) {
+            icon.collapse()
+            if let storage = textView?.textStorage, NSMaxRange(range) <= storage.length {
+                storage.addAttribute(
+                    .font,
+                    value: DaySummaryDocument.hairlineFont,
+                    range: range
+                )
+            }
+            invalidate(range: range)
         }
 
         private func invalidate(range: NSRange) {

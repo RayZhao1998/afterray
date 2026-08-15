@@ -33,6 +33,16 @@ enum SnapshotRunner {
             withIntermediateDirectories: true
         )
 
+        // Mirror the running app, where the timeline segments have already
+        // put every icon in the shared cache before the panel is built: the
+        // panel then takes the synchronous cache path, not the async one.
+        for identifier in [
+            "com.apple.dt.Xcode", "com.apple.Safari", "com.apple.Terminal",
+            "com.figma.Desktop", "com.tinyspeck.slackmacgap", "com.apple.mail",
+        ] {
+            _ = AppIconLookup.icon(bundleIdentifier: identifier)
+        }
+
         for scene in SnapshotScene.all {
             let url = outputDirectory.appendingPathComponent("\(scene.name).png")
             render(scene: scene, to: url)
@@ -451,7 +461,11 @@ private var historyPanelScene: [SnapshotScene] {
         dayStartMs: dayStart,
         dayEndMs: dayStart + 86_400_000,
         slots: [
+            // Every way an icon fails to resolve: no bundle id at all, and a
+            // bundle id Launch Services has never heard of. Both must take no
+            // room on the metadata line rather than leaving a mark.
             slot(index: 24, title: nil, state: "degraded", apps: [
+                DayAppFact(name: "unknown", bundleIdentifier: nil, ms: 40_000),
                 DayAppFact(name: "Lody", bundleIdentifier: "ai.lody.app", ms: 780_000),
             ]),
             slot(
@@ -467,6 +481,11 @@ private var historyPanelScene: [SnapshotScene] {
                 title: "Lody search logic debug and overlay scroll listener fix",
                 bullets: [
                     "Identified that UI search returned a fixed daemon candidate pool rather than similarity scores.",
+                ],
+                apps: [
+                    DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 900_000),
+                    DayAppFact(name: "unknown", bundleIdentifier: nil, ms: 20_000),
+                    DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 420_000),
                 ]
             ),
         ]
