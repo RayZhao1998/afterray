@@ -548,6 +548,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 schema_version: afterray_store::SCHEMA_VERSION,
                 recording_state: recording_state_of(&recording),
                 active_session_id: recording.active_session_id.clone(),
+                host_build: std::env::var("AFTERRAY_HOST_BUILD").ok().filter(|v| !v.is_empty()),
             })
         }
         Request::RecordStart => record_start(state).await,

@@ -33,6 +33,11 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var cliStatus: String { get }
     var isInstallingCli: Bool { get }
     var cliInstalled: Bool { get }
+    /// False in a development build, where the updater is not running and the
+    /// section has nothing to control.
+    var updatesSupported: Bool { get }
+    var automaticUpdates: Bool { get }
+    var updateStatus: String { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -55,6 +60,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func saveLlmConnection() async
     func probeLlm() async
     func installCli() async
+    func setAutomaticUpdates(_ enabled: Bool)
+    func checkForUpdates()
 }
 
 public struct AfterRayStorageSnapshot: Equatable, Sendable {
@@ -1303,6 +1310,31 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var advancedPage: some View {
+        if model.updatesSupported {
+            SettingsSection(
+                title: "Updates",
+                footnote: "AfterRay downloads updates in the background and installs them the next time you quit, so a recording is never interrupted."
+            ) {
+                SettingsRow(
+                    title: "Check automatically",
+                    subtitle: model.updateStatus,
+                    subtitleLineLimit: 2
+                ) {
+                    Toggle("", isOn: Binding(
+                        get: { model.automaticUpdates },
+                        set: { model.setAutomaticUpdates($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                SettingsSeparator()
+                SettingsFooterBar {
+                    Button("Check Now") { model.checkForUpdates() }
+                        .buttonStyle(SettingsButtonStyle(kind: .standard))
+                }
+            }
+        }
+
         SettingsSection(
             title: "CLI for agents",
             footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history (read-only)."

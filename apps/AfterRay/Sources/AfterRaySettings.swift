@@ -139,6 +139,29 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         cliInstalled = AfterRayCliInstall.isInstalled
     }
 
+    var updatesSupported: Bool { AfterRayUpdater.shared.isEnabled }
+
+    var automaticUpdates: Bool { AfterRayUpdater.shared.automaticallyChecksForUpdates }
+
+    var updateStatus: String {
+        if let staged = AfterRayUpdater.shared.stagedVersion {
+            return "Version \(staged) is downloaded and installs when you quit AfterRay."
+        }
+        let build = AfterRayUpdater.hostDescription
+        return AfterRayUpdater.shared.automaticallyChecksForUpdates
+            ? "You are on \(build). AfterRay checks once a day."
+            : "You are on \(build). Automatic checks are off."
+    }
+
+    func setAutomaticUpdates(_ enabled: Bool) {
+        objectWillChange.send()
+        AfterRayUpdater.shared.automaticallyChecksForUpdates = enabled
+    }
+
+    func checkForUpdates() {
+        AfterRayUpdater.shared.checkForUpdates()
+    }
+
     func excludeBundle(_ bundleID: String) async {
         var next = excludedBundleIds
         guard !bundleID.isEmpty, !next.contains(bundleID) else { return }

@@ -507,4 +507,28 @@ final class DaemonWireTests: XCTestCase {
             "s1"
         )
     }
+
+    func testStatusDecodesHostBuildStampedByTheApp() throws {
+        let json = #"""
+        {"daemon_version":"0.0.1","protocol_version":7,"schema_version":11,\#
+        "recording_state":"recording","active_session_id":"s1","host_build":"142"}
+        """#
+        let status = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+
+        XCTAssertEqual(status.hostBuild, "142")
+        XCTAssertEqual(status.daemonVersion, "0.0.1")
+    }
+
+    func testStatusFromADaemonWithoutHostBuildDecodesToNil() throws {
+        // A daemon left running by a previous version predates the field. It
+        // must still decode, because that is exactly the daemon an updated app
+        // needs to recognise and replace.
+        let json = #"""
+        {"daemon_version":"0.0.1","protocol_version":7,"schema_version":11,\#
+        "recording_state":"idle","active_session_id":null}
+        """#
+        let status = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+
+        XCTAssertNil(status.hostBuild)
+    }
 }

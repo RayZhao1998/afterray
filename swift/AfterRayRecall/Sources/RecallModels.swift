@@ -198,19 +198,25 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let recordingState: DaemonRecordingState
     public let activeSessionId: String?
+    /// `CFBundleVersion` of the app that spawned this daemon. Nil from a
+    /// daemon started before this field existed, or from one started outside
+    /// the app.
+    public let hostBuild: String?
 
     public init(
         daemonVersion: String,
         protocolVersion: Int,
         schemaVersion: Int,
         recordingState: DaemonRecordingState,
-        activeSessionId: String? = nil
+        activeSessionId: String? = nil,
+        hostBuild: String? = nil
     ) {
         self.daemonVersion = daemonVersion
         self.protocolVersion = protocolVersion
         self.schemaVersion = schemaVersion
         self.recordingState = recordingState
         self.activeSessionId = activeSessionId
+        self.hostBuild = hostBuild
     }
 
     enum CodingKeys: String, CodingKey {
@@ -219,6 +225,7 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
         case schemaVersion = "schema_version"
         case recordingState = "recording_state"
         case activeSessionId = "active_session_id"
+        case hostBuild = "host_build"
     }
 }
 

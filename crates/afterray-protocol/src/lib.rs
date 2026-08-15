@@ -308,6 +308,12 @@ pub struct Status {
     pub schema_version: u32,
     pub recording_state: RecordingState,
     pub active_session_id: Option<String>,
+    /// `CFBundleVersion` of the app that spawned this daemon, echoed back from
+    /// `AFTERRAY_HOST_BUILD`. The marketing version alone cannot tell two
+    /// builds of the same release apart, so an updated app uses this to notice
+    /// that the socket is still owned by the daemon it just replaced.
+    #[serde(default)]
+    pub host_build: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
