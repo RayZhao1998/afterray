@@ -171,6 +171,47 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertNil(decoded.slots[0].title)
     }
 
+    /// Copy is for pasting into notes: chronological, day-headed, bullets
+    /// indented — regardless of the newest-first display order.
+    func testClipboardTextIsChronologicalAndComplete() {
+        let day = DaySummary(
+            day: "2026-08-15",
+            dayStartMs: 0,
+            dayEndMs: 86_400_000,
+            slots: [
+                DaySlotSummary(
+                    slotStartMs: DaySummaryLayout.slotDurationMs,
+                    slotEndMs: DaySummaryLayout.slotDurationMs * 2,
+                    state: "done",
+                    facts: DaySlotFacts(apps: []),
+                    title: "Later work",
+                    bullets: ["shipped the fix"]
+                ),
+                DaySlotSummary(
+                    slotStartMs: 0,
+                    slotEndMs: DaySummaryLayout.slotDurationMs,
+                    state: "degraded",
+                    facts: DaySlotFacts(apps: [DayAppFact(name: "Zed", ms: 600_000)])
+                ),
+            ]
+        )
+        let text = DaySummaryClipboard.dayText(day, timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertTrue(text.hasPrefix("## 2026-08-15\n"), text)
+        let earlier = text.range(of: "Zed 10m")!.lowerBound
+        let later = text.range(of: "Later work")!.lowerBound
+        XCTAssertLessThan(earlier, later, "copied text must read forward in time")
+        XCTAssertTrue(text.contains("  - shipped the fix"), text)
+        XCTAssertTrue(text.contains("(Not summarised)"), "fallback rows say so in copies too")
+
+        let older = DaySummary(day: "2026-08-14", dayStartMs: -86_400_000, dayEndMs: 0, slots: [])
+        let history = DaySummaryClipboard.historyText([day, older])
+        XCTAssertLessThan(
+            history.range(of: "2026-08-14")!.lowerBound,
+            history.range(of: "2026-08-15")!.lowerBound,
+            "days also read forward in time"
+        )
+    }
+
     private func slot(
         start: Int64,
         title: String?,

@@ -147,6 +147,39 @@ public struct DaySummaryHeading: Equatable, Sendable {
     public let isToday: Bool
 }
 
+/// Plain-text renderings of summaries for the clipboard. The panel displays
+/// newest-first, but copied text reads chronologically — pasted notes flow
+/// forward in time the way prose does.
+public enum DaySummaryClipboard {
+    public static func slotText(_ slot: DaySlotSummary, timeZone: TimeZone = .current) -> String {
+        let text = DaySummaryLayout.rowText(slot: slot, timeZone: timeZone)
+        var lines = ["\(text.time) \(text.primary)"]
+        for detail in text.detail {
+            lines.append("  - \(detail)")
+        }
+        if let badge = text.badge {
+            lines.append("  (\(badge))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    public static func dayText(_ summary: DaySummary, timeZone: TimeZone = .current) -> String {
+        var lines = ["## \(summary.day)"]
+        for slot in summary.slots.sorted(by: { $0.slotStartMs < $1.slotStartMs }) {
+            lines.append(slotText(slot, timeZone: timeZone))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Every loaded day, oldest first, blank line between days.
+    public static func historyText(_ summaries: [DaySummary], timeZone: TimeZone = .current) -> String {
+        summaries
+            .sorted { $0.dayStartMs < $1.dayStartMs }
+            .map { dayText($0, timeZone: timeZone) }
+            .joined(separator: "\n\n")
+    }
+}
+
 public struct DaySummaryRowText: Equatable, Sendable {
     public let time: String
     public let primary: String

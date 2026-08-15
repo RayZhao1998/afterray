@@ -1658,8 +1658,13 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         }
 
         private func shouldHandle(_ event: NSEvent) -> Bool {
-            guard let window = hostView?.window else { return false }
-            if event.window === window { return true }
+            // Only a visible overlay may scrub, and only with its own
+            // events. The overlay panel's frame spans the whole screen even
+            // while ordered out, so the old mouse-inside-frame test was
+            // always true — it swallowed every scroll destined for the
+            // standalone history window and fed it to a hidden timeline.
+            guard let window = hostView?.window, window.isVisible else { return false }
+            if let eventWindow = event.window { return eventWindow === window }
             return window.frame.contains(NSEvent.mouseLocation)
         }
 

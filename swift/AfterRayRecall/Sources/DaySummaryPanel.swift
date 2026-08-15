@@ -1,4 +1,12 @@
+import AppKit
 import SwiftUI
+
+@MainActor
+private func copyToPasteboard(_ text: String) {
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(text, forType: .string)
+}
 
 /// How the panel is being hosted. The overlay pins its size and wears
 /// glass; a standalone window fills whatever the user resizes it to.
@@ -110,6 +118,11 @@ public struct DaySummaryPanel: View {
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 8)
+        .contextMenu {
+            Button("Copy All Loaded Days") {
+                copyToPasteboard(DaySummaryClipboard.historyText(summaries))
+            }
+        }
     }
 
     private var emptyState: some View {
@@ -219,6 +232,11 @@ private struct DaySummarySection: View {
             .padding(.vertical, 5)
             .background(Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94))
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contextMenu {
+                Button("Copy This Day") {
+                    copyToPasteboard(DaySummaryClipboard.dayText(summary))
+                }
+            }
         }
     }
 
@@ -310,18 +328,22 @@ private struct DaySummaryRow: View {
     }
 
     var body: some View {
-        Button(action: onSelect) {
-            // Top-aligned, never baseline: an image's "baseline" is its
-            // bottom edge, so baseline alignment shoved every thumbnail
-            // above its own row and inflated the row height — the giant
-            // inter-row voids in the before state were exactly that.
-            HStack(alignment: .top, spacing: 10) {
-                Text(text.time)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
-                    .frame(width: 42, alignment: .leading)
-                    .padding(.top, 2) // optically align with the title's cap height
+        // Not a button: the prose is content to read, select and copy. The
+        // two deliberate jump affordances — the time chip and the frame
+        // thumbnail — open the timeline; everything else leaves the text
+        // alone so selection works.
+        HStack(alignment: .top, spacing: 10) {
+                Button(action: onSelect) {
+                    Text(text.time)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
+                        .frame(width: 42, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open this half hour in the timeline")
+                .padding(.top, 2) // optically align with the title's cap height
                 VStack(alignment: .leading, spacing: 4) {
                     Text(text.primary)
                         .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
@@ -329,6 +351,7 @@ private struct DaySummaryRow: View {
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
 
                     if !text.detail.isEmpty {
                         VStack(alignment: .leading, spacing: 3) {
@@ -343,6 +366,7 @@ private struct DaySummaryRow: View {
                                         .multilineTextAlignment(.leading)
                                         .fixedSize(horizontal: false, vertical: true)
                                         .frame(maxWidth: .infinity, alignment: .leading)
+                                        .textSelection(.enabled)
                                 }
                             }
                         }
@@ -374,10 +398,14 @@ private struct DaySummaryRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 if let anchorMomentId = slot.anchorMomentId, let thumbnailLoader {
-                    SlotAnchorThumbnail(
-                        momentID: anchorMomentId,
-                        loader: thumbnailLoader
-                    )
+                    Button(action: onSelect) {
+                        SlotAnchorThumbnail(
+                            momentID: anchorMomentId,
+                            loader: thumbnailLoader
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open this frame in the timeline")
                     .padding(.top, 1)
                 }
             }
@@ -396,11 +424,13 @@ private struct DaySummaryRow: View {
                         .padding(.vertical, 6)
                 }
             }
-        }
-        .buttonStyle(.plain)
         .padding(.horizontal, 6)
         .onHover { isHovering = $0 }
-        .help(text.primary)
+        .contextMenu {
+            Button("Copy This Half Hour") {
+                copyToPasteboard(DaySummaryClipboard.slotText(slot))
+            }
+        }
     }
 
     private func badgeTint(_ badge: String) -> Color {
