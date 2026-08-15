@@ -103,6 +103,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
+        excludedDomains: [String]?,
         llmProvider: LlmProvider?,
         llmBaseUrl: String?,
         llmModel: String?,
@@ -122,6 +123,7 @@ public extension AfterRayDaemonServing {
         try await updateSettings(
             recordAudio: recordAudio,
             excludedBundleIds: nil,
+            excludedDomains: nil,
             llmProvider: nil,
             llmBaseUrl: nil,
             llmModel: nil,
@@ -185,6 +187,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
+        excludedDomains: [String]?,
         llmProvider: LlmProvider? = nil,
         llmBaseUrl: String? = nil,
         llmModel: String? = nil,
@@ -198,6 +201,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 type: "update_settings",
                 recordAudio: recordAudio,
                 excludedBundleIds: excludedBundleIds,
+                excludedDomains: excludedDomains,
                 llmProvider: llmProvider?.rawValue,
                 llmBaseUrl: llmBaseUrl,
                 llmModel: llmModel,
@@ -433,6 +437,7 @@ struct WireRequest: Encodable, Equatable {
     var gopMode: String?
     var maxEdge: Int?
     var excludedBundleIds: [String]?
+    var excludedDomains: [String]?
     var historyScope: String?
     var llmProvider: String?
     var llmBaseUrl: String?
@@ -468,6 +473,7 @@ struct WireRequest: Encodable, Equatable {
         case gopMode = "mode"
         case maxEdge = "max_edge"
         case excludedBundleIds = "excluded_bundle_ids"
+        case excludedDomains = "excluded_domains"
         case historyScope = "scope"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
@@ -505,6 +511,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(gopMode, forKey: .gopMode)
         try container.encodeIfPresent(maxEdge, forKey: .maxEdge)
         try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
+        try container.encodeIfPresent(excludedDomains, forKey: .excludedDomains)
         try container.encodeIfPresent(historyScope, forKey: .historyScope)
         try container.encodeIfPresent(llmProvider, forKey: .llmProvider)
         try container.encodeIfPresent(llmBaseUrl, forKey: .llmBaseUrl)

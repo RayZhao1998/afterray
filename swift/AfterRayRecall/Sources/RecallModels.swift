@@ -491,6 +491,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let captureIntervalSeconds: UInt64
     public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
+    /// Hosts never recorded. Subdomains are covered by the daemon.
+    public let excludedDomains: [String]
     public let llmProvider: LlmProvider
     public let llmBaseUrl: String
     public let llmModel: String
@@ -506,6 +508,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         captureIntervalSeconds: UInt64,
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
+        excludedDomains: [String] = [],
         llmProvider: LlmProvider = .builtin,
         llmBaseUrl: String = "",
         llmModel: String = "",
@@ -520,6 +523,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
+        self.excludedDomains = excludedDomains
         self.llmProvider = llmProvider
         self.llmBaseUrl = llmBaseUrl
         self.llmModel = llmModel
@@ -536,6 +540,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case captureIntervalSeconds = "capture_interval_seconds"
         case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
+        case excludedDomains = "excluded_domains"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
         case llmModel = "llm_model"
@@ -554,6 +559,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
             ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
+        excludedDomains = try container.decodeIfPresent([String].self, forKey: .excludedDomains) ?? []
         llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""
         llmModel = try container.decodeIfPresent(String.self, forKey: .llmModel) ?? ""

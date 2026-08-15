@@ -237,6 +237,39 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertTrue(settings.llmModel.isEmpty)
     }
 
+    func testAppSettingsDecodesExcludedWebsites() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_domains":["bank.example","mail.example.com"]}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.excludedDomains, ["bank.example", "mail.example.com"])
+    }
+
+    /// A daemon that predates website exclusion omits the key entirely. Decoding
+    /// must not fail there, or upgrading the app strands the old daemon.
+    func testAppSettingsTreatsMissingExcludedWebsitesAsNone() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertTrue(settings.excludedDomains.isEmpty)
+    }
+
+    /// The daemon distinguishes "leave this list alone" from "make it empty",
+    /// so an update that only touches apps must not carry a domains key at all.
+    func testUpdateSettingsOmitsWebsitesWhenUntouched() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", excludedBundleIds: ["com.apple.Safari"])
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["excluded_bundle_ids"] as? [String], ["com.apple.Safari"])
+        XCTAssertNil(json["excluded_domains"])
+    }
+
+    func testUpdateSettingsRequestCarriesExcludedWebsites() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", excludedDomains: ["example.com"])
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["excluded_domains"] as? [String], ["example.com"])
+    }
+
     func testAppSettingsDecodesLlmFields() throws {
         let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"llm_provider":"ollama","llm_base_url":"http://127.0.0.1:11434","llm_model":"qwen3.6:latest","llm_api_key_set":false}"#
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
