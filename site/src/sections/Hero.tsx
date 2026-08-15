@@ -21,7 +21,7 @@ export default function Hero() {
           {t.sub}
         </p>
         <div className="hero-ctas anim-in" style={{ animationDelay: '0.4s' }}>
-          <a className="btn btn-primary" href="#download">
+          <a className="btn btn-primary" href="/download/latest">
             {t.ctaPrimary}
           </a>
           <a className="btn btn-ghost" href="#memories">

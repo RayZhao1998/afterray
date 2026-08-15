@@ -151,11 +151,11 @@ fi
 step "Adding build $build (version $version) to the index"
 python3 - \
   "$index_local" "$index_local.next" "$version" "$build" "$minimum_macos" \
-  "$archive_name" "$archive_size" "$signature" "$critical" <<'PYTHON'
+  "$archive_name" "$archive_size" "$signature" "$critical" "$dmg_name" <<'PYTHON'
 import json, sys, datetime
 
 (source, destination, version, build_text, minimum_macos,
- archive_name, archive_size, signature, critical) = sys.argv[1:10]
+ archive_name, archive_size, signature, critical, installer_name) = sys.argv[1:11]
 
 with open(source) as handle:
     index = json.load(handle)
@@ -180,6 +180,9 @@ entry = {
     "archive": archive_name,
     "length": int(archive_size),
     "edSignature": signature,
+    # What a new user downloads. /download/latest resolves through this, so
+    # the site's download button never names a version.
+    "installer": installer_name,
     "publishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
 if critical == "true":

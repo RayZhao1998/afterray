@@ -153,6 +153,11 @@ make publish           # uploads the zip and DMG, then the index
 The index is written last, so a failure part way through leaves installed
 copies on the previous release rather than pointing them at a partial upload.
 
+New users download through `/download/latest`, which redirects to the newest
+published DMG. The site's download buttons link there and never name a
+version, so shipping a release stays an upload — the site does not need
+redeploying to point at it.
+
 `publish-release.sh` refuses to publish an artifact that is not notarized, was
 built from a dirty worktree, has no EdDSA signature, or carries a build number
 that is already published or older than one that is. Each of those would fail

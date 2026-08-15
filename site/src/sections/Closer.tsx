@@ -55,7 +55,7 @@ export default function Closer() {
             <Rich parts={t.final.titleB} />
           </h2>
           <div className="hero-ctas">
-            <a className="btn btn-primary" href="#download">
+            <a className="btn btn-primary" href="/download/latest">
               {t.final.ctaPrimary}
             </a>
             <a
