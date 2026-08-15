@@ -198,16 +198,18 @@ public enum DaySummaryDocument {
                     range: NSRange(location: 0, length: icon.length)
                 )
                 icons.append(icon)
-                // Small font on the separators keeps the line thin if every
-                // icon collapses (all apps uninstalled since capture).
+                // The gap is kerning on a hairline font, not a space in a
+                // readable one: the icons set the line's height, so if every
+                // one of them collapses (all apps uninstalled since capture)
+                // the line closes up instead of leaving a blank strip.
                 icons.append(NSAttributedString(
                     string: " ",
-                    attributes: [.font: NSFont.systemFont(ofSize: 9.5)]
+                    attributes: [.font: NSFont.systemFont(ofSize: 1), .kern: 5]
                 ))
             }
             icons.append(NSAttributedString(
                 string: "\n",
-                attributes: [.font: NSFont.systemFont(ofSize: 9.5)]
+                attributes: [.font: NSFont.systemFont(ofSize: 1)]
             ))
             icons.addAttribute(
                 .paragraphStyle,

@@ -8,32 +8,55 @@ import SwiftUI
 /// border would break at every paragraph — the seams are exactly what the
 /// eye reads as "misaligned".
 final class HistoryTextView: NSTextView {
-    /// The current half hour's extent in view coordinates, lit on the spine
-    /// instead of washing the row in a background colour.
+    /// The text extent of the current half hour, in view coordinates. The
+    /// card drawn around it is padded out from this: a highlight clamped to
+    /// the glyphs reads as a printing error, not as a selected row.
     var highlightRect: NSRect?
+
+    /// Breathing room between the current half hour's text and the edge of
+    /// its card, and how round that card's corners are.
+    private let cardPadding = NSEdgeInsets(top: 7, left: 4, bottom: 7, right: 6)
+    private let cardRadius: CGFloat = 9
 
     override func draw(_ dirtyRect: NSRect) {
         let x = (textContainerInset.width + DaySummaryDocument.spineX).rounded()
+        let ray = NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1)
+
+        if let card = highlightCard, card.intersects(dirtyRect) {
+            let path = NSBezierPath(roundedRect: card, xRadius: cardRadius, yRadius: cardRadius)
+            ray.withAlphaComponent(0.10).setFill()
+            path.fill()
+        }
+
         NSColor.white.withAlphaComponent(0.09).setFill()
         NSRect(x: x, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
 
-        if let highlightRect, highlightRect.intersects(dirtyRect) {
-            let ray = NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1)
+        if let highlightRect, let card = highlightCard, card.intersects(dirtyRect) {
+            // The lit rail spans the card, not just the glyphs, so the rule
+            // and the card start and end on the same line.
             ray.setFill()
-            NSRect(
-                x: x,
-                y: highlightRect.minY,
-                width: 2,
-                height: highlightRect.height
-            ).fill()
-            // A dot at the top of the lit segment: the playhead's position on
-            // the timeline, readable at a glance from across the panel.
+            NSRect(x: x, y: card.minY + 2, width: 2, height: card.height - 4).fill()
+            // A dot beside the title: the playhead's position on the
+            // timeline, readable at a glance from across the panel.
             let dot = NSRect(x: x - 2.5, y: highlightRect.minY + 4, width: 7, height: 7)
             NSBezierPath(ovalIn: dot).fill()
         }
 
         super.draw(dirtyRect)
     }
+
+    /// The padded card behind the current half hour: full panel width so it
+    /// reads as a row, inset from both edges so it never touches them.
+    private var highlightCard: NSRect? {
+        guard let highlightRect else { return nil }
+        return NSRect(
+            x: cardPadding.left,
+            y: highlightRect.minY - cardPadding.top,
+            width: max(bounds.width - cardPadding.left - cardPadding.right, 0),
+            height: highlightRect.height + cardPadding.top + cardPadding.bottom
+        )
+    }
+
 }
 
 /// Hosts the history document in an `NSTextView`: document-grade selection
@@ -335,16 +358,16 @@ struct HistoryDocumentView: NSViewRepresentable {
         private func scrolled() {
             guard let textView, let scroll else { return }
             syncMinimumHeight()
-            // Topmost visible character → its day heading, for the chip.
+            // First visible character → its day heading, for the chip. The
+            // probe is in text-container coordinates, which the container
+            // inset offsets from the view's own.
             if let layoutManager = textView.layoutManager,
                let container = textView.textContainer
             {
-                let topPoint = CGPoint(
-                    x: 4,
-                    y: scroll.contentView.bounds.origin.y + 4
-                )
-                let glyph = layoutManager.glyphIndex(for: topPoint, in: container)
-                let character = layoutManager.characterIndexForGlyph(at: glyph)
+                let origin = textView.textContainerOrigin
+                let visible = textView.visibleRect.offsetBy(dx: -origin.x, dy: -origin.y)
+                let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: container)
+                let character = layoutManager.characterIndexForGlyph(at: glyphs.location)
                 let day = layout.dayRanges.last { $0.range.location <= character }
                 // The chip stands in for the day's own heading, so it only
                 // appears once that heading has scrolled off the top.
