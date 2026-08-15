@@ -153,7 +153,7 @@ private struct VisualLabView: View {
                 onOpenSettings: {},
                 recordingState: labRecordingState,
                 onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
-                daySummary: labDaySummary,
+                summaryHistory: [labDaySummary],
                 searchSession: searchSession,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader,

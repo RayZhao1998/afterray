@@ -132,7 +132,7 @@ private func chromeScene(
                 onOpenSettings: {},
                 recordingState: .recording,
                 onToggleRecording: {},
-                daySummary: .mockRich(around: playheadMs),
+                summaryHistory: [.mockRich(around: playheadMs)],
                 searchSession: session,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader
@@ -579,7 +579,7 @@ private var captionScenes: [SnapshotScene] {
                     onOpenSettings: {},
                     recordingState: .recording,
                     onToggleRecording: {},
-                    daySummary: .mockRich(around: playheadMs)
+                    summaryHistory: [.mockRich(around: playheadMs)]
                 )
                 .frame(width: CGFloat(width), height: CGFloat(height))
             )

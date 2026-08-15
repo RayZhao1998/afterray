@@ -944,7 +944,6 @@ private struct AfterRayRootView: View {
             isChangingRecording: control.isChangingRecording,
             onToggleRecording: toggleRecording,
             chromeTopPadding: controlBarTopPadding,
-            daySummary: store.daySummary,
             summaryHistory: store.summaryHistory,
             summaryHistoryHasMore: store.summaryHistoryHasMore,
             isLoadingSummaryHistory: store.isLoadingSummaryHistory,
@@ -953,7 +952,7 @@ private struct AfterRayRootView: View {
             },
             onPopOutHistory: { HistoryWindowController.shared.show() },
             onVisibleDayChange: { dayMs in
-                Task { await store.loadDaySummary(dayMs: dayMs) }
+                Task { await store.ensureSummaryHistory(containing: dayMs) }
             },
             searchSession: control.searchSession,
             thumbnailLoader: { momentID in

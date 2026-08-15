@@ -28,7 +28,6 @@ public struct RecallView: View {
     public var onToggleRecording: (() -> Void)?
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
-    public var daySummary: DaySummary
     /// Newest first; SwiftUI's LazyVStack only instantiates visible summary
     /// sections while the store pages older days from the daemon.
     public var summaryHistory: [DaySummary]
@@ -88,7 +87,6 @@ public struct RecallView: View {
         onToggleRecording: (() -> Void)? = nil,
         chromeTopPadding: CGFloat = 22,
         trailingChromeInset: CGFloat = 0,
-        daySummary: DaySummary = .empty,
         summaryHistory: [DaySummary] = [],
         summaryHistoryHasMore: Bool = false,
         isLoadingSummaryHistory: Bool = false,
@@ -119,7 +117,6 @@ public struct RecallView: View {
         self.onToggleRecording = onToggleRecording
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
-        self.daySummary = daySummary
         self.summaryHistory = summaryHistory
         self.summaryHistoryHasMore = summaryHistoryHasMore
         self.isLoadingSummaryHistory = isLoadingSummaryHistory
@@ -213,7 +210,7 @@ public struct RecallView: View {
                                     popOut()
                                 }
                             },
-                            summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
+                            summaries: summaryHistory,
                             playheadMs: playheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
                             hasMore: summaryHistoryHasMore,
@@ -491,7 +488,7 @@ public struct RecallView: View {
                 symbol: daySummaryExpanded
                     ? "rectangle.bottomhalf.inset.filled"
                     : "list.bullet.rectangle",
-                help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                help: daySummaryExpanded ? "Hide summaries" : "Show summaries",
                 tint: daySummaryExpanded ? RecallPalette.ray : .white,
                 action: {
                     withAnimation(.easeOut(duration: 0.18)) {

@@ -72,9 +72,9 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         Task {
-            await AfterRayServices.shared.store.loadDaySummary(
-                dayMs: Int64(Date().timeIntervalSince1970 * 1_000),
-                force: true
+            await AfterRayServices.shared.store.ensureSummaryHistory(
+                containing: Int64(Date().timeIntervalSince1970 * 1_000),
+                refresh: true
             )
         }
     }
@@ -90,7 +90,7 @@ private struct HistoryWindowRoot: View {
     var body: some View {
         DaySummaryPanel(
             style: .window,
-            summaries: store.summaryHistory.isEmpty ? [store.daySummary] : store.summaryHistory,
+            summaries: store.summaryHistory,
             playheadMs: store.playheadMs,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             hasMore: store.summaryHistoryHasMore,

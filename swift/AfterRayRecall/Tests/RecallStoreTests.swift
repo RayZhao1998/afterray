@@ -110,59 +110,170 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
     }
 
-    func testSelectingOlderDayKeepsNewerSummariesLoaded() async {
+    func testInitialSummaryHistoryLoadsNewestPageWithoutRepeatingTheDayRequest() async {
         let todayStartMs: Int64 = 1_786_665_600_000
         let yesterdayStartMs = todayStartMs - 86_400_000
+        let today = summary(dayStartMs: todayStartMs, title: "Today")
+        let yesterday = summary(dayStartMs: yesterdayStartMs, title: "Yesterday")
         let daemon = SummaryHistoryDaemon(
-            todayStartMs: todayStartMs,
-            yesterdayStartMs: yesterdayStartMs
+            initialPage: SummaryHistoryPage(
+                days: [today, yesterday],
+                nextBeforeMs: yesterdayStartMs,
+                hasMore: true
+            ),
+            daySummaries: [today, yesterday]
         )
         let store = RecallStore(daemon: daemon)
 
-        await store.loadDaySummary(dayMs: todayStartMs)
+        await store.ensureSummaryHistory(containing: todayStartMs, refresh: true)
+
         XCTAssertEqual(
             store.summaryHistory.map(\.dayStartMs),
             [todayStartMs, yesterdayStartMs]
         )
+        let historyCalls = await daemon.summaryHistoryCalls
+        XCTAssertEqual(historyCalls.count, 1)
+        XCTAssertNil(historyCalls[0], "the first page starts at the newest occupied day")
+        let dayCalls = await daemon.daySummaryCalls
+        XCTAssertTrue(dayCalls.isEmpty, "the fresh initial page already contains the requested day")
+    }
 
-        await store.loadDaySummary(dayMs: yesterdayStartMs)
+    func testEmptyInitialHistoryIsInitializedOnlyOnce() async {
+        let todayStartMs: Int64 = 1_786_665_600_000
+        let today = summary(dayStartMs: todayStartMs, title: "Today")
+        let daemon = SummaryHistoryDaemon(
+            initialPage: SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false),
+            daySummaries: [today]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.ensureSummaryHistory(containing: todayStartMs, refresh: true)
+        await store.ensureSummaryHistory(containing: todayStartMs)
+
+        XCTAssertEqual(store.summaryHistory, [today])
+        let historyCalls = await daemon.summaryHistoryCalls
+        XCTAssertEqual(historyCalls.count, 1, "an empty first page is still an initialized history")
+        let dayCalls = await daemon.daySummaryCalls
+        XCTAssertEqual(dayCalls, [todayStartMs])
+    }
+
+    func testSelectingLoadedOlderDayKeepsNewerDaysAndPaginationCursor() async {
+        let todayStartMs: Int64 = 1_786_665_600_000
+        let yesterdayStartMs = todayStartMs - 86_400_000
+        let olderStartMs = yesterdayStartMs - 86_400_000
+        let today = summary(dayStartMs: todayStartMs, title: "Today")
+        let yesterday = summary(dayStartMs: yesterdayStartMs, title: "Yesterday")
+        let older = summary(dayStartMs: olderStartMs, title: "Older")
+        let daemon = SummaryHistoryDaemon(
+            initialPage: SummaryHistoryPage(
+                days: [today, yesterday],
+                nextBeforeMs: yesterdayStartMs,
+                hasMore: true
+            ),
+            olderPages: [
+                yesterdayStartMs: SummaryHistoryPage(
+                    days: [older],
+                    nextBeforeMs: nil,
+                    hasMore: false
+                )
+            ],
+            daySummaries: [today, yesterday, older]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.ensureSummaryHistory(containing: todayStartMs, refresh: true)
+        await store.ensureSummaryHistory(containing: yesterdayStartMs)
+        await store.loadOlderSummaryHistory()
 
         XCTAssertEqual(
             store.summaryHistory.map(\.dayStartMs),
-            [todayStartMs, yesterdayStartMs],
-            "selecting an older day must not remove newer summaries from the history panel"
+            [todayStartMs, yesterdayStartMs, olderStartMs]
+        )
+        let historyCalls = await daemon.summaryHistoryCalls
+        XCTAssertEqual(historyCalls.count, 2)
+        XCTAssertNil(historyCalls[0])
+        XCTAssertEqual(historyCalls[1], yesterdayStartMs, "date selection must not move the older-page cursor")
+        let dayCalls = await daemon.daySummaryCalls
+        XCTAssertTrue(dayCalls.isEmpty, "selecting a day already in history needs no second request")
+    }
+
+    func testRefreshingLoadedDayReplacesOnlyThatDay() async {
+        let todayStartMs: Int64 = 1_786_665_600_000
+        let yesterdayStartMs = todayStartMs - 86_400_000
+        let today = summary(dayStartMs: todayStartMs, title: "Before refresh")
+        let refreshedToday = summary(dayStartMs: todayStartMs, title: "After refresh")
+        let yesterday = summary(dayStartMs: yesterdayStartMs, title: "Yesterday")
+        let daemon = SummaryHistoryDaemon(
+            initialPage: SummaryHistoryPage(
+                days: [today, yesterday],
+                nextBeforeMs: nil,
+                hasMore: false
+            ),
+            daySummaries: [today, yesterday]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.ensureSummaryHistory(containing: todayStartMs, refresh: true)
+        await daemon.setDaySummary(refreshedToday)
+        await store.ensureSummaryHistory(containing: todayStartMs, refresh: true)
+
+        XCTAssertEqual(store.summaryHistory[0], refreshedToday)
+        XCTAssertEqual(store.summaryHistory[1], yesterday)
+        let dayCalls = await daemon.daySummaryCalls
+        XCTAssertEqual(dayCalls, [todayStartMs])
+    }
+
+    private func summary(dayStartMs: Int64, title: String) -> DaySummary {
+        DaySummary(
+            day: DaySummaryLayout.localDayKey(ms: dayStartMs),
+            dayStartMs: dayStartMs,
+            dayEndMs: dayStartMs + 86_400_000,
+            slots: [
+                DaySlotSummary(
+                    slotStartMs: dayStartMs,
+                    slotEndMs: dayStartMs + DaySummaryLayout.slotDurationMs,
+                    state: "done",
+                    facts: DaySlotFacts(apps: []),
+                    title: title
+                )
+            ]
         )
     }
 }
 
 private actor SummaryHistoryDaemon: RecallDaemonServing {
-    let today: DaySummary
-    let yesterday: DaySummary
+    private let initialPage: SummaryHistoryPage
+    private let olderPages: [Int64: SummaryHistoryPage]
+    private var daySummaries: [String: DaySummary]
+    private(set) var daySummaryCalls: [Int64] = []
+    private(set) var summaryHistoryCalls: [Int64?] = []
 
-    init(todayStartMs: Int64, yesterdayStartMs: Int64) {
-        today = DaySummary(
-            day: "today",
-            dayStartMs: todayStartMs,
-            dayEndMs: todayStartMs + 86_400_000,
-            slots: []
+    init(
+        initialPage: SummaryHistoryPage,
+        olderPages: [Int64: SummaryHistoryPage] = [:],
+        daySummaries: [DaySummary]
+    ) {
+        self.initialPage = initialPage
+        self.olderPages = olderPages
+        self.daySummaries = Dictionary(
+            daySummaries.map { ($0.day, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
-        yesterday = DaySummary(
-            day: "yesterday",
-            dayStartMs: yesterdayStartMs,
-            dayEndMs: todayStartMs,
-            slots: []
-        )
+    }
+
+    func setDaySummary(_ summary: DaySummary) {
+        daySummaries[summary.day] = summary
     }
 
     func daySummary(dayMs: Int64) async throws -> DaySummary {
-        dayMs >= today.dayStartMs ? today : yesterday
+        daySummaryCalls.append(dayMs)
+        return daySummaries[DaySummaryLayout.localDayKey(ms: dayMs)] ?? .empty
     }
 
     func summaryHistory(beforeMs: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
-        if beforeMs == today.dayStartMs {
-            return SummaryHistoryPage(days: [yesterday], nextBeforeMs: nil, hasMore: false)
-        }
-        return SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
+        summaryHistoryCalls.append(beforeMs)
+        guard let beforeMs else { return initialPage }
+        return olderPages[beforeMs] ?? SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
     }
 
     func sessions() async throws -> [RecallSession] { [] }
