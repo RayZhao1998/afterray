@@ -63,7 +63,7 @@ public struct DaySummaryPanel: View {
 
     private var dayCountLabel: String {
         let count = summaries.count
-        return count == 1 ? "1 DAY" : "\(count) DAYS"
+        return count == 1 ? "1 day" : "\(count) days"
     }
 
     public var body: some View {
@@ -87,12 +87,11 @@ public struct DaySummaryPanel: View {
     private var dayChip: some View {
         if let topDayHeading {
             Text(topDayHeading)
-                .font(.system(size: 9, weight: .semibold, design: .rounded))
-                .tracking(1.1)
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(
-                    topDayHeading.hasPrefix("TODAY")
-                        ? RecallPalette.ray.opacity(0.85)
-                        : .white.opacity(0.7)
+                    topDayHeading.hasPrefix("Today")
+                        ? RecallPalette.ray.opacity(0.9)
+                        : .white.opacity(0.62)
                 )
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -100,7 +99,9 @@ public struct DaySummaryPanel: View {
                     Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94),
                     in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                 )
-                .padding(.leading, 14)
+                // Lands on the document's own text edge, so the chip reads as
+                // the heading it stands in for rather than a second element.
+                .padding(.leading, 62)
                 .padding(.top, 2)
                 .animation(nil, value: topDayHeading)
                 .allowsHitTesting(false)
@@ -109,21 +110,14 @@ public struct DaySummaryPanel: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("HISTORY")
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .tracking(1.6)
-                    .foregroundStyle(RecallPalette.ray.opacity(0.78))
-                Text("Summaries")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
-            }
+            Text("Summaries")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
             Spacer(minLength: 8)
             if !summaries.isEmpty {
                 Text(dayCountLabel)
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundStyle(.white.opacity(0.38))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.35))
             }
             if let onPopOut {
                 Button(action: onPopOut) {
@@ -169,6 +163,7 @@ public struct DaySummaryPanel: View {
             hasMore: hasMore,
             isLoadingMore: isLoadingMore,
             followPulse: followPulse,
+            fillsHeight: style == .window,
             onSelectSlot: onSelectSlot,
             onLoadMore: onLoadMore,
             onTopDayChange: { heading in

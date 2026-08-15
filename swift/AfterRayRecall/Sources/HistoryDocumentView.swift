@@ -1,6 +1,41 @@
 import AppKit
 import SwiftUI
 
+/// The text view that draws the timeline rule behind the document.
+///
+/// The spine has to be drawn rather than typeset: a continuous line down a
+/// scrolling document is not something a text run can be, and a per-row
+/// border would break at every paragraph — the seams are exactly what the
+/// eye reads as "misaligned".
+final class HistoryTextView: NSTextView {
+    /// The current half hour's extent in view coordinates, lit on the spine
+    /// instead of washing the row in a background colour.
+    var highlightRect: NSRect?
+
+    override func draw(_ dirtyRect: NSRect) {
+        let x = (textContainerInset.width + DaySummaryDocument.spineX).rounded()
+        NSColor.white.withAlphaComponent(0.09).setFill()
+        NSRect(x: x, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
+
+        if let highlightRect, highlightRect.intersects(dirtyRect) {
+            let ray = NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1)
+            ray.setFill()
+            NSRect(
+                x: x,
+                y: highlightRect.minY,
+                width: 2,
+                height: highlightRect.height
+            ).fill()
+            // A dot at the top of the lit segment: the playhead's position on
+            // the timeline, readable at a glance from across the panel.
+            let dot = NSRect(x: x - 2.5, y: highlightRect.minY + 4, width: 7, height: 7)
+            NSBezierPath(ovalIn: dot).fill()
+        }
+
+        super.draw(dirtyRect)
+    }
+}
+
 /// Hosts the history document in an `NSTextView`: document-grade selection
 /// across bullets, rows and days — the thing a stack of SwiftUI `Text`
 /// views structurally cannot do. Non-editable, dark, link clicks jump the
@@ -12,6 +47,10 @@ struct HistoryDocumentView: NSViewRepresentable {
     let hasMore: Bool
     let isLoadingMore: Bool
     let followPulse: Int
+    /// A window fills whatever height it is given, so the timeline rule runs
+    /// the full panel; the overlay card hugs its content instead of
+    /// stretching a glass panel around two rows.
+    let fillsHeight: Bool
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
     /// Reports the heading of the topmost visible day as the user scrolls,
@@ -23,15 +62,15 @@ struct HistoryDocumentView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView()
+        let textView = HistoryTextView()
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 8, height: 6)
-        textView.linkTextAttributes = [
-            .foregroundColor: NSColor(red: 1, green: 0.42, blue: 0.32, alpha: 0.92),
-            .cursor: NSCursor.pointingHand,
-        ]
+        textView.textContainerInset = NSSize(width: 8, height: 14)
+        // The time chips are links, but tinting every one of them would put a
+        // column of coloured text down the panel; the document already gives
+        // them their colour, and only the current one is meant to stand out.
+        textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
         textView.delegate = context.coordinator
         textView.autoresizingMask = [.width]
         textView.isVerticallyResizable = true
@@ -65,6 +104,9 @@ struct HistoryDocumentView: NSViewRepresentable {
               let layoutManager = textView.layoutManager,
               let container = textView.textContainer
         else { return nil }
+        if fillsHeight, let height = proposal.height, height.isFinite {
+            return CGSize(width: width, height: height)
+        }
         layoutManager.ensureLayout(for: container)
         let content = layoutManager.usedRect(for: container).height
             + textView.textContainerInset.height * 2
@@ -78,8 +120,9 @@ struct HistoryDocumentView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         private var view: HistoryDocumentView
-        private weak var textView: NSTextView?
+        private weak var textView: HistoryTextView?
         private weak var scroll: NSScrollView?
+        private var frameObserver: NSObjectProtocol?
         private var layout = DaySummaryDocument.Layout()
         private var renderedSummaries: [DaySummary] = []
         private var renderedNowKey: Int64 = 0
@@ -96,7 +139,7 @@ struct HistoryDocumentView: NSViewRepresentable {
             self.view = view
         }
 
-        func attach(textView: NSTextView, scroll: NSScrollView) {
+        func attach(textView: HistoryTextView, scroll: NSScrollView) {
             self.textView = textView
             self.scroll = scroll
             boundsObserver = NotificationCenter.default.addObserver(
@@ -108,11 +151,26 @@ struct HistoryDocumentView: NSViewRepresentable {
                     self?.scrolled()
                 }
             }
+            // A width change rewraps every paragraph, so the measured extent
+            // of the current half hour moves with it.
+            textView.postsFrameChangedNotifications = true
+            frameObserver = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: textView,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshHighlight(force: true)
+                }
+            }
         }
 
         deinit {
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
+            }
+            if let frameObserver {
+                NotificationCenter.default.removeObserver(frameObserver)
             }
         }
 
@@ -162,23 +220,38 @@ struct HistoryDocumentView: NSViewRepresentable {
             scrolled()
         }
 
-        private func refreshHighlight() {
+        private func refreshHighlight(force: Bool = false) {
             guard let textView, let layoutManager = textView.layoutManager else { return }
             let current = view.summaries.lazy.compactMap {
                 DaySummaryLayout.highlightedSlotStartMs(playheadMs: self.view.playheadMs, slots: $0.slots)
             }.first
-            guard current != highlightedSlot else { return }
-            if let previous = highlightedSlot, let range = layout.slotRanges[previous] {
-                layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
+            guard force || current != highlightedSlot else { return }
+            if let previous = highlightedSlot, let range = layout.timeRanges[previous] {
+                layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
             }
-            if let current, let range = layout.slotRanges[current] {
+            if let current, let range = layout.timeRanges[current] {
                 layoutManager.addTemporaryAttribute(
-                    .backgroundColor,
-                    value: NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 0.10),
+                    .foregroundColor,
+                    value: NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1),
                     forCharacterRange: range
                 )
             }
             highlightedSlot = current
+            textView.highlightRect = current.flatMap { boundingRect(ofSlot: $0) }
+            textView.needsDisplay = true
+        }
+
+        /// The slot's extent in view coordinates, for the lit spine segment.
+        private func boundingRect(ofSlot slotStartMs: Int64) -> NSRect? {
+            guard let textView,
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer,
+                  let range = layout.slotRanges[slotStartMs]
+            else { return nil }
+            let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
+            let origin = textView.textContainerOrigin
+            return rect.offsetBy(dx: origin.x, dy: origin.y)
         }
 
         private func followPlayhead() {
@@ -240,12 +313,28 @@ struct HistoryDocumentView: NSViewRepresentable {
                 actualCharacterRange: nil
             )
             textView.layoutManager?.invalidateDisplay(forCharacterRange: range)
+            // Lines moved, so the lit spine segment has to be re-measured.
+            refreshHighlight(force: true)
         }
 
         // -------------------------------------------------------- scroll
 
+        /// Keeps the document at least as tall as the visible area, so the
+        /// timeline rule it draws runs the full height of the panel rather
+        /// than stopping where the last summary happens to end.
+        private func syncMinimumHeight() {
+            guard let textView, let scroll else { return }
+            let visible = scroll.contentView.bounds.height
+            guard visible > 0, textView.minSize.height != visible else { return }
+            textView.minSize = NSSize(width: 0, height: visible)
+            if textView.frame.height < visible {
+                textView.setFrameSize(NSSize(width: textView.frame.width, height: visible))
+            }
+        }
+
         private func scrolled() {
             guard let textView, let scroll else { return }
+            syncMinimumHeight()
             // Topmost visible character → its day heading, for the chip.
             if let layoutManager = textView.layoutManager,
                let container = textView.textContainer

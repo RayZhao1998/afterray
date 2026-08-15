@@ -102,8 +102,23 @@ final class DaySummaryDocumentTests: XCTestCase {
             nowMs: dayMs,
             timeZone: utc
         )
-        // Uppercase micro-label: status reads as metadata, not prose.
-        XCTAssertTrue(document.string.contains("SUMMARY FAILED"))
+        XCTAssertTrue(document.string.contains("Summary failed"))
+    }
+
+    /// All-caps runs read as shouting in a dense list; the document is
+    /// Title case throughout, headings included.
+    func testDocumentNeverShouts() {
+        let (document, layout) = DaySummaryDocument.build(
+            summaries: [day(start: 0, titles: ["a slot"])],
+            nowMs: 0,
+            timeZone: utc
+        )
+        XCTAssertEqual(layout.dayRanges.first?.heading.hasPrefix("Today"), true)
+        let shouted = document.string
+            .split(whereSeparator: { !$0.isLetter })
+            .map(String.init)
+            .filter { $0.count > 2 && $0 == $0.uppercased() && $0 != $0.lowercased() }
+        XCTAssertTrue(shouted.isEmpty, "found all-caps words: \(shouted)")
     }
 
     func testSlotLinkRoundTrips() {

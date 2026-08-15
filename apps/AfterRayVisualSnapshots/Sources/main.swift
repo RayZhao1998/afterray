@@ -94,7 +94,7 @@ struct SnapshotScene {
 
     @MainActor
     static var all: [SnapshotScene] {
-        chromeScenes + highlightScenes + stampScene + settingsScenes
+        chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
     }
 }
 
@@ -413,6 +413,93 @@ private var stampScene: [SnapshotScene] {
             settleSeconds: 0.3,
             content: AnyView(StampLadder())
         )
+    ]
+}
+
+/// The history panel with titles and bullets long enough to wrap, at the
+/// narrowest width it ships in. Wrapping is where a document layout goes
+/// wrong: every wrapped line must land on the same edge as its first line,
+/// and the timeline rule must stay continuous through all of it.
+@MainActor
+private var historyPanelScene: [SnapshotScene] {
+    let slotMs = DaySummaryLayout.slotDurationMs
+    let dayStart: Int64 = 1_786_665_600_000
+    let now = dayStart + 13 * 3_600_000
+
+    func slot(
+        index: Int64,
+        title: String?,
+        bullets: [String] = [],
+        state: String = "done",
+        apps: [DayAppFact] = [
+            DayAppFact(name: "Xcode", bundleIdentifier: "com.apple.dt.Xcode", ms: 900_000),
+            DayAppFact(name: "Safari", bundleIdentifier: "com.apple.Safari", ms: 420_000),
+        ]
+    ) -> DaySlotSummary {
+        DaySlotSummary(
+            slotStartMs: dayStart + index * slotMs,
+            slotEndMs: dayStart + (index + 1) * slotMs,
+            state: state,
+            facts: DaySlotFacts(apps: apps, momentCount: 24),
+            title: title,
+            bullets: bullets.isEmpty ? nil : bullets
+        )
+    }
+
+    let today = DaySummary(
+        day: DaySummaryLayout.localDayKey(ms: dayStart),
+        dayStartMs: dayStart,
+        dayEndMs: dayStart + 86_400_000,
+        slots: [
+            slot(index: 24, title: nil, state: "degraded", apps: [
+                DayAppFact(name: "Lody", bundleIdentifier: "ai.lody.app", ms: 780_000),
+            ]),
+            slot(
+                index: 25,
+                title: "Debugging Lody search logic and publishing AfterRay packages",
+                bullets: [
+                    "Search logic fix: resolved the issue where UI search returned exactly 60 matches by adding a cosine similarity floor (0.72) and fixing Chinese tokenisation in FTS5 to avoid semantic noise filling results.",
+                    "Website and package publish: iterated on the home page design and SEO metrics, then configured the Cloudflare domain to prepare for uploading the site.",
+                ]
+            ),
+            slot(
+                index: 26,
+                title: "Lody search logic debug and overlay scroll listener fix",
+                bullets: [
+                    "Identified that UI search returned a fixed daemon candidate pool rather than similarity scores.",
+                ]
+            ),
+        ]
+    )
+    let yesterday = DaySummary(
+        day: DaySummaryLayout.localDayKey(ms: dayStart - 86_400_000),
+        dayStartMs: dayStart - 86_400_000,
+        dayEndMs: dayStart,
+        slots: [
+            slot(index: -4, title: "Read the GOP packer end to end", bullets: ["Length check was reading the IVF header twice."]),
+        ]
+    )
+
+    return [
+        SnapshotScene(
+            name: "16-history-panel-wrapping",
+            size: CGSize(width: 380, height: 720),
+            settleSeconds: 1.0,
+            content: AnyView(
+                DaySummaryPanel(
+                    style: .window,
+                    summaries: [today, yesterday],
+                    playheadMs: dayStart + 25 * slotMs + 60_000,
+                    nowMs: now,
+                    hasMore: false,
+                    isLoadingMore: false,
+                    followPulse: 0,
+                    onSelectSlot: { _ in },
+                    onLoadMore: {}
+                )
+                .frame(width: 380, height: 720)
+            )
+        ),
     ]
 }
 
