@@ -348,7 +348,7 @@ public struct AfterRayOnboardingView: View {
         case .hotKey:
             return "Press this to open AfterRay."
         case .privacy:
-            return "Decide what AfterRay never sees."
+            return "Decide what AfterRay should skip."
         case .cli:
             return "Let other agents use your history."
         case .models:
@@ -477,7 +477,7 @@ public struct AfterRayOnboardingView: View {
 
     private var privacyFooter: some View {
         HStack(spacing: 10) {
-            Text("Private browsing is never recorded.")
+            Text("Exclusions follow the app in front and the site your browser reports.")
                 .font(.system(size: 11, design: .rounded))
                 .foregroundStyle(RecallPalette.textSecondary)
             Spacer(minLength: 8)
@@ -490,7 +490,7 @@ public struct AfterRayOnboardingView: View {
     private var cliStage: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(
-                "Install the `afterray` CLI so Claude Code, Codex, Cursor, and similar tools can search your encrypted vault. Read-only."
+                "Install the `afterray` CLI so Claude Code, Codex, Cursor, and similar tools can search your encrypted vault. V0 installs the full developer CLI, which can also change settings and delete history — install it for agents you trust."
             )
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .foregroundStyle(RecallPalette.textSecondary)

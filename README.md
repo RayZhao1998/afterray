@@ -34,8 +34,9 @@ audio around a moment. Captures, indexes, and the vault key stay on your Mac.
 - **Ask questions and get citations** from a built-in assistant that can only
   read your history.
 - **Keep what matters** — favorited moments survive retention cleanup.
-- **Decide what is never seen** by excluding apps and websites; private
-  browsing is never recorded.
+- **Exclude apps and websites** you would rather it skipped. Exclusion is
+  best-effort in V0 — [what it covers](#what-exclusion-covers) is worth
+  reading before you rely on it.
 - **Let your agents use it** — Claude Code, Codex, and similar tools can query
   history through the `afterray` CLI you install explicitly.
 
@@ -147,6 +148,29 @@ Anything returned through the CLI becomes visible to that agent. The V0 CLI is
 the full developer CLI, so treat it as trusted local access rather than a
 security boundary.
 
+### What exclusion covers
+
+Excluding an app or a site is a real filter, not a promise about everything
+that was on screen. In V0:
+
+- It follows the **foreground app**. A window merely beside the one you are
+  working in — a split view, a picture-in-picture, an open password manager —
+  is still in the pixels of the frame.
+- A site is matched by the URL the browser reports through Accessibility.
+  Browsers that do not expose one, Firefox and some Electron apps among them,
+  cannot be matched, so a domain exclusion silently does not fire there.
+- The screenshot is taken first. When the app or URL that arrives with it
+  turns out to be excluded, the moment and its artifacts are deleted from the
+  vault — but they were written before that was known.
+- System audio is one mix of the whole machine. Excluding an app does not take
+  its sound out of a recording.
+- Private browsing is not detected. macOS offers no reliable signal for it, so
+  a private window is recorded like any other window. Exclude the sites you
+  care about by name.
+
+Moving exclusion into the capture filter, before a frame exists, is planned
+before the public release.
+
 ## Troubleshooting
 
 **Recording never starts.** Check all three permissions in **System Settings →
@@ -169,7 +193,9 @@ rm -f ~/.local/bin/afterray
 ```
 
 Delete the `dev.afterray.v0.vault` entry in Keychain Access to remove the vault
-key; without it any leftover copy of the vault is unreadable.
+key; without it any leftover copy of the vault is unreadable. Delete
+`dev.afterray.v0.secrets` too if you configured an API key for a remote
+assistant.
 
 ## Documentation
 

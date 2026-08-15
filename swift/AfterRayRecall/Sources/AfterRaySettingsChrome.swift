@@ -1309,7 +1309,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private var advancedPage: some View {
         SettingsSection(
             title: "CLI for agents",
-            footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history (read-only)."
+            footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history. V0 installs the full developer CLI, which can also change settings and delete history."
         ) {
             SettingsRow(
                 title: model.cliInstalled ? "afterray is installed" : "afterray CLI",
