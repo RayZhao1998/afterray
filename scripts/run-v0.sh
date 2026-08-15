@@ -163,6 +163,23 @@ cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-wo
 cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
+
+# The app links @rpath/Sparkle.framework, and the only rpath it carries into a
+# bundle is Contents/Frameworks. Without this the development build dies in
+# dyld before main — which `open` reports as nothing happening at all. The
+# updater itself stays off in a development tree; this is only what it takes
+# to load. Unlike the release bundle, nothing is pruned: dev never signs or
+# notarizes the framework, so the parts that go unused cost only disk.
+sparkle_framework="$(
+  find "$repo_root/.build/artifacts" -type d -name 'Sparkle.framework' -path '*macos*' -print -quit
+)"
+if [[ -z "$sparkle_framework" ]]; then
+  printf '%s\n' \
+    'Sparkle.framework not found under .build/artifacts; run `swift package resolve`.' >&2
+  exit 1
+fi
+mkdir -p "$app_bundle/Contents/Frameworks"
+ditto "$sparkle_framework" "$app_bundle/Contents/Frameworks/Sparkle.framework"
 codesign_identity="$(resolve_codesign_identity)"
 if [[ "$codesign_identity" == '-' ]]; then
   printf '%s\n' \
