@@ -232,6 +232,13 @@ public enum DaySummaryLayout {
         return slots.contains(where: { $0.slotStartMs == start }) ? start : nil
     }
 
+    /// Panel display order: newest half-hour first, matching how every feed
+    /// the user lives in orders time. Storage and the chat tool keep
+    /// chronological order; this is presentation only.
+    public static func displayOrder(_ slots: [DaySlotSummary]) -> [DaySlotSummary] {
+        slots.sorted { $0.slotStartMs > $1.slotStartMs }
+    }
+
     public static func timeLabel(slotStartMs: Int64, timeZone: TimeZone = .current) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(slotStartMs) / 1_000)
         var calendar = Calendar(identifier: .gregorian)

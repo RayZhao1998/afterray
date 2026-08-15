@@ -9,6 +9,11 @@ struct DaySummaryPanel: View {
     let nowMs: Int64
     let hasMore: Bool
     let isLoadingMore: Bool
+    /// Bumped by the overlay when a scrub settles; the one moment the list
+    /// follows the playhead. Following every half-hour crossing mid-glide
+    /// was a scrollTo storm that churned rows (and their thumbnails) faster
+    /// than the main thread could keep up.
+    let followPulse: Int
     let thumbnailLoader: RecallThumbnailLoader?
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
@@ -94,6 +99,7 @@ struct DaySummaryPanel: View {
                             thumbnailLoader: thumbnailLoader,
                             onSelectSlot: onSelectSlot
                         )
+                        .id(summary.dayStartMs)
                     }
                     if hasMore {
                         HistorySummaryLoadTrigger(isLoading: isLoadingMore, onAppear: onLoadMore)
@@ -104,7 +110,7 @@ struct DaySummaryPanel: View {
             }
             .frame(maxHeight: RecallGeometry.daySummaryListMaxHeight)
             .onAppear { scrollToCurrent(proxy) }
-            .onChange(of: highlightedStart) { _, _ in
+            .onChange(of: followPulse) { _, _ in
                 scrollToCurrent(proxy)
             }
         }
@@ -115,6 +121,13 @@ struct DaySummaryPanel: View {
         // The user reading the panel outranks the playhead: yanking the list
         // to the highlighted slot mid-read is the jank being reported.
         if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
+        // LazyVStack cannot scroll to a row inside an unmaterialised day
+        // section; target the section first so its rows exist, then the row.
+        if let day = summaries.first(where: {
+            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots) != nil
+        }) {
+            proxy.scrollTo(day.dayStartMs, anchor: .top)
+        }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -165,7 +178,7 @@ private struct DaySummarySection: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 7)
             } else {
-                ForEach(summary.slots) { slot in
+                ForEach(DaySummaryLayout.displayOrder(summary.slots)) { slot in
                     DaySummaryRow(
                         slot: slot,
                         isCurrent: slot.slotStartMs == highlightedStart,
@@ -347,14 +360,7 @@ private struct SlotAppIconStrip: View {
     var body: some View {
         HStack(spacing: 4) {
             ForEach(apps.prefix(Self.iconLimit), id: \.name) { app in
-                if let icon = AppIconLookup.icon(bundleIdentifier: app.bundleIdentifier) {
-                    Image(nsImage: icon)
-                        .resizable()
-                        .interpolation(.medium)
-                        .frame(width: 14, height: 14)
-                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                        .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
-                }
+                SlotAppIcon(app: app)
             }
             if apps.count > Self.iconLimit {
                 Text("+\(apps.count - Self.iconLimit)")
@@ -363,5 +369,33 @@ private struct SlotAppIconStrip: View {
             }
         }
         .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
+    }
+}
+
+/// One icon, loaded off the main thread on first sight. A row scrolling in
+/// must never pay Launch Services on the render loop.
+private struct SlotAppIcon: View {
+    let app: DayAppFact
+    @State private var icon: NSImage?
+
+    var body: some View {
+        Group {
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.medium)
+            } else {
+                Color.white.opacity(0.06)
+            }
+        }
+        .frame(width: 14, height: 14)
+        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
+        .task(id: app.bundleIdentifier) {
+            icon = AppIconLookup.cachedIcon(bundleIdentifier: app.bundleIdentifier)
+            if icon == nil {
+                icon = await AppIconLookup.iconAsync(bundleIdentifier: app.bundleIdentifier)
+            }
+        }
     }
 }

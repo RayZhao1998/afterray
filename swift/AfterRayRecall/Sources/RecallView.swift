@@ -52,6 +52,11 @@ public struct RecallView: View {
     @State private var timelineZoom: CGFloat = 1
     @State private var isZoomingTimeline = false
     @State private var layoutCache = TimelineLayoutCache()
+    /// True from the first scrub delta until the gesture (and its glide)
+    /// settles. Prefetch and panel-follow both wait for the settle: doing
+    /// either per frame at coast speed was the stutter being reported.
+    @State private var isScrubbing = false
+    @State private var followPulse = 0
     @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
     @State private var settledStill: SettledStill?
     @State private var searchScrollAccumulator: CGFloat = 0
@@ -219,6 +224,7 @@ public struct RecallView: View {
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
                             hasMore: summaryHistoryHasMore,
                             isLoadingMore: isLoadingSummaryHistory,
+                            followPulse: followPulse,
                             thumbnailLoader: thumbnailLoader,
                             onSelectSlot: { selectPlayhead(playheadMs: $0) },
                             onLoadMore: { onLoadOlderSummaryHistory?() }
@@ -302,7 +308,12 @@ public struct RecallView: View {
         }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
-        .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection)") {
+        .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection):\(isScrubbing)") {
+            // While the scrub coasts, the selected moment changes every
+            // frame; forty-artifact prefetch batches at that rate were pure
+            // main-thread churn. The visible still keeps updating through
+            // its own throttle; neighbours warm once motion settles.
+            guard !isScrubbing else { return }
             prefetchAroundSelection()
         }
         .onAppear { onVisibleDayChange?(playheadMs) }
@@ -548,8 +559,11 @@ public struct RecallView: View {
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
         if ended {
             searchScrollAccumulator = 0
+            isScrubbing = false
+            followPulse += 1
             return
         }
+        isScrubbing = true
         if let searchSession {
             guard delta != 0 else { return }
             if !isPrecise {

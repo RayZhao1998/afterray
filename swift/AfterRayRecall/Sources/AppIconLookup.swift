@@ -10,6 +10,14 @@ public enum AppIconLookup {
     /// re-query Launch Services forever.
     private static let absent = NSImage(size: .zero)
 
+    /// Cache-only read: never touches Launch Services. Safe on any thread,
+    /// safe at scroll speed.
+    public static func cachedIcon(bundleIdentifier: String?) -> NSImage? {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
+        guard let cached = cache.object(forKey: bundleIdentifier as NSString) else { return nil }
+        return cached === absent ? nil : cached
+    }
+
     public static func icon(bundleIdentifier: String?) -> NSImage? {
         guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
         let key = bundleIdentifier as NSString
@@ -24,5 +32,15 @@ public enum AppIconLookup {
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         cache.setObject(icon, forKey: key)
         return icon
+    }
+
+    /// The miss path off the main thread: rows appearing during a scroll
+    /// must not pay a Launch Services round trip on the render loop.
+    public static func iconAsync(bundleIdentifier: String?) async -> NSImage? {
+        if let hit = cachedIcon(bundleIdentifier: bundleIdentifier) { return hit }
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
+        return await Task.detached(priority: .utility) {
+            icon(bundleIdentifier: bundleIdentifier)
+        }.value
     }
 }

@@ -84,6 +84,18 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertTrue(bare.detail.isEmpty)
     }
 
+    /// Presentation order is newest-first, the way every feed the user
+    /// lives in orders time; storage stays chronological.
+    func testDisplayOrderPutsTheNewestSlotFirst() {
+        let slots = [
+            slot(start: 0, title: "morning"),
+            slot(start: DaySummaryLayout.slotDurationMs * 2, title: "noon"),
+            slot(start: DaySummaryLayout.slotDurationMs, title: "late morning"),
+        ]
+        let ordered = DaySummaryLayout.displayOrder(slots)
+        XCTAssertEqual(ordered.map(\.title), ["noon", "late morning", "morning"])
+    }
+
     func testEmptyFactsHaveAnExplicitLine() {
         XCTAssertEqual(DaySummaryLayout.factLine(apps: []), "Quiet — nothing on screen")
     }
