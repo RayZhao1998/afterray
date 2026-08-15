@@ -342,6 +342,134 @@ fn create_keychain_key(_account: &str) -> Result<VaultKey, StoreError> {
     ))
 }
 
+/// Secrets that are not the vault key — today only the assistant API key.
+///
+/// It used to live in cleartext in `settings.json` beside the vault, written
+/// with the process umask, so a `0644` file held a billable credential. The
+/// Keychain gives it the same device-bound, unlocked-only protection the
+/// vault key already has.
+#[cfg(target_os = "macos")]
+const SECRET_KEYCHAIN_SERVICE: &str = "dev.afterray.v0.secrets";
+
+/// Keychain account for the OpenAI-compatible API key.
+pub const LLM_API_KEY_SECRET: &str = "llm-api-key";
+
+pub fn load_secret(name: &str) -> Result<Option<String>, StoreError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut protected = secret_query_options(name);
+        protected.use_protected_keychain();
+        if let Some(value) = read_secret_item(protected)? {
+            return Ok(Some(value));
+        }
+        read_secret_item(secret_query_options(name))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        Err(StoreError::KeyProvider(
+            "storing secrets requires the macOS Keychain".to_owned(),
+        ))
+    }
+}
+
+pub fn store_secret(name: &str, value: &str) -> Result<(), StoreError> {
+    #[cfg(target_os = "macos")]
+    {
+        match set_generic_password_options(
+            value.as_bytes(),
+            secret_create_options(name, /* protected */ true)?,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if is_missing_entitlement(error) => set_generic_password_options(
+                value.as_bytes(),
+                secret_create_options(name, /* protected */ false)?,
+            )
+            .map_err(|error| StoreError::KeyProvider(error.to_string())),
+            Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, value);
+        Err(StoreError::KeyProvider(
+            "storing secrets requires the macOS Keychain".to_owned(),
+        ))
+    }
+}
+
+/// Clearing a secret has to clear it everywhere it could have landed, or a
+/// user who deletes their API key keeps a working credential on disk.
+pub fn delete_secret(name: &str) -> Result<(), StoreError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut protected = secret_query_options(name);
+        protected.use_protected_keychain();
+        remove_secret_item(protected)?;
+        remove_secret_item(secret_query_options(name))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        Err(StoreError::KeyProvider(
+            "storing secrets requires the macOS Keychain".to_owned(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn secret_query_options(name: &str) -> PasswordOptions {
+    let mut options = PasswordOptions::new_generic_password(SECRET_KEYCHAIN_SERVICE, name);
+    options.set_access_synchronized(Some(false));
+    options
+}
+
+#[cfg(target_os = "macos")]
+fn secret_create_options(name: &str, protected: bool) -> Result<PasswordOptions, StoreError> {
+    let mut options = secret_query_options(name);
+    options.set_label("AfterRay Assistant Credential");
+    #[allow(deprecated)]
+    {
+        options.query.push((
+            CFString::from(SEC_ATTR_ACCESSIBLE),
+            CFString::from(SEC_ATTR_ACCESSIBLE_WHEN_UNLOCKED_THIS_DEVICE_ONLY).into_CFType(),
+        ));
+    }
+    if protected {
+        let access_control = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+            0,
+        )
+        .map_err(|error| StoreError::KeyProvider(error.to_string()))?;
+        options.use_protected_keychain();
+        options.set_access_control(access_control);
+    }
+    Ok(options)
+}
+
+#[cfg(target_os = "macos")]
+fn read_secret_item(options: PasswordOptions) -> Result<Option<String>, StoreError> {
+    match generic_password(options) {
+        Ok(value) => {
+            let value = Zeroizing::new(value);
+            let text = std::str::from_utf8(&value)
+                .map_err(|_| StoreError::KeyProvider("stored secret is not UTF-8".to_owned()))?;
+            Ok(Some(text.to_owned()))
+        }
+        Err(error) if is_item_not_found(error) || is_missing_entitlement(error) => Ok(None),
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_secret_item(options: PasswordOptions) -> Result<(), StoreError> {
+    match delete_generic_password_options(options) {
+        Ok(()) => Ok(()),
+        Err(error) if is_item_not_found(error) || is_missing_entitlement(error) => Ok(()),
+        Err(error) => Err(StoreError::KeyProvider(error.to_string())),
+    }
+}
+
 fn decode_key(value: &[u8]) -> Result<VaultKey, StoreError> {
     if value.len() == 32 {
         return value

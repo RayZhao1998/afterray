@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
+pub mod socket;
+
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 pub const PROTOCOL_VERSION: u32 = 7;
 

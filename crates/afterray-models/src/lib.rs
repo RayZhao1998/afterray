@@ -35,7 +35,8 @@ pub use queue::{
 };
 pub use remote::{
     DEFAULT_OLLAMA_BASE_URL, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, LlmTokenSinkGuard,
-    chat_completions_url, models_from_ollama_tags, models_from_openai_list, normalize_origin,
+    chat_completions_url, check_origin, models_from_ollama_tags, models_from_openai_list,
+    normalize_origin,
     ollama_chat_delta, ollama_chat_url, ollama_tags_url, openai_models_url, openai_sse_delta,
     probe_llm, recommend_model,
 };

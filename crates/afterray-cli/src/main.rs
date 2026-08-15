@@ -260,9 +260,11 @@ enum HistoryScopeArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let socket = cli
-        .socket
-        .unwrap_or_else(|| std::env::temp_dir().join("afterray-v0.sock"));
+    let socket = match cli.socket {
+        Some(path) => path,
+        None => afterray_protocol::socket::default_socket_path()
+            .context("resolve the afterray daemon socket")?,
+    };
     if let Command::Chat { command } = cli.command {
         return chat::run(&socket, command, cli.json).await;
     }

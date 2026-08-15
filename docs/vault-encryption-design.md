@@ -103,7 +103,11 @@ Swift UI 不直接读取数据库、artifact 文件或密钥。Rust daemon 是 V
 - ARV0 artifact 与旧数据库 key 自动迁移；迁移采用新旧文件并存、数据库切换、最后删除旧文件的崩溃安全顺序。
 - 私有目录为 `0700`，文件为 `0600`；artifact 写入经过 `fsync` 和原子 rename；启动时清理孤立密文、迁移残留与明文 capture staging。
 - 已有 Vault 丢失 Keychain key 时 fail-closed，不会生成替代 key 覆盖恢复入口。
-- 锁屏、睡眠和用户切换时停止 daemon 与录制，并清理 Timeline、搜索结果、音频、编码 artifact cache 和解码图片 cache；恢复活动会重新启动 daemon 与录制。
+- 锁屏、睡眠和用户切换时停止录制，并清理 Timeline、搜索结果、音频、编码 artifact cache 和解码图片 cache；恢复活动会重新启动录制。
+  **daemon 本身仍在运行**：主密钥留在进程内存里，socket 也仍可连接，因此锁屏后本机进程依然可以读到明文历史。真正卸载密钥、关闭 socket 的锁屏行为列在 8.2 的发布前要求里。
+- daemon socket 位于 `0700` 目录内、自身为 `0600`，绑定前拒绝替换不属于自己的路径（非 socket、他人所有、或仍有 daemon 在监听），接受连接后校验对端 uid。
+- OpenAI 兼容 API key 存在 Keychain（`dev.afterray.v0.secrets`），不再写进 `settings.json`；旧版本写下的明文 key 会在启动时迁移并从文件中抹去。`settings.json` 自身经临时文件原子写入并保持 `0600`。
+- 远程 endpoint 只接受 `https`，或指向本机的 `http`（loopback）；HTTP 客户端不跟随 redirect，避免 API key 与检索到的历史被带去用户没有确认的主机。
 - retention 先在 SQLCipher 事务中删除 wrapped DEK，再删除 artifact 文件，使内容立即不可通过正常 Vault 路径恢复。
 
 尚未产品化的可选能力只有“用户主动创建的口令恢复包”。它需要单独确定口令强度、丢失提示和恢复 UI；AfterRay 不因此保留服务器端密钥。
@@ -122,6 +126,7 @@ V0 必须满足：
 
 - wrapped per-artifact DEK 和版本化 header。
 - 锁屏、睡眠、用户切换时的暂停与内存清理经过验证。
+- 锁屏、睡眠、用户切换时 daemon 卸载主密钥并停止响应读取请求，解锁后重新取钥匙。锁定状态由 daemon 自己向系统查询，不信任调用方声称的解锁。
 - 数据库 WAL、删除和崩溃恢复经过验证。
 - 可选的用户持有恢复包与恢复流程。
 - 安全评审覆盖随机数、nonce、key derivation、文件替换和 downgrade 风险。

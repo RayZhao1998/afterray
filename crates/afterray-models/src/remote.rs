@@ -140,6 +140,10 @@ impl LlmRouterAdapter {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(GENERATE_TIMEOUT)
+                // The prompt carries retrieved history and the header carries
+                // the API key: neither follows a redirect to a host the user
+                // did not configure.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             token_sink: LlmTokenSink::default(),
@@ -216,6 +220,10 @@ impl ModelAdapter for LlmRouterAdapter {
                         "LLM router received a non-LLM input".into(),
                     ));
                 };
+                // Settings validates on the way in; this catches an endpoint
+                // stored by an older build or forced through
+                // `AFTERRAY_LLM_BASE_URL`, before any evidence is on the wire.
+                check_origin(&config.resolved_base_url()).map_err(AdapterError::Process)?;
                 let text = generate_remote(
                     &self.client,
                     &config,
@@ -267,10 +275,22 @@ pub async fn probe_llm(
             default_base_url,
         };
     }
+    if let Err(error) = check_origin(&origin) {
+        return LlmEndpointStatus {
+            reachable: false,
+            models: Vec::new(),
+            recommended_model: None,
+            error: Some(error),
+            default_base_url,
+        };
+    }
 
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(PROBE_TIMEOUT)
+        // A redirect would carry the API key and the probe to a host the user
+        // never approved.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -451,6 +471,60 @@ pub fn normalize_origin(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_owned()
 }
 
+/// Remote inference ships retrieved history — OCR, transcripts, window
+/// titles — off the machine, so the endpoint has to be either TLS-protected
+/// or never leave this Mac. Any `http://` host used to be a valid setting,
+/// which made "change one setting" enough to turn the background summarizer
+/// into an exfiltration channel in cleartext.
+///
+/// # Errors
+///
+/// Returns a message for the user when the endpoint is not a full URL, is not
+/// `https`, or is plain `http` to something other than this machine.
+pub fn check_origin(raw: &str) -> Result<(), String> {
+    let origin = normalize_origin(raw);
+    let Some((scheme, host)) = split_origin(&origin) else {
+        return Err(format!(
+            "`{origin}` is not a full endpoint URL; include a scheme and host, such as https://api.example.com/v1"
+        ));
+    };
+    match scheme.as_str() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&host) => Ok(()),
+        "http" => Err(format!(
+            "`{host}` needs https://; plain http is only accepted for an endpoint on this Mac"
+        )),
+        other => Err(format!(
+            "`{other}://` is not a supported endpoint scheme; use https://"
+        )),
+    }
+}
+
+/// Splits an origin into its lowercased scheme and host. Userinfo, port,
+/// path, query, and IPv6 brackets are stripped so the host that comes back is
+/// the name the request is actually addressed to.
+fn split_origin(origin: &str) -> Option<(String, String)> {
+    let (scheme, rest) = origin.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, it)| it);
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split_once(']')?.0
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!scheme.trim().is_empty() && !host.is_empty())
+        .then(|| (scheme.trim().to_ascii_lowercase(), host))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 #[must_use]
 pub fn chat_completions_url(origin: &str) -> String {
     let origin = normalize_origin(origin);
@@ -608,6 +682,35 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn https_endpoints_are_accepted() {
+        assert!(check_origin("https://api.openai.com/v1").is_ok());
+        assert!(check_origin("HTTPS://Api.Example.com").is_ok());
+    }
+
+    #[test]
+    fn plain_http_is_only_accepted_on_this_machine() {
+        assert!(check_origin("http://127.0.0.1:11434").is_ok());
+        assert!(check_origin("http://localhost:1234/v1").is_ok());
+        assert!(check_origin("http://[::1]:11434").is_ok());
+        assert!(check_origin(DEFAULT_OLLAMA_BASE_URL).is_ok());
+
+        assert!(check_origin("http://evil.example.com/v1").is_err());
+        // A loopback-looking userinfo does not make the host loopback.
+        assert!(check_origin("http://127.0.0.1@evil.example.com/v1").is_err());
+        // Neither does a loopback-looking prefix.
+        assert!(check_origin("http://127.0.0.1.evil.example.com").is_err());
+    }
+
+    #[test]
+    fn an_endpoint_without_a_usable_scheme_is_rejected() {
+        assert!(check_origin("").is_err());
+        assert!(check_origin("api.example.com/v1").is_err());
+        assert!(check_origin("file:///etc/passwd").is_err());
+        assert!(check_origin("ftp://example.com").is_err());
+        assert!(check_origin("https://").is_err());
+    }
 
     #[test]
     fn mlx_is_the_default_and_is_ready_only_with_the_verified_pack() {

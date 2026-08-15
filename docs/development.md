@@ -152,6 +152,12 @@ afterray jobs list --json
 When running from the repository, replace `afterray` with
 `target/debug/afterray` (or `target/release/afterray`).
 
+Without `AFTERRAY_SOCKET`, the CLI resolves the socket the same way the daemon
+does: a binary inside `target/{debug,release}` uses
+`<checkout>/.afterray-dev/afterray.sock`, and an installed copy uses
+`~/Library/Application Support/AfterRay/afterray.sock`. Nothing falls back to
+`/tmp`, where any process could have bound the path first.
+
 The V0 developer binary also contains operational commands for development and
 direct user actions: starting or stopping capture, changing settings, managing
 favorites, clearing history, downloading models, retrying jobs, and requesting
