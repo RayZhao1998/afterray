@@ -1053,6 +1053,14 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
             audioPlayer.stop()
+            // A search outlives the overlay being dismissed, and its filmstrip
+            // comes back parked on the frame it was left on. Going live anyway
+            // put "NOW" on the clock above a still from hours ago, so reopening
+            // into a live search lands back on the selected result instead.
+            if let session = control.searchSession, session.selectedFrame != nil {
+                selectSearchFrame(session.selectedIndex)
+                return
+            }
             isLive = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
@@ -1481,11 +1489,13 @@ private struct ImmersiveQueryBar: View {
             }
             .fixedSize()
 
+            // Pointing the way the strip runs: older matches lie to its left,
+            // newer to its right, as on the timeline.
             HStack(spacing: 2) {
-                stepButton(symbol: "chevron.left", help: "Newer match", delta: -1)
-                    .disabled(session.selectedIndex == 0)
-                stepButton(symbol: "chevron.right", help: "Older match", delta: 1)
+                stepButton(symbol: "chevron.left", help: "Older match", delta: 1)
                     .disabled(session.selectedIndex >= session.frames.count - 1)
+                stepButton(symbol: "chevron.right", help: "Newer match", delta: -1)
+                    .disabled(session.selectedIndex == 0)
             }
         }
     }
