@@ -440,6 +440,7 @@ async fn request_from_command(
             summary_language,
             storage_limit_bytes: None,
             excluded_bundle_ids: None,
+            excluded_domains: None,
             llm_provider: None,
             llm_base_url: None,
             llm_model: None,

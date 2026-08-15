@@ -169,6 +169,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded_domains: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         llm_provider: Option<LlmProvider>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         llm_base_url: Option<String>,
@@ -330,6 +332,10 @@ pub struct AppSettings {
     pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
+    /// Hosts whose pages are never recorded. Matched on the URL the
+    /// accessibility snapshot reports, subdomains included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_domains: Vec<String>,
     #[serde(default)]
     pub llm_provider: LlmProvider,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -869,6 +875,7 @@ mod tests {
                 summary_language: None,
                 storage_limit_bytes: None,
                 excluded_bundle_ids: None,
+                excluded_domains: None,
                 llm_provider: None,
                 llm_base_url: None,
                 llm_model: None,
@@ -908,6 +915,7 @@ mod tests {
             summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
             excluded_bundle_ids: None,
+            excluded_domains: None,
             llm_provider: None,
             llm_base_url: None,
             llm_model: None,
