@@ -919,6 +919,12 @@ private struct AfterRayRootView: View {
             onToggleRecording: toggleRecording,
             chromeTopPadding: controlBarTopPadding,
             daySummary: store.daySummary,
+            summaryHistory: store.summaryHistory,
+            summaryHistoryHasMore: store.summaryHistoryHasMore,
+            isLoadingSummaryHistory: store.isLoadingSummaryHistory,
+            onLoadOlderSummaryHistory: {
+                Task { await store.loadOlderSummaryHistory() }
+            },
             onVisibleDayChange: { dayMs in
                 Task { await store.loadDaySummary(dayMs: dayMs) }
             },
@@ -1525,4 +1531,3 @@ private struct RecordingButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
-
