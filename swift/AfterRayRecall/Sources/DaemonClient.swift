@@ -552,10 +552,22 @@ final class StreamSocket: @unchecked Sendable {
 }
 
 enum UnixLineTransport {
-    static func exchange(path: String, payload: Data) throws -> Data {
+    /// Unary requests get a receive deadline. Without one, a daemon that is
+    /// alive but wedged (model queue jammed, vault lock held) parks every
+    /// caller in a blocking `read` forever — awaits that never resume are how
+    /// the overlay froze on 2026-08-15. Streaming reads (`readLines`) stay
+    /// deadline-free: a chat stream legitimately goes quiet during prefill.
+    static let unaryReceiveTimeout: TimeInterval = 30
+
+    static func exchange(
+        path: String,
+        payload: Data,
+        receiveTimeout: TimeInterval = UnixLineTransport.unaryReceiveTimeout
+    ) throws -> Data {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
+        try applyReceiveTimeout(descriptor: descriptor, seconds: receiveTimeout)
         try connect(descriptor: descriptor, path: path)
         try writeAll(descriptor: descriptor, payload: payload)
         return try readLine(descriptor: descriptor)
@@ -565,6 +577,7 @@ enum UnixLineTransport {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
+        try applyReceiveTimeout(descriptor: descriptor, seconds: unaryReceiveTimeout)
         try connect(descriptor: descriptor, path: path)
         try writeAll(descriptor: descriptor, payload: payload)
 
@@ -639,6 +652,22 @@ enum UnixLineTransport {
         }
     }
 
+    private static func applyReceiveTimeout(descriptor: Int32, seconds: TimeInterval) throws {
+        guard seconds > 0 else { return }
+        var timeout = timeval(
+            tv_sec: Int(seconds),
+            tv_usec: Int32((seconds.truncatingRemainder(dividingBy: 1)) * 1_000_000)
+        )
+        let applied = setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+        guard applied == 0 else { throw posixError("set receive timeout") }
+    }
+
     private static func connect(descriptor: Int32, path: String) throws {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -684,6 +713,11 @@ enum UnixLineTransport {
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while response.count < maximumResponseBytes {
             let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                throw DaemonClientError.connection(
+                    "daemon did not respond within \(Int(unaryReceiveTimeout))s"
+                )
+            }
             guard count > 0 else { break }
             let bytes = buffer[..<count]
             if let newline = bytes.firstIndex(of: 0x0A) {
