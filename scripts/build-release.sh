@@ -335,6 +335,24 @@ for library in "${runtime_libraries[@]}"; do
 done
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 
+# Notarize the application before it goes into the DMG, so the ticket
+# travels with what the user actually keeps. Stapling only the DMG leaves
+# the dragged-out copy relying on an online check with Apple, which is a
+# first-launch failure for anyone installing offline.
+if [[ "$mode" == 'release' ]]; then
+  step "Submitting app for notarization (profile: $notary_profile)"
+  app_archive="$temp_root/AfterRay.zip"
+  ditto -c -k --keepParent "$app_bundle" "$app_archive"
+  xcrun notarytool submit \
+    "$app_archive" \
+    --keychain-profile "$notary_profile" \
+    --wait \
+    --timeout 30m
+  step 'Stapling ticket to the application'
+  xcrun stapler staple "$app_bundle"
+  xcrun stapler validate "$app_bundle"
+fi
+
 step 'Creating compressed DMG'
 dmg_root="$temp_root/dmg"
 mkdir -p "$dmg_root"
