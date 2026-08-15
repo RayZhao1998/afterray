@@ -236,7 +236,6 @@ public struct RecallView: View {
                             hasMore: summaryHistoryHasMore,
                             isLoadingMore: isLoadingSummaryHistory,
                             followPulse: followPulse,
-                            thumbnailLoader: thumbnailLoader,
                             onSelectSlot: { selectPlayhead(playheadMs: $0) },
                             onLoadMore: { onLoadOlderSummaryHistory?() }
                         )

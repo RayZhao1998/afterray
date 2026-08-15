@@ -96,9 +96,6 @@ private struct HistoryWindowRoot: View {
             hasMore: store.summaryHistoryHasMore,
             isLoadingMore: store.isLoadingSummaryHistory,
             followPulse: 0,
-            thumbnailLoader: { momentID in
-                try await AfterRayServices.shared.images.thumbnail(momentID: momentID).bytes
-            },
             onSelectSlot: { slotStartMs in
                 // Jumping to a moment is an overlay affair: bring it up on
                 // the selected half hour. The window stays where it is.

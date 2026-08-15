@@ -4,7 +4,7 @@ import SwiftUI
 /// Hosts the history document in an `NSTextView`: document-grade selection
 /// across bullets, rows and days — the thing a stack of SwiftUI `Text`
 /// views structurally cannot do. Non-editable, dark, link clicks jump the
-/// timeline, attachments (thumbnails, app icons) fill in asynchronously.
+/// timeline, app icons fill in asynchronously.
 struct HistoryDocumentView: NSViewRepresentable {
     let summaries: [DaySummary]
     let playheadMs: Int64
@@ -12,7 +12,6 @@ struct HistoryDocumentView: NSViewRepresentable {
     let hasMore: Bool
     let isLoadingMore: Bool
     let followPulse: Int
-    let thumbnailLoader: RecallThumbnailLoader?
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
     /// Reports the heading of the topmost visible day as the user scrolls,
@@ -201,27 +200,9 @@ struct HistoryDocumentView: NSViewRepresentable {
                 .attachment,
                 in: NSRange(location: 0, length: storage.length)
             ) { value, range, _ in
-                if let thumbnail = value as? DaySummaryDocument.ThumbnailAttachment {
-                    fill(thumbnail: thumbnail, at: range)
-                } else if let icon = value as? DaySummaryDocument.AppIconAttachment {
+                if let icon = value as? DaySummaryDocument.AppIconAttachment {
                     fill(icon: icon, at: range)
                 }
-            }
-        }
-
-        private func fill(thumbnail: DaySummaryDocument.ThumbnailAttachment, at range: NSRange) {
-            guard let loader = view.thumbnailLoader else { return }
-            let key = ObjectIdentifier(thumbnail)
-            guard !loadingAttachments.contains(key) else { return }
-            loadingAttachments.insert(key)
-            Task { @MainActor [weak self] in
-                defer { self?.loadingAttachments.remove(key) }
-                guard let image = await RecallThumbnailCache.shared.image(
-                    momentID: thumbnail.momentID,
-                    loader: loader
-                ) else { return }
-                thumbnail.image = NSImage(cgImage: image, size: NSSize(width: 56, height: 36))
-                self?.invalidate(range: range)
             }
         }
 

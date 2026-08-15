@@ -34,7 +34,6 @@ public struct DaySummaryPanel: View {
     /// was a scrollTo storm that churned rows (and their thumbnails) faster
     /// than the main thread could keep up.
     let followPulse: Int
-    let thumbnailLoader: RecallThumbnailLoader?
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
 
@@ -47,7 +46,6 @@ public struct DaySummaryPanel: View {
         hasMore: Bool,
         isLoadingMore: Bool,
         followPulse: Int,
-        thumbnailLoader: RecallThumbnailLoader?,
         onSelectSlot: @escaping (Int64) -> Void,
         onLoadMore: @escaping () -> Void
     ) {
@@ -59,7 +57,6 @@ public struct DaySummaryPanel: View {
         self.hasMore = hasMore
         self.isLoadingMore = isLoadingMore
         self.followPulse = followPulse
-        self.thumbnailLoader = thumbnailLoader
         self.onSelectSlot = onSelectSlot
         self.onLoadMore = onLoadMore
     }
@@ -172,7 +169,6 @@ public struct DaySummaryPanel: View {
             hasMore: hasMore,
             isLoadingMore: isLoadingMore,
             followPulse: followPulse,
-            thumbnailLoader: thumbnailLoader,
             onSelectSlot: onSelectSlot,
             onLoadMore: onLoadMore,
             onTopDayChange: { heading in

@@ -52,8 +52,8 @@ final class DaySummaryDocumentTests: XCTestCase {
         let range = try! XCTUnwrap(layout.slotRanges[slotStart])
         let slotText = (document.string as NSString).substring(with: range)
         XCTAssertTrue(slotText.contains("only slot"))
-        XCTAssertTrue(slotText.contains("· read the code"))
-        XCTAssertTrue(slotText.contains("· wrote a fix"))
+        XCTAssertTrue(slotText.contains("·\tread the code"))
+        XCTAssertTrue(slotText.contains("·\twrote a fix"))
 
         // The time chip links to the slot so clicking it jumps the timeline.
         var foundLink = false
@@ -102,41 +102,8 @@ final class DaySummaryDocumentTests: XCTestCase {
             nowMs: dayMs,
             timeZone: utc
         )
-        XCTAssertTrue(document.string.contains("(Summary failed)"))
-    }
-
-    func testThumbnailAttachmentRidesTheAnchorMoment() {
-        let summary = DaySummary(
-            day: "1970-01-01",
-            dayStartMs: 0,
-            dayEndMs: dayMs,
-            slots: [
-                DaySlotSummary(
-                    slotStartMs: 0,
-                    slotEndMs: DaySummaryLayout.slotDurationMs,
-                    state: "done",
-                    anchorMomentId: "moment-42",
-                    facts: DaySlotFacts(apps: []),
-                    title: "titled"
-                ),
-            ]
-        )
-        let (document, _) = DaySummaryDocument.build(
-            summaries: [summary],
-            nowMs: dayMs,
-            timeZone: utc
-        )
-        var thumbnail: DaySummaryDocument.ThumbnailAttachment?
-        document.enumerateAttribute(
-            .attachment,
-            in: NSRange(location: 0, length: document.length)
-        ) { value, _, _ in
-            if let found = value as? DaySummaryDocument.ThumbnailAttachment {
-                thumbnail = found
-            }
-        }
-        XCTAssertEqual(thumbnail?.momentID, "moment-42")
-        XCTAssertEqual(thumbnail?.slotStartMs, 0)
+        // Uppercase micro-label: status reads as metadata, not prose.
+        XCTAssertTrue(document.string.contains("SUMMARY FAILED"))
     }
 
     func testSlotLinkRoundTrips() {

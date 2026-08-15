@@ -6,8 +6,8 @@ import Foundation
 /// Cross-row text selection is why this exists: SwiftUI's `.textSelection`
 /// is scoped to a single `Text` view, so a list of views can never extend a
 /// selection across a bullet, a row, or a day. One `NSTextView` over one
-/// backing store gives document-grade selection; thumbnails and app icons
-/// ride along as text attachments, and the time chips become links.
+/// backing store gives document-grade selection; app icons ride along as
+/// text attachments, and the time chips become links.
 public enum DaySummaryDocument {
     /// Link scheme for jump affordances inside the document. The URL host
     /// carries the slot start in milliseconds.
@@ -41,36 +41,6 @@ public enum DaySummaryDocument {
         public func dayStart(at characterIndex: Int) -> Int64? {
             dayRanges.last { $0.range.location <= characterIndex }?.dayStartMs
         }
-    }
-
-    /// Attachment for a slot's opening frame; the hosting view fills
-    /// `image` asynchronously and invalidates layout.
-    public final class ThumbnailAttachment: NSTextAttachment {
-        public let momentID: String
-        public let slotStartMs: Int64
-
-        public init(momentID: String, slotStartMs: Int64) {
-            self.momentID = momentID
-            self.slotStartMs = slotStartMs
-            super.init(data: nil, ofType: nil)
-            // Vertically centre the image against the 12pt title text rather
-            // than sitting it on the baseline: a 36px image on the baseline
-            // towers over its line and leaves the title looking sunk.
-            bounds = CGRect(x: 0, y: -14, width: 56, height: 36)
-            image = Self.placeholder
-        }
-
-        @available(*, unavailable)
-        required init?(coder _: NSCoder) { nil }
-
-        private static let placeholder: NSImage = {
-            let image = NSImage(size: NSSize(width: 56, height: 36), flipped: false) { rect in
-                NSColor.white.withAlphaComponent(0.06).setFill()
-                NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
-                return true
-            }
-            return image
-        }()
     }
 
     /// Attachment for one application icon in a slot's metadata line.
@@ -137,7 +107,9 @@ public enum DaySummaryDocument {
     ) {
         let row = DaySummaryLayout.rowText(slot: slot, timeZone: timeZone)
 
-        // Time chip: the deliberate jump affordance, so it links.
+        // Time chip: the deliberate jump affordance, so it links. The tab
+        // lands the title exactly on the 46pt edge that bullets and the
+        // metadata line share — one alignment edge for the whole row.
         text.append(NSAttributedString(
             string: row.time,
             attributes: [
@@ -147,7 +119,7 @@ public enum DaySummaryDocument {
                 .paragraphStyle: titleParagraph,
             ]
         ))
-        text.append(NSAttributedString(string: "  ", attributes: [.paragraphStyle: titleParagraph]))
+        text.append(NSAttributedString(string: "\t", attributes: [.paragraphStyle: titleParagraph]))
 
         text.append(NSAttributedString(
             string: row.primary,
@@ -158,26 +130,11 @@ public enum DaySummaryDocument {
             ]
         ))
 
-        // The opening frame, inline at the end of the title line; clicking
-        // it opens the timeline like the time chip does.
-        if let anchor = slot.anchorMomentId {
-            text.append(NSAttributedString(string: "  ", attributes: [.paragraphStyle: titleParagraph]))
-            let attachment = ThumbnailAttachment(momentID: anchor, slotStartMs: slot.slotStartMs)
-            let attachmentText = NSMutableAttributedString(attachment: attachment)
-            attachmentText.addAttributes(
-                [
-                    .link: slotLink(startMs: slot.slotStartMs),
-                    .paragraphStyle: titleParagraph,
-                ],
-                range: NSRange(location: 0, length: attachmentText.length)
-            )
-            text.append(attachmentText)
-        }
         text.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: titleParagraph]))
 
         for detail in row.detail {
             text.append(NSAttributedString(
-                string: "· \(detail)\n",
+                string: "·\t\(detail)\n",
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 11),
                     .foregroundColor: NSColor.white.withAlphaComponent(0.66),
@@ -189,13 +146,16 @@ public enum DaySummaryDocument {
         if row.badge != nil || !slot.facts.apps.isEmpty {
             let meta = NSMutableAttributedString()
             if let badge = row.badge {
+                // Uppercase micro-label, styled like the day kicker: status
+                // is metadata about the row, not a parenthetical sentence.
                 meta.append(NSAttributedString(
-                    string: "(\(badge))  ",
+                    string: badge.uppercased() + "   ",
                     attributes: [
-                        .font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
+                        .font: NSFont.systemFont(ofSize: 8.5, weight: .semibold),
+                        .kern: 0.8,
                         .foregroundColor: badge == "Summary failed"
-                            ? NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 0.9)
-                            : NSColor.white.withAlphaComponent(0.45),
+                            ? NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 0.85)
+                            : NSColor.white.withAlphaComponent(0.32),
                     ]
                 ))
             }
@@ -240,6 +200,7 @@ public enum DaySummaryDocument {
         style.paragraphSpacingBefore = 9
         style.paragraphSpacing = 1
         style.headIndent = 46
+        style.tabStops = [NSTextTab(textAlignment: .left, location: 46)]
         style.lineBreakMode = .byWordWrapping
         return style
     }()
@@ -248,6 +209,7 @@ public enum DaySummaryDocument {
         let style = NSMutableParagraphStyle()
         style.firstLineHeadIndent = 46
         style.headIndent = 56
+        style.tabStops = [NSTextTab(textAlignment: .left, location: 56)]
         style.paragraphSpacing = 1
         return style
     }()
