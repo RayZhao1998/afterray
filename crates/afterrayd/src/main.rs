@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
+        excluded_domains: std::sync::Mutex::new(persisted.excluded_domains.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
         languages: std::sync::Mutex::new((
             persisted.ui_language.clone(),
@@ -154,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
     });
     spawn_gop_packer(Arc::clone(&state));
     spawn_slot_summarizer(Arc::clone(&state));
+    spawn_text_df_maintainer(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -265,6 +267,7 @@ struct AppState {
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
+    excluded_domains: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
     /// (ui_language, summary_language) as stored preferences; `auto` until
     /// the user picks, resolved against the system locale at prompt time.
@@ -281,6 +284,8 @@ struct PersistedSettings {
     storage_limit_bytes: u64,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
+    #[serde(default)]
+    excluded_domains: Vec<String>,
     #[serde(default)]
     llm_provider: LlmProvider,
     #[serde(default)]
@@ -334,6 +339,7 @@ impl Default for PersistedSettings {
             record_audio: true,
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
+            excluded_domains: Vec::new(),
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
             llm_model: String::new(),
@@ -602,6 +608,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             summary_language,
             storage_limit_bytes,
             excluded_bundle_ids,
+            excluded_domains,
             llm_provider,
             llm_base_url,
             llm_model,
@@ -615,6 +622,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     summary_language,
                     storage_limit_bytes,
                     excluded_bundle_ids,
+                    excluded_domains,
                     llm_provider,
                     llm_base_url,
                     llm_model,
@@ -872,6 +880,11 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
+            .unwrap_or_default(),
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
         llm_model: llm.model,
@@ -905,6 +918,11 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
+            .unwrap_or_default(),
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
         llm_model: llm.model,
@@ -928,6 +946,7 @@ struct SettingsPatch {
     summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
+    excluded_domains: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
@@ -941,6 +960,7 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         summary_language,
         storage_limit_bytes,
         excluded_bundle_ids,
+        excluded_domains,
         llm_provider,
         llm_base_url,
         llm_model,
@@ -994,6 +1014,19 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         {
             let mut excluded = state
                 .excluded_bundle_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *excluded = cleaned;
+        }
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save settings: {error}"));
+        }
+    }
+    if let Some(domains) = excluded_domains {
+        let cleaned = normalize_domains(domains);
+        {
+            let mut excluded = state
+                .excluded_domains
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             *excluded = cleaned;
@@ -1084,6 +1117,68 @@ fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
         .excluded_bundle_ids
         .lock()
         .map(|ids| ids.iter().any(|id| id == bundle_id))
+        .unwrap_or(false)
+}
+
+/// The host part of whatever the user typed. People paste a full URL as often
+/// as they type a bare host, and asking them to know the difference is a way
+/// to get an exclusion that silently never matches.
+fn normalize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('/');
+    let without_scheme = trimmed
+        .split_once("://")
+        .map_or(trimmed, |(_, rest)| rest);
+    // Drop userinfo, then path/query/fragment, then port.
+    let after_userinfo = without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, rest)| rest);
+    let host = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        // An IPv6 literal has colons of its own; only strip a numeric port.
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(after_userinfo.split(['/', '?', '#']).next().unwrap_or_default(), |(head, _)| head);
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(host)
+}
+
+fn normalize_domains(inputs: Vec<String>) -> Vec<String> {
+    let mut cleaned = inputs
+        .iter()
+        .filter_map(|input| normalize_domain(input))
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
+}
+
+/// Subdomains are covered: excluding `example.com` has to stop
+/// `mail.example.com` too, or the exclusion is a false promise. It must not
+/// stop `notexample.com`, which is a different site entirely.
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn is_excluded_url(state: &AppState, url: Option<&str>) -> bool {
+    let Some(host) = url.and_then(normalize_domain) else {
+        return false;
+    };
+    state
+        .excluded_domains
+        .lock()
+        .map(|domains| {
+            domains
+                .iter()
+                .any(|domain| host_matches_domain(&host, domain))
+        })
         .unwrap_or(false)
 }
 
@@ -1354,7 +1449,12 @@ async fn import_artifact(
         ArtifactKind::Accessibility => {
             let metadata =
                 serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
-            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref()) {
+            // The URL only exists in this snapshot, so a page on an excluded
+            // host is identified here or not at all — the screen JPEG has
+            // already landed by now and has to be deleted, not skipped.
+            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref())
+                || is_excluded_url(state, metadata.url.as_deref())
+            {
                 if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
                 {
                     let _ = state.store.delete_moment_and_artifacts(&moment_id);
@@ -1395,6 +1495,10 @@ async fn import_artifact(
 struct AccessibilityMetadata {
     application_name: Option<String>,
     bundle_identifier: Option<String>,
+    /// Present when the foreground app exposes one — browsers do, via the web
+    /// area's `AXURL`. This is the only place a page's address is visible;
+    /// the screenshot itself carries no such thing.
+    url: Option<String>,
 }
 
 fn attach_accessibility_artifact(
@@ -1764,6 +1868,45 @@ async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
 /// Closes the loop the day panel was missing: T1 has been marking slots ready
 /// since capture began, but nothing ever ran T2 on them, so every row fell back
 /// to a bare app list. This is the only automatic caller.
+/// Keeps the text DF corpus current: the background frequencies that let T1
+/// tell a slot's own content from the user's everyday chrome. Small batches
+/// on a timer — a cold vault backfills two weeks over a few minutes without
+/// ever holding the store lock long.
+fn spawn_text_df_maintainer(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        // After the model runtimes settle; this touches only SQLite.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+        let mut total = 0_usize;
+        loop {
+            let processed =
+                match state.store.advance_text_df(now_ms(), interval_ms, 12) {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        eprintln!("text.df advance failed: {error}");
+                        0
+                    }
+                };
+            total += processed;
+            if processed > 0 && total % 96 < 12 {
+                eprintln!("text.df corpus advanced ({total} slots this run)");
+            }
+            // Drained: check twice a minute for newly closed slots. Behind:
+            // keep pulling with short pauses so a backfill finishes promptly.
+            let pause = if processed == 0 { 30 } else { 2 };
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(pause)) => {}
+            }
+        }
+    });
+}
+
 fn spawn_slot_summarizer(state: Arc<AppState>) {
     let period = Duration::from_secs(
         std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
@@ -1920,7 +2063,7 @@ fn slot_prompt_for(
     state: &AppState,
     at_ms: i64,
 ) -> Result<serde_json::Value, afterray_store::StoreError> {
-    let card = slot_card_for(state, at_ms)?;
+    let mut card = slot_card_for(state, at_ms)?;
     let stored = state
         .languages
         .lock()
@@ -1930,7 +2073,15 @@ fn slot_prompt_for(
         .store
         .previous_slot_titles(card.slot_start_ms, 3)
         .unwrap_or_default();
-    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language);
+    // History-aware rendering: the DF corpus decides which lines carry
+    // information and which are the user's everyday chrome. An empty corpus
+    // (first run) degrades to pattern-and-position scoring, never an error.
+    let background = state.store.background_stats(&card).unwrap_or_else(|error| {
+        eprintln!("slot.prompt background stats unavailable: {error}");
+        afterray_store::infoscore::BackgroundStats::empty()
+    });
+    afterray_store::attach_entity_candidates(&mut card, &background);
+    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background);
     eprintln!(
         "slot.prompt slot={} language={language} user_chars={}",
         card.slot_start_ms,
@@ -2140,6 +2291,71 @@ mod tests {
     use super::*;
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
+
+    /// People paste what is in the address bar. Every one of these means the
+    /// same site, and rejecting any of them produces an exclusion that looks
+    /// saved and silently never fires.
+    #[test]
+    fn a_domain_is_recognised_however_it_was_typed() {
+        for input in [
+            "example.com",
+            "  example.com  ",
+            "EXAMPLE.com",
+            "https://example.com",
+            "https://example.com/",
+            "http://example.com/inbox?q=1#top",
+            "example.com:8443",
+            "https://user:pw@example.com/path",
+            "example.com.",
+        ] {
+            assert_eq!(
+                normalize_domain(input).as_deref(),
+                Some("example.com"),
+                "{input}"
+            );
+        }
+    }
+
+    /// A bare word is a typo, not a host. Storing it would leave a row in the
+    /// list that can never match anything.
+    #[test]
+    fn things_that_are_not_hosts_are_rejected() {
+        for input in ["", "   ", "localhost", "https://", "/", "just some text"] {
+            assert_eq!(normalize_domain(input), None, "{input}");
+        }
+    }
+
+    /// Excluding a site has to cover its subdomains, or the promise is false:
+    /// most of what a user wants hidden lives on `mail.` or `app.`.
+    #[test]
+    fn excluding_a_domain_covers_its_subdomains() {
+        assert!(host_matches_domain("example.com", "example.com"));
+        assert!(host_matches_domain("mail.example.com", "example.com"));
+        assert!(host_matches_domain("a.b.example.com", "example.com"));
+    }
+
+    /// And must not reach past the dot. `notexample.com` is somebody else's
+    /// site, and a suffix test written with `ends_with` alone would eat it.
+    #[test]
+    fn excluding_a_domain_stops_at_the_label_boundary() {
+        assert!(!host_matches_domain("notexample.com", "example.com"));
+        assert!(!host_matches_domain("example.com.evil.test", "example.com"));
+        assert!(!host_matches_domain("example.co", "example.com"));
+        // The narrower entry must not be widened by the broader one.
+        assert!(!host_matches_domain("example.com", "mail.example.com"));
+    }
+
+    #[test]
+    fn the_saved_list_is_deduplicated_and_ordered() {
+        let cleaned = normalize_domains(vec![
+            "https://example.com/inbox".into(),
+            "EXAMPLE.COM".into(),
+            "  ".into(),
+            "bank.test".into(),
+            "not a host".into(),
+        ]);
+        assert_eq!(cleaned, vec!["bank.test".to_owned(), "example.com".to_owned()]);
+    }
 
     /// A machine that should be summarising: plugged in, charged, untouched,
     /// quiet. Each test spoils exactly one of those.

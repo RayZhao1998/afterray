@@ -181,11 +181,21 @@ impl ToolHost<'_> {
             .and_then(Value::as_i64)
             .ok_or_else(|| "get_slot_card requires at_ms".to_owned())?;
         self.check_range(at_ms, at_ms)?;
-        let card = self
+        let mut card = self
             .store
             .slot_card(at_ms, 10_000)
             .map_err(|e| e.to_string())?;
-        Ok(afterray_store::render_t2_prompt(&card, &[], "the user's language"))
+        let background = self
+            .store
+            .background_stats(&card)
+            .unwrap_or_else(|_| afterray_store::infoscore::BackgroundStats::empty());
+        afterray_store::attach_entity_candidates(&mut card, &background);
+        Ok(afterray_store::render_t2_prompt(
+            &card,
+            &[],
+            "the user's language",
+            &background,
+        ))
     }
 
     fn get_moment(&self, args: &Value) -> Result<String, String> {

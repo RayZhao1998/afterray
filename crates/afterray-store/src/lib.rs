@@ -48,6 +48,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
 mod gop;
+pub mod infoscore;
 mod jpeg;
 mod memory;
 mod slot;
@@ -72,11 +73,12 @@ pub use slot::{
     AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
     SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
     SlotSummaryState, StoredSlotOverlay, T2Card, T2_SYSTEM_PROMPT, TimelineEntry,
-    assemble_day_summary, build_slot_card, extract_json_object, local_day_bounds, local_day_for,
-    parse_t2_card, render_t2_prompt, shorten_place, slot_clock_label, slot_start_for,
+    assemble_day_summary, attach_entity_candidates, build_slot_card, dedup_key_of,
+    extract_json_object, local_day_bounds, local_day_for, parse_t2_card, render_t2_prompt,
+    shorten_place, slot_clock_label, slot_start_for,
 };
 
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// `text_evidence.source` for the synthetic rows that put window titles in FTS.
 pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
@@ -929,6 +931,132 @@ impl Vault {
             idle_ms,
             capture_interval_ms,
         ))
+    }
+
+    /// Folds up to `max_slots` closed-but-uncounted slots into the text DF
+    /// corpus, oldest first, and returns how many were processed. Called
+    /// repeatedly from a background task until it returns 0; each call is one
+    /// short transaction, so a cold-start backfill never blocks a reader.
+    ///
+    /// A slot enters the corpus once, decided by the watermark. Only closed
+    /// slots count — the half hour still being written must not see itself
+    /// in its own background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be read or written.
+    pub fn advance_text_df(
+        &self,
+        now_ms: i64,
+        capture_interval_ms: i64,
+        max_slots: usize,
+    ) -> Result<usize, StoreError> {
+        const BACKFILL_REACH_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+        let current_slot = slot::slot_start_for(now_ms);
+        let floor = now_ms.saturating_sub(BACKFILL_REACH_MS);
+        let mut watermark = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement =
+                connection.prepare("SELECT watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => row.get::<_, i64>(0)?,
+                None => slot::slot_start_for(floor),
+            }
+        }
+        .max(slot::slot_start_for(floor));
+
+        let mut processed = 0_usize;
+        while processed < max_slots {
+            if watermark + slot::SLOT_DURATION_MS > current_slot.min(now_ms) {
+                break; // only slots that have fully closed
+            }
+            let slot_start = watermark;
+            watermark += slot::SLOT_DURATION_MS;
+            let rows = self.slot_moment_rows(slot_start, slot_start + slot::SLOT_DURATION_MS)?;
+            let (line_keys, tokens) = slot::df_contribution(&rows);
+            let connection = self.connection.lock().unwrap();
+            let tx = connection.unchecked_transaction()?;
+            {
+                let mut upsert = tx.prepare_cached(
+                    "INSERT INTO text_df (kind, key, df, last_seen_ms) VALUES (?1, ?2, 1, ?3)
+                     ON CONFLICT(kind, key) DO UPDATE SET
+                       df = df + 1, last_seen_ms = excluded.last_seen_ms",
+                )?;
+                for key in &line_keys {
+                    upsert.execute(params![0_i64, key, slot_start])?;
+                }
+                for token in &tokens {
+                    upsert.execute(params![1_i64, token, slot_start])?;
+                }
+            }
+            let occupied = i64::from(!line_keys.is_empty() || !tokens.is_empty());
+            tx.execute(
+                "INSERT INTO text_df_meta (id, watermark_ms, slot_count)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   watermark_ms = excluded.watermark_ms,
+                   slot_count = text_df_meta.slot_count + ?2",
+                params![watermark, occupied],
+            )?;
+            tx.commit()?;
+            processed += 1;
+        }
+        let _ = capture_interval_ms; // rows query is interval-independent
+        Ok(processed)
+    }
+
+    /// Batch DF lookup for exactly the keys and tokens one card needs.
+    /// Loading the whole corpus would be megabytes; a card asks after a few
+    /// thousand strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn background_stats(
+        &self,
+        card: &slot::SlotCard,
+    ) -> Result<infoscore::BackgroundStats, StoreError> {
+        let (line_keys, tokens) = slot::card_df_queries(card);
+        let connection = self.connection.lock().unwrap();
+        let (slots, watermark_ms) = {
+            let mut statement = connection
+                .prepare("SELECT slot_count, watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                None => (0, i64::MIN),
+            }
+        };
+        let mut stats = infoscore::BackgroundStats {
+            slots: u32::try_from(slots.max(0)).unwrap_or(u32::MAX),
+            corpus_includes_slot: card.slot_end_ms <= watermark_ms,
+            line_df: HashMap::new(),
+            token_df: HashMap::new(),
+        };
+        let mut lookup = connection
+            .prepare_cached("SELECT df FROM text_df WHERE kind = ?1 AND key = ?2")?;
+        for key in line_keys {
+            if let Some(df) = lookup
+                .query_row(params![0_i64, &key], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .line_df
+                    .insert(key, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        for token in tokens {
+            if let Some(df) = lookup
+                .query_row(params![1_i64, &token], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .token_df
+                    .insert(token, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        Ok(stats)
     }
 
     /// Persists a successful T2 card. Re-running the same slot increments
@@ -2569,6 +2697,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_12(connection)?;
     migrate_schema_13(connection)?;
     migrate_schema_14(connection)?;
+    migrate_schema_15(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2964,6 +3093,28 @@ fn migrate_schema_14(connection: &Connection) -> Result<(), StoreError> {
            ON slot_summaries(slot_start_ms);
          CREATE INDEX IF NOT EXISTS slot_summaries_day
            ON slot_summaries(local_day, slot_start_ms);",
+    )?;
+    Ok(())
+}
+
+/// Document frequencies of screen-text lines and tokens over the user's own
+/// slot history — the background corpus for `infoscore`. `kind` 0 is a line
+/// dedup key, 1 is a token. `text_df_meta` remembers how far the corpus has
+/// been built so maintenance is incremental.
+fn migrate_schema_15(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS text_df (
+           kind          INTEGER NOT NULL,
+           key           TEXT NOT NULL,
+           df            INTEGER NOT NULL,
+           last_seen_ms  INTEGER NOT NULL,
+           PRIMARY KEY (kind, key)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS text_df_meta (
+           id            INTEGER PRIMARY KEY CHECK (id = 1),
+           watermark_ms  INTEGER NOT NULL,
+           slot_count    INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }
