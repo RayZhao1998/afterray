@@ -151,6 +151,7 @@ public extension DaySummary {
                 // Untitled rows carry their reason in the category slot, so the
                 // lab shows every badge the panel can render, not just one.
                 state: title == nil ? category : "done",
+                anchorMomentId: "mock-\(abs(start / slot) % 12)",
                 facts: DaySlotFacts(apps: apps, momentCount: 12),
                 title: title,
                 bullets: title.map { ["\($0)"] },

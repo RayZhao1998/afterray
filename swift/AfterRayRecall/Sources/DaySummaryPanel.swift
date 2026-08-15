@@ -229,12 +229,17 @@ private struct DaySummaryRow: View {
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+            // Top-aligned, never baseline: an image's "baseline" is its
+            // bottom edge, so baseline alignment shoved every thumbnail
+            // above its own row and inflated the row height — the giant
+            // inter-row voids in the before state were exactly that.
+            HStack(alignment: .top, spacing: 10) {
                 Text(text.time)
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
                     .frame(width: 42, alignment: .leading)
+                    .padding(.top, 2) // optically align with the title's cap height
                 VStack(alignment: .leading, spacing: 4) {
                     Text(text.primary)
                         .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
@@ -262,27 +267,36 @@ private struct DaySummaryRow: View {
                         .padding(.top, 1)
                     }
 
-                    if let badge = text.badge {
-                        Text(badge)
-                            .font(.system(size: 9, weight: .semibold, design: .rounded))
-                            .foregroundStyle(badgeTint(badge).opacity(0.9))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(badgeTint(badge).opacity(0.14), in: Capsule())
-                            .accessibilityLabel("Summary status: \(badge)")
-                    }
-
-                    if !slot.facts.apps.isEmpty {
-                        SlotAppIconStrip(apps: slot.facts.apps)
-                            .padding(.top, 2)
+                    // One metadata line: status and app icons are both
+                    // "about this row", so they share a row instead of
+                    // stacking — grouped by proximity, and the row stays
+                    // short for unsummarised slots.
+                    if text.badge != nil || !slot.facts.apps.isEmpty {
+                        HStack(spacing: 8) {
+                            if let badge = text.badge {
+                                Text(badge)
+                                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(badgeTint(badge).opacity(0.9))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(badgeTint(badge).opacity(0.14), in: Capsule())
+                                    .accessibilityLabel("Summary status: \(badge)")
+                            }
+                            if !slot.facts.apps.isEmpty {
+                                SlotAppIconStrip(apps: slot.facts.apps)
+                            }
+                        }
+                        .padding(.top, 1)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 if let anchorMomentId = slot.anchorMomentId, let thumbnailLoader {
                     SlotAnchorThumbnail(
                         momentID: anchorMomentId,
                         loader: thumbnailLoader
                     )
+                    .padding(.top, 1)
                 }
             }
             .padding(.leading, 12)
@@ -373,29 +387,47 @@ private struct SlotAppIconStrip: View {
 }
 
 /// One icon, loaded off the main thread on first sight. A row scrolling in
-/// must never pay Launch Services on the render loop.
+/// must never pay Launch Services on the render loop. An app whose icon
+/// cannot resolve (uninstalled since capture) collapses to nothing — an
+/// empty placeholder square communicates only "something failed here".
 private struct SlotAppIcon: View {
     let app: DayAppFact
-    @State private var icon: NSImage?
+
+    private enum Resolution: Equatable {
+        case loading
+        case loaded(NSImage)
+        case absent
+    }
+
+    @State private var resolution = Resolution.loading
 
     var body: some View {
-        Group {
-            if let icon {
-                Image(nsImage: icon)
-                    .resizable()
-                    .interpolation(.medium)
-            } else {
-                Color.white.opacity(0.06)
-            }
+        switch resolution {
+        case .loading:
+            Color.clear
+                .frame(width: 14, height: 14)
+                .task(id: app.bundleIdentifier) { await resolve() }
+        case .loaded(let icon):
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.medium)
+                .frame(width: 14, height: 14)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
+        case .absent:
+            EmptyView()
         }
-        .frame(width: 14, height: 14)
-        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
-        .task(id: app.bundleIdentifier) {
-            icon = AppIconLookup.cachedIcon(bundleIdentifier: app.bundleIdentifier)
-            if icon == nil {
-                icon = await AppIconLookup.iconAsync(bundleIdentifier: app.bundleIdentifier)
-            }
+    }
+
+    private func resolve() async {
+        if let hit = AppIconLookup.cachedIcon(bundleIdentifier: app.bundleIdentifier) {
+            resolution = .loaded(hit)
+            return
+        }
+        if let icon = await AppIconLookup.iconAsync(bundleIdentifier: app.bundleIdentifier) {
+            resolution = .loaded(icon)
+        } else {
+            resolution = .absent
         }
     }
 }
