@@ -1,6 +1,22 @@
 import AppKit
 import SwiftUI
 
+enum HistoryDocumentScroll {
+    /// Places the followed row above centre, leaving more of the older
+    /// timeline visible beneath it as the user scrubs backwards.
+    private static let viewportAnchor: CGFloat = 0.35
+
+    static func targetOriginY(
+        highlightRect: NSRect,
+        viewportHeight: CGFloat,
+        documentHeight: CGFloat
+    ) -> CGFloat {
+        let maximumOrigin = max(documentHeight - viewportHeight, 0)
+        let desiredOrigin = highlightRect.midY - viewportHeight * viewportAnchor
+        return min(max(desiredOrigin, 0), maximumOrigin)
+    }
+}
+
 /// The text view that draws the timeline rule behind the document.
 ///
 /// The spine has to be drawn rather than typeset: a continuous line down a
@@ -210,8 +226,9 @@ struct HistoryDocumentView: NSViewRepresentable {
                 refreshHighlight()
             }
             if followRequested {
-                lastFollowPulse = newView.followPulse
-                followPlayhead()
+                if followPlayhead() {
+                    lastFollowPulse = newView.followPulse
+                }
             }
         }
 
@@ -271,21 +288,45 @@ struct HistoryDocumentView: NSViewRepresentable {
                   let container = textView.textContainer,
                   let range = layout.slotRanges[slotStartMs]
             else { return nil }
+            layoutManager.ensureLayout(for: container)
             let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
             let origin = textView.textContainerOrigin
             return rect.offsetBy(dx: origin.x, dy: origin.y)
         }
 
-        private func followPlayhead() {
+        @discardableResult
+        private func followPlayhead() -> Bool {
             guard let textView,
+                  let scroll,
                   !ScrollFenceRegistry.shared.pointerInsideAnyFence(),
                   let current = highlightedSlot ?? view.summaries.lazy.compactMap({
                       DaySummaryLayout.highlightedSlotStartMs(playheadMs: self.view.playheadMs, slots: $0.slots)
                   }).first,
-                  let range = layout.slotRanges[current]
-            else { return }
-            textView.scrollRangeToVisible(range)
+                  let highlightRect = boundingRect(ofSlot: current),
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer
+            else { return false }
+
+            layoutManager.ensureLayout(for: container)
+            let contentHeight = layoutManager.usedRect(for: container).height
+                + textView.textContainerInset.height * 2
+            let viewportHeight = scroll.contentView.bounds.height
+            guard viewportHeight > 0 else { return false }
+            if textView.frame.height < contentHeight {
+                textView.setFrameSize(NSSize(width: textView.frame.width, height: contentHeight))
+            }
+            let originY = HistoryDocumentScroll.targetOriginY(
+                highlightRect: highlightRect,
+                viewportHeight: viewportHeight,
+                documentHeight: max(textView.bounds.height, contentHeight)
+            )
+            scroll.contentView.scroll(to: NSPoint(
+                x: scroll.contentView.bounds.origin.x,
+                y: originY
+            ))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            return true
         }
 
         // ---------------------------------------------------- attachments
