@@ -72,13 +72,14 @@ pub type MomentAt = (String, i64);
 pub use slot::{
     AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
     SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
-    SlotSummaryState, StoredSlotOverlay, T2Card, T2_SYSTEM_PROMPT, TimelineEntry,
-    assemble_day_summary, attach_entity_candidates, build_slot_card, dedup_key_of,
-    extract_json_object, local_day_bounds, local_day_for, parse_t2_card, render_t2_prompt,
-    shorten_place, slot_clock_label, slot_start_for,
+    SlotSummaryState, StoredSlotOverlay, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
+    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, TimelineEntry, assemble_day_summary,
+    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object,
+    local_day_bounds, local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt,
+    shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// `text_evidence.source` for the synthetic rows that put window titles in FTS.
 pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
@@ -1128,6 +1129,48 @@ impl Vault {
         Ok(())
     }
 
+    /// Persists a v2 card. Bullets are derived from threads so every v1
+    /// reader — the day panel, old CLI output — keeps working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary_v2(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2CardV2,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let compat = slot::T2Card {
+            artifacts: Vec::new(),
+            title: t2.title.clone(),
+            bullets: t2.derived_bullets(),
+            category: t2.category.clone(),
+            confidence: t2.confidence,
+        };
+        self.put_t2_summary(card, &compat, producer, produced_at_ms, latency_ms)?;
+        self.connection.lock().unwrap().execute(
+            "UPDATE slot_summaries SET
+                description = ?2,
+                threads_json = ?3,
+                entities_json = ?4,
+                decisions_json = ?5,
+                not_captured_json = ?6
+              WHERE slot_start_ms = ?1",
+            params![
+                card.slot_start_ms,
+                t2.description.trim(),
+                serde_json::to_string(&t2.threads).ok(),
+                serde_json::to_string(&t2.entities).ok(),
+                serde_json::to_string(&t2.decisions).ok(),
+                serde_json::to_string(&t2.not_captured).ok(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Neighbouring T2 titles, oldest first. Fed to the next T2 pass as a
     /// negative constraint so adjacent cards do not copy each other's wording.
     ///
@@ -1213,7 +1256,9 @@ impl Vault {
     ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT slot_start_ms, state, title, bullets_json, category
+            "SELECT slot_start_ms, state, title, bullets_json, category,
+                    description, threads_json, entities_json, decisions_json,
+                    not_captured_json
                FROM slot_summaries
               WHERE local_day = ?1
               ORDER BY slot_start_ms",
@@ -1224,6 +1269,14 @@ impl Vault {
             let title: Option<String> = row.get(2)?;
             let bullets_json: Option<String> = row.get(3)?;
             let category: Option<String> = row.get(4)?;
+            let description: Option<String> = row.get(5)?;
+            let threads_json: Option<String> = row.get(6)?;
+            let entities_json: Option<String> = row.get(7)?;
+            let decisions_json: Option<String> = row.get(8)?;
+            let not_captured_json: Option<String> = row.get(9)?;
+            let parse_list = |json: Option<String>| {
+                json.and_then(|raw| serde_json::from_str(&raw).ok())
+            };
             let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
             Ok((
                 start,
@@ -1232,6 +1285,13 @@ impl Vault {
                     title,
                     bullets,
                     category,
+                    description: description.filter(|text| !text.is_empty()),
+                    threads: threads_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    entities: entities_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    decisions: parse_list(decisions_json),
+                    not_captured: parse_list(not_captured_json),
                 },
             ))
         })?;
@@ -2698,6 +2758,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_13(connection)?;
     migrate_schema_14(connection)?;
     migrate_schema_15(connection)?;
+    migrate_schema_16(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3094,6 +3155,33 @@ fn migrate_schema_14(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS slot_summaries_day
            ON slot_summaries(local_day, slot_start_ms);",
     )?;
+    Ok(())
+}
+
+/// The v2 card columns: description, per-thread prose with frame citations,
+/// verbatim entities, decisions, and honest gaps. Additive so v1 rows keep
+/// reading; `bullets_json` stays derived for old readers.
+fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in [
+        "description TEXT",
+        "threads_json TEXT",
+        "entities_json TEXT",
+        "decisions_json TEXT",
+        "not_captured_json TEXT",
+    ] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE slot_summaries ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 

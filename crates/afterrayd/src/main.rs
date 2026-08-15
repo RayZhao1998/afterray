@@ -307,22 +307,30 @@ fn default_language() -> String {
 /// Resolves a stored language preference to the English name a model should
 /// be told to write in. `auto` follows the system language, defaulting to
 /// English when the locale is unset or unrecognised.
+/// The explicit setting always wins. `auto` asks macOS for the user's
+/// ordered language list — a GUI-launched daemon has no `LANG`, so the old
+/// environment sniffing silently answered English for everyone.
 fn resolve_summary_language(stored: &str) -> String {
     if !stored.eq_ignore_ascii_case("auto") {
         return afterray_protocol::language_display_name(stored);
     }
-    let locale = std::env::var("LANG")
-        .or_else(|_| std::env::var("LC_ALL"))
-        .unwrap_or_default();
-    let tag = locale.split(['.', '_']).next().unwrap_or("").to_lowercase();
-    let region = locale.split('.').next().unwrap_or("").to_lowercase();
-    let code = match (tag.as_str(), region.as_str()) {
-        ("zh", region) if region.contains("tw") || region.contains("hk") => "zh-Hant",
-        ("zh", _) => "zh-Hans",
-        (other, _) if !other.is_empty() => other,
-        _ => "en",
+    let tag = afterray_platform_macos::preferred_languages()
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let code = if tag.starts_with("zh") {
+        if tag.contains("hant") || tag.contains("-tw") || tag.contains("-hk") {
+            "zh-Hant".to_owned()
+        } else {
+            "zh-Hans".to_owned()
+        }
+    } else if let Some(primary) = tag.split('-').next().filter(|part| !part.is_empty()) {
+        primary.to_owned()
+    } else {
+        "en".to_owned()
     };
-    afterray_protocol::language_display_name(code)
+    afterray_protocol::language_display_name(&code)
 }
 
 const fn default_record_audio() -> bool {
@@ -1630,91 +1638,91 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
 /// through the configured model, persist the card. Shared by the RPC and the
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
+    /// Rounds are model calls, so this bounds both cost and transcript
+    /// growth. The transcript is append-only — never clipped — so a
+    /// prefix-caching runtime re-prefills only each round's delta.
+    const T2_MAX_ROUNDS: usize = 8;
+
     let started = std::time::Instant::now();
-    let prompt = slot_prompt_for(state, at_ms).map_err(|error| error.to_string())?;
-    let slot_start_ms = prompt
-        .get("slot_start_ms")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(at_ms);
-    let user = prompt
-        .get("user")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let system = prompt
-        .get("system")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let inputs = slot_t2_inputs(state, at_ms).map_err(|error| error.to_string())?;
+    let slot_start_ms = inputs.card.slot_start_ms;
 
     ensure_remote_llm_model(state).await;
-    let job_id = state
-        .models
-        .submit(ModelInput::Llm {
-            prompt: user.clone(),
-            system: Some(system),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let snapshot = state
-        .models
-        .wait(&job_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    if snapshot.state != JobState::Done {
-        return Err(snapshot
-            .last_error
-            .unwrap_or_else(|| "t2 job did not complete".to_owned()));
-    }
-    let Some(afterray_models::ModelOutput::Llm { text: raw }) = snapshot.output else {
-        return Err("t2 job returned a non-text output".to_owned());
+    let tools = SlotT2Tools {
+        store: &state.store,
+        card: &inputs.card,
     };
+    let turn = agent::run_agent_loop(
+        &state.models,
+        &tools,
+        inputs.system,
+        &inputs.user,
+        agent::AgentLoopConfig {
+            max_rounds: T2_MAX_ROUNDS,
+            clip_chars: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let parsed = afterray_store::parse_t2_card(&raw);
-    let card_value = parsed.as_ref().and_then(|card| serde_json::to_value(card).ok());
+    let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
+    // Grounding: a claim may come from the prompt or from anything a tool
+    // returned this turn. Entities that match neither are dropped in code —
+    // the check the prompt alone can never be.
+    let verification = parsed.as_mut().map(|card| {
+        let mut evidence = inputs.user.clone();
+        for result in &turn.tool_results {
+            evidence.push('\n');
+            evidence.push_str(result);
+        }
+        let valid_ids: std::collections::HashSet<String> =
+            inputs.card.evidence.moment_ids.iter().cloned().collect();
+        afterray_store::verify_t2_card(card, &evidence, &valid_ids)
+    });
+
+    let tool_names: Vec<&str> = turn
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
     eprintln!(
-        "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
-         parsed={}",
-        snapshot.adapter,
-        user.chars().count(),
-        raw.chars().count(),
+        "slot.t2 slot={slot_start_ms} prompt_chars={} rounds={} tools={tool_names:?} \
+         out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
+        inputs.user.chars().count(),
+        turn.tool_calls.len() + 1,
+        turn.answer.chars().count(),
         parsed.is_some(),
+        verification
+            .as_ref()
+            .map_or(0, |report| report.entities_dropped.len()),
     );
 
-    if let Some(t2) = parsed.as_ref() {
-        match slot_card_for(state, at_ms) {
-            Ok(card) => {
-                if let Err(error) = state.store.put_t2_summary(
-                    &card,
-                    t2,
-                    &snapshot.adapter,
-                    now_ms(),
-                    i64::try_from(latency_ms).ok(),
-                ) {
-                    eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
-                }
-            }
-            Err(error) => {
-                eprintln!("slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}");
-            }
-        }
-    }
-
-    if parsed.is_none() {
+    let Some(t2) = parsed else {
         return Err(format!(
             "the model returned no parseable T2 card ({} chars)",
-            raw.chars().count()
+            turn.answer.chars().count()
         ));
+    };
+    if let Err(error) = state.store.put_t2_summary_v2(
+        &inputs.card,
+        &t2,
+        "t2-agent",
+        now_ms(),
+        i64::try_from(latency_ms).ok(),
+    ) {
+        eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
     }
 
     Ok(serde_json::json!({
         "slot_start_ms": slot_start_ms,
-        "model": snapshot.adapter,
         "latency_ms": latency_ms,
-        "prompt_chars": user.chars().count(),
-        "card": card_value,
-        "raw": raw,
+        "prompt_chars": inputs.user.chars().count(),
+        "card": serde_json::to_value(&t2).ok(),
+        "tool_calls": serde_json::to_value(&turn.tool_calls).ok(),
+        "tool_results": turn.tool_results,
+        "verification": serde_json::to_value(&verification).ok(),
+        "raw": turn.answer,
     }))
 }
 
@@ -2056,13 +2064,18 @@ fn slot_card_for(
     Ok(card)
 }
 
-/// Renders the full T2 prompt: system instructions plus the JSON card view.
-/// `prev_cards` will carry neighbouring T2 titles once slot summaries are
-/// persisted; until then it is empty.
-fn slot_prompt_for(
+/// Everything one T2 pass needs: the card (for the tool host and
+/// persistence) and the rendered prompt pair.
+struct SlotT2Inputs {
+    card: afterray_store::SlotCard,
+    system: &'static str,
+    user: String,
+}
+
+fn slot_t2_inputs(
     state: &AppState,
     at_ms: i64,
-) -> Result<serde_json::Value, afterray_store::StoreError> {
+) -> Result<SlotT2Inputs, afterray_store::StoreError> {
     let mut card = slot_card_for(state, at_ms)?;
     let stored = state
         .languages
@@ -2087,14 +2100,153 @@ fn slot_prompt_for(
         card.slot_start_ms,
         user.chars().count()
     );
+    Ok(SlotT2Inputs {
+        card,
+        system: afterray_store::T2_SYSTEM_PROMPT_V2,
+        user,
+    })
+}
+
+/// Renders the full T2 prompt: system instructions plus the JSON card view.
+fn slot_prompt_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<serde_json::Value, afterray_store::StoreError> {
+    let inputs = slot_t2_inputs(state, at_ms)?;
     Ok(serde_json::json!({
-        "slot_start_ms": card.slot_start_ms,
-        "slot_end_ms": card.slot_end_ms,
-        "local_day": card.local_day,
-        "state": card.state,
-        "system": afterray_store::T2_SYSTEM_PROMPT,
-        "user": user,
+        "slot_start_ms": inputs.card.slot_start_ms,
+        "slot_end_ms": inputs.card.slot_end_ms,
+        "local_day": inputs.card.local_day,
+        "state": inputs.card.state,
+        "system": inputs.system,
+        "user": inputs.user,
     }))
+}
+
+/// The slot-scoped tools a T2 agent may call. Every tool reads only this
+/// slot's evidence; the summariser has no business elsewhere in the vault.
+struct SlotT2Tools<'a> {
+    store: &'a afterray_store::Vault,
+    card: &'a afterray_store::SlotCard,
+}
+
+/// One page of a paginated tool result.
+const T2_TOOL_PAGE_CHARS: usize = 3_000;
+
+impl SlotT2Tools<'_> {
+    fn run_by_id(&self, id: &str) -> Option<&afterray_store::RunRow> {
+        self.card.timeline.iter().find_map(|entry| match entry {
+            afterray_store::TimelineEntry::Run(run) if run.moment_id == id => Some(run),
+            _ => None,
+        })
+    }
+
+    fn get_run_text(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_run_text requires id (a run id from the input)".to_owned())?;
+        let offset = args
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let run = self
+            .run_by_id(id)
+            .ok_or_else(|| format!("no run with id `{id}` in this slot"))?;
+        let full = run.lines.join("\n");
+        let total = full.chars().count();
+        if offset >= total {
+            return Ok(format!("(no text beyond offset {offset}; total {total} chars)"));
+        }
+        let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
+        let next = offset + page.chars().count();
+        if next < total {
+            Ok(format!(
+                "{page}\n…(continues; call again with offset {next}; total {total} chars)"
+            ))
+        } else {
+            Ok(page)
+        }
+    }
+
+    fn get_transcript(&self) -> Result<String, String> {
+        let rows = self
+            .store
+            .transcripts_in_range(self.card.slot_start_ms, self.card.slot_end_ms, 400)
+            .map_err(|error| error.to_string())?;
+        if rows.is_empty() {
+            return Ok("(no speech was recorded in this half hour)".to_owned());
+        }
+        let mut out = String::new();
+        for (at_ms, track, text) in rows {
+            let line = format!(
+                "{} {}: {}\n",
+                afterray_store::slot_clock_label(at_ms),
+                track,
+                text.trim()
+            );
+            if out.chars().count() + line.chars().count() > T2_TOOL_PAGE_CHARS {
+                out.push_str("…(transcript truncated)\n");
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+
+    fn get_ocr(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_ocr requires id (a run id from the input)".to_owned())?;
+        // Accept any moment in the slot, not only run anchors: the model may
+        // hold an id from a thread citation.
+        if !self.card.evidence.moment_ids.iter().any(|held| held == id) {
+            return Err(format!("`{id}` is not a frame of this slot"));
+        }
+        let row = self
+            .store
+            .ocr_evidence_for_moment(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("no OCR stored for `{id}`"))?;
+        let (text, _layout) = row;
+        let clipped: String = text.chars().take(T2_TOOL_PAGE_CHARS).collect();
+        Ok(clipped)
+    }
+
+    fn get_prev_cards(&self, args: &serde_json::Value) -> Result<String, String> {
+        let n = args
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 8) as usize;
+        let cards = self
+            .store
+            .previous_slot_titles(self.card.slot_start_ms, n)
+            .map_err(|error| error.to_string())?;
+        if cards.is_empty() {
+            return Ok("(no earlier cards)".to_owned());
+        }
+        Ok(cards
+            .into_iter()
+            .map(|card| format!("{}: {}", card.from_label, card.title))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+impl agent::ToolSurface for SlotT2Tools<'_> {
+    async fn invoke(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        match name {
+            "get_run_text" => self.get_run_text(args),
+            "get_transcript" => self.get_transcript(),
+            "get_ocr" => self.get_ocr(args),
+            "get_prev_cards" => self.get_prev_cards(args),
+            other => Err(format!(
+                "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
+            )),
+        }
+    }
 }
 
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
@@ -2461,6 +2613,11 @@ mod tests {
             title: None,
             bullets: None,
             category: None,
+            description: None,
+            threads: None,
+            entities: None,
+            decisions: None,
+            not_captured: None,
         }
     }
 

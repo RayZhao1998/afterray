@@ -20,6 +20,7 @@ import os
 import pathlib
 import re
 import socket
+import subprocess
 import sys
 import time
 import unicodedata
@@ -258,10 +259,17 @@ def cmd_run(args: argparse.Namespace) -> None:
                 "metrics": None,
             }
             if card:
+                # Grounding evidence is everything the model saw: the prompt
+                # plus whatever its tools returned during the turn.
+                evidence = "\n".join([user_text, *(data.get("tool_results") or [])])
                 row["metrics"] = {
-                    **fidelity(card, user_text),
+                    **fidelity(card, evidence),
                     "han_ratio": han_ratio(card_text(card)),
                     "title": card.get("title"),
+                    "tool_rounds": len(data.get("tool_calls") or []),
+                    "entities_dropped_by_daemon": len(
+                        ((data.get("verification") or {}).get("entities_dropped")) or []
+                    ),
                 }
             rows.append(row)
             status = "ok" if row["ok"] else f"FAIL {row['error']}"
@@ -314,6 +322,149 @@ def cmd_report(args: argparse.Namespace) -> None:
     summarise([latest_for_tag(tag) for tag in args.tags])
 
 
+# ------------------------------------------------------- worktree baseline
+
+WORKTREE = REPO / ".scratch/baseline-2c202fa"
+DATA_DIR = REPO / ".afterray/v0-data"
+
+
+def worktree_prompt(at_ms: int) -> dict:
+    """The baseline pipeline's card+prompt for one slot, via the pinned
+    `slot_cards --json` example. No daemon, no persistence."""
+    out = subprocess.run(
+        [
+            str(WORKTREE / "target/debug/examples/slot_cards"),
+            "--data-dir", str(DATA_DIR),
+            "--at-ms", str(at_ms),
+            "--slots", "1",
+            "--json",
+            "--language", "English",
+        ],
+        cwd=WORKTREE,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    line = next((l for l in out.stdout.splitlines() if l.startswith("{")), None)
+    if not line:
+        raise RuntimeError(f"slot_cards produced no JSON: {out.stderr[-400:]}")
+    return json.loads(line)
+
+
+def ollama_generate(model: str, system: str, user: str) -> tuple[str, int]:
+    """One chat completion against local Ollama — the same OpenAI-compatible
+    endpoint the daemon's router uses."""
+    import urllib.request
+
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+    }).encode()
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.time()
+    with urllib.request.urlopen(request, timeout=1800) as response:
+        payload = json.load(response)
+    wall_ms = int((time.time() - started) * 1000)
+    text = payload["choices"][0]["message"]["content"] or ""
+    return text, wall_ms
+
+
+def extract_json_block(raw: str) -> dict | None:
+    start = raw.find("{")
+    while start != -1:
+        depth, in_string, escaped = 0, False, False
+        for index in range(start, len(raw)):
+            ch = raw[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(raw[start : index + 1])
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        break
+                    break
+        start = raw.find("{", start + 1)
+    return None
+
+
+def cmd_run_worktree(args: argparse.Namespace) -> None:
+    """Baseline: pinned pipeline renders the prompt, Ollama answers, the
+    daemon is never involved and nothing is persisted."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    results = {"tag": args.tag, "stamp": stamp, "models": {}, "slot_ids": args.slots}
+    prompts = {}
+    for at_ms in args.slots:
+        prompts[at_ms] = worktree_prompt(at_ms)
+        print(f"prompt {hhmm(at_ms)}: {len(prompts[at_ms]['user'])} chars")
+    for model in args.models:
+        print(f"\n=== {model} ===")
+        rows = []
+        for at_ms in args.slots:
+            record = prompts[at_ms]
+            try:
+                raw, wall_ms = ollama_generate(model, record["system"], record["user"])
+            except Exception as error:  # noqa: BLE001 — record and continue
+                rows.append({
+                    "slot_start_ms": at_ms, "label": hhmm(at_ms), "ok": False,
+                    "error": str(error), "wall_ms": None, "latency_ms": None,
+                    "prompt_chars": len(record["user"]), "metrics": None,
+                })
+                print(f"  {hhmm(at_ms)}  FAIL {error}")
+                continue
+            card = extract_json_block(raw)
+            ok = bool(card and (card.get("title") or "").strip())
+            row = {
+                "slot_start_ms": at_ms,
+                "label": hhmm(at_ms),
+                "ok": ok,
+                "error": None if ok else "no parseable card",
+                "wall_ms": wall_ms,
+                "latency_ms": wall_ms,
+                "prompt_chars": len(record["user"]),
+                "prompt_user": record["user"],
+                "response": {"card": card, "raw": raw},
+                "metrics": None,
+            }
+            if card:
+                row["metrics"] = {
+                    **fidelity(card, record["user"]),
+                    "han_ratio": han_ratio(card_text(card)),
+                    "title": card.get("title"),
+                    "tool_rounds": 0,
+                }
+            fab = (row["metrics"] or {}).get("fabricated")
+            print(f"  {hhmm(at_ms)}  {'ok' if ok else 'PARSE FAIL'}  {wall_ms}ms  fabricated={fab}")
+            rows.append(row)
+        results["models"][model] = rows
+    out_path = OUT_DIR / f"{args.tag}-{stamp}.json"
+    out_path.write_text(json.dumps(results, ensure_ascii=False, indent=1))
+    print(f"\nresults -> {out_path.relative_to(REPO)}")
+    summarise([out_path])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -328,6 +479,15 @@ def main() -> None:
     report = sub.add_parser("report", help="print the comparison table for saved runs")
     report.add_argument("--tags", nargs="+", required=True)
     report.set_defaults(func=cmd_report)
+
+    worktree = sub.add_parser(
+        "run-worktree",
+        help="baseline via the pinned worktree examples + direct Ollama (no daemon)",
+    )
+    worktree.add_argument("--tag", default="baseline")
+    worktree.add_argument("--models", nargs="+", required=True)
+    worktree.add_argument("--slots", nargs="+", type=int, required=True)
+    worktree.set_defaults(func=cmd_run_worktree)
 
     args = parser.parse_args()
     args.func(args)
