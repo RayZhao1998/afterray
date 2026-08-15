@@ -207,6 +207,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pack_id: Option<String>,
     },
+    RemoveModel {
+        pack_id: String,
+    },
     Shutdown,
 }
 
@@ -221,11 +224,28 @@ pub struct ModelLibrary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelDownloadProgress {
     pub pack_id: String,
+    #[serde(default)]
+    pub state: ModelPackState,
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_bytes: Option<u64>,
     pub completed_files: u64,
     pub total_files: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPackState {
+    #[default]
+    NotDownloaded,
+    Downloading,
+    Verifying,
+    Ready,
+    InUse,
+    Failed,
+    Incompatible,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,12 +255,18 @@ pub struct ModelPack {
     pub capability: String,
     pub path: String,
     pub present: bool,
+    #[serde(default)]
+    pub state: ModelPackState,
     pub bytes: u64,
     pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +315,7 @@ pub struct Status {
 pub enum LlmProvider {
     #[default]
     Builtin,
+    MlxLocal,
     Ollama,
     OpenaiCompatible,
 }
@@ -298,6 +325,7 @@ impl LlmProvider {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::Builtin => "builtin",
+            Self::MlxLocal => "mlx_local",
             Self::Ollama => "ollama",
             Self::OpenaiCompatible => "openai_compatible",
         }
@@ -307,6 +335,7 @@ impl LlmProvider {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "builtin" | "built_in" | "local" => Some(Self::Builtin),
+            "mlx" | "mlx_local" | "mlx-local" => Some(Self::MlxLocal),
             "ollama" => Some(Self::Ollama),
             "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenaiCompatible),
             _ => None,
@@ -1212,6 +1241,21 @@ mod tests {
             .unwrap(),
             r#"{"type":"download_models","pack_id":"asr"}"#
         );
+    }
+
+    #[test]
+    fn mlx_provider_and_model_removal_wire_shapes_are_stable() {
+        assert_eq!(LlmProvider::parse("mlx_local"), Some(LlmProvider::MlxLocal));
+        assert_eq!(LlmProvider::MlxLocal.as_label(), "mlx_local");
+        assert_eq!(
+            serde_json::to_string(&Request::RemoveModel {
+                pack_id: "llm_qwen35_4b_mlx4".into()
+            })
+            .unwrap(),
+            r#"{"type":"remove_model","pack_id":"llm_qwen35_4b_mlx4"}"#
+        );
+        let state: ModelPackState = serde_json::from_str(r#""in_use""#).unwrap();
+        assert_eq!(state, ModelPackState::InUse);
     }
 
     #[test]

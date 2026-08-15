@@ -351,6 +351,13 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["pack_id"] as? String, "asr")
     }
 
+    func testRemoveModelRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "remove_model", packID: "llm_qwen35_4b_mlx4"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "remove_model")
+        XCTAssertEqual(json["pack_id"] as? String, "llm_qwen35_4b_mlx4")
+    }
+
     func testShutdownRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "shutdown"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
