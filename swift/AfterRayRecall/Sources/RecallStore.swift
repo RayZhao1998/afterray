@@ -180,8 +180,22 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             daySummary = loaded
             loadedDayKey = key
+
+            let isInitialHistoryLoad = summaryHistory.isEmpty
+            if let index = summaryHistory.firstIndex(where: { $0.dayStartMs == loaded.dayStartMs }) {
+                summaryHistory[index] = loaded
+            } else {
+                summaryHistory.append(loaded)
+                summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
+            }
+
+            // Changing the playhead's day only changes which summary the
+            // document follows. Keep the already-loaded newer days and the
+            // existing older-page cursor instead of rebuilding history from
+            // the selected day, which made Today disappear after scrubbing
+            // into Yesterday.
+            guard isInitialHistoryLoad else { return }
             summaryHistoryGeneration &+= 1
-            summaryHistory = [loaded]
             summaryHistoryCursorMs = loaded.dayStartMs
             summaryHistoryHasMore = true
             isLoadingSummaryHistory = false

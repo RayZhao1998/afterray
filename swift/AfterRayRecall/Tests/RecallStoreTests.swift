@@ -109,6 +109,71 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedMoment?.id, "m1")
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
     }
+
+    func testSelectingOlderDayKeepsNewerSummariesLoaded() async {
+        let todayStartMs: Int64 = 1_786_665_600_000
+        let yesterdayStartMs = todayStartMs - 86_400_000
+        let daemon = SummaryHistoryDaemon(
+            todayStartMs: todayStartMs,
+            yesterdayStartMs: yesterdayStartMs
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadDaySummary(dayMs: todayStartMs)
+        XCTAssertEqual(
+            store.summaryHistory.map(\.dayStartMs),
+            [todayStartMs, yesterdayStartMs]
+        )
+
+        await store.loadDaySummary(dayMs: yesterdayStartMs)
+
+        XCTAssertEqual(
+            store.summaryHistory.map(\.dayStartMs),
+            [todayStartMs, yesterdayStartMs],
+            "selecting an older day must not remove newer summaries from the history panel"
+        )
+    }
+}
+
+private actor SummaryHistoryDaemon: RecallDaemonServing {
+    let today: DaySummary
+    let yesterday: DaySummary
+
+    init(todayStartMs: Int64, yesterdayStartMs: Int64) {
+        today = DaySummary(
+            day: "today",
+            dayStartMs: todayStartMs,
+            dayEndMs: todayStartMs + 86_400_000,
+            slots: []
+        )
+        yesterday = DaySummary(
+            day: "yesterday",
+            dayStartMs: yesterdayStartMs,
+            dayEndMs: todayStartMs,
+            slots: []
+        )
+    }
+
+    func daySummary(dayMs: Int64) async throws -> DaySummary {
+        dayMs >= today.dayStartMs ? today : yesterday
+    }
+
+    func summaryHistory(beforeMs: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
+        if beforeMs == today.dayStartMs {
+            return SummaryHistoryPage(days: [yesterday], nextBeforeMs: nil, hasMore: false)
+        }
+        return SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
+    }
+
+    func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "application/octet-stream", bytes: Data())
+    }
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
 private actor RefreshingDaemon: RecallDaemonServing {
