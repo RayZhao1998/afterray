@@ -1,6 +1,6 @@
 //! Minimal read-only tool loop for Ask and memory generation.
 
-use afterray_models::{JobState, ModelInput, ModelOutput, ModelQueue, QueueError};
+use afterray_models::{JobPriority, JobState, ModelInput, ModelOutput, ModelQueue, QueueError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -64,6 +64,9 @@ pub struct AgentLoopConfig {
     pub max_rounds: usize,
     /// `None` = never clip the transcript.
     pub clip_chars: Option<usize>,
+    /// Scheduling class for every round's model call. Chat is interactive;
+    /// the T2 summariser runs background under a lease hold.
+    pub priority: JobPriority,
 }
 
 /// Wraps vault or user text so the model can tell data from instructions.
@@ -101,6 +104,7 @@ pub async fn run_readonly_agent_traced(
         AgentLoopConfig {
             max_rounds: MAX_ROUNDS,
             clip_chars: Some(MAX_HISTORY_CHARS),
+            priority: JobPriority::Interactive,
         },
     )
     .await
@@ -126,7 +130,7 @@ pub async fn run_agent_loop<T: ToolSurface>(
             None => transcript.clone(),
         };
 
-        let text = generate(models, &prompt, system).await?;
+        let text = generate(models, &prompt, system, config.priority).await?;
 
         if let Some(answer) = parse_final(&text) {
             return Ok(AgentTurn {
@@ -190,12 +194,20 @@ impl ToolSurface for ToolHost<'_> {
     }
 }
 
-async fn generate(models: &ModelQueue, prompt: &str, system: &str) -> Result<String, AgentError> {
+async fn generate(
+    models: &ModelQueue,
+    prompt: &str,
+    system: &str,
+    priority: JobPriority,
+) -> Result<String, AgentError> {
     let job_id = match models
-        .submit(ModelInput::Llm {
-            prompt: prompt.to_owned(),
-            system: Some(system.to_owned()),
-        })
+        .submit_with(
+            ModelInput::Llm {
+                prompt: prompt.to_owned(),
+                system: Some(system.to_owned()),
+            },
+            priority,
+        )
         .await
     {
         Ok(id) => id,

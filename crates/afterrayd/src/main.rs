@@ -529,6 +529,21 @@ async fn write_artifact_response(
     Ok(())
 }
 
+/// Runs store/CPU-heavy work on the blocking pool. Every synchronous Vault
+/// call made directly from async context occupies a tokio worker for its
+/// whole duration; a handful of card builds used to freeze the entire async
+/// surface — socket accepts and chat streams included.
+async fn run_store<T, F>(state: &Arc<AppState>, task: F) -> T
+where
+    F: FnOnce(&AppState) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || task(&state))
+        .await
+        .expect("blocking store task panicked")
+}
+
 async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
     match request {
         Request::Ping => Response::success(serde_json::json!({"pong": true})),
@@ -545,11 +560,16 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::RecordStart => record_start(state).await,
         Request::RecordStop { reason } => record_stop(state, reason.as_deref()).await,
         Request::SessionsList => into_response(state.store.sessions_sync()),
-        Request::TimelineList => into_response(state.store.timeline_sync()),
+        Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
-            into_response(state.store.timeline_since_sync(since_ms))
+            run_store(state, move |s| {
+                into_response(s.store.timeline_since_sync(since_ms))
+            })
+            .await
         }
-        Request::MomentsList { session_id } => into_response(state.store.moments_sync(&session_id)),
+        Request::MomentsList { session_id } => {
+            run_store(state, move |s| into_response(s.store.moments_sync(&session_id))).await
+        }
         Request::RecallWindow {
             session_id,
             center_ms,
@@ -602,21 +622,36 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Ok(None) => Response::failure("no moment has been captured yet"),
             Err(error) => Response::failure(error.to_string()),
         },
-        Request::SlotCard { at_ms } => into_response(slot_card_for(state, at_ms)),
+        Request::SlotCard { at_ms } => {
+            run_store(state, move |s| into_response(slot_card_for(s, at_ms))).await
+        }
         Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
         Request::SlotBackfill { days } => slot_backfill(state, days).await,
         Request::DaySummary { day_ms } => {
-            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
-            into_response(state.store.day_summary(day_ms, interval_ms))
+            run_store(state, move |s| {
+                let interval_ms =
+                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                into_response(s.store.day_summary(day_ms, interval_ms))
+            })
+            .await
+        }
+        Request::SlotPrompt { at_ms } => {
+            run_store(state, move |s| match slot_prompt_for(s, at_ms) {
+                Ok(prompt) => Response::success(prompt),
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
         }
         Request::SummaryHistory { before_ms, limit } => {
-            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
-            into_response(state.store.summary_history(before_ms, limit, interval_ms))
+            // Multi-day summary assembly is exactly the class of work the
+            // blocking pool exists for.
+            run_store(state, move |s| {
+                let interval_ms =
+                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                into_response(s.store.summary_history(before_ms, limit, interval_ms))
+            })
+            .await
         }
-        Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
-            Ok(prompt) => Response::success(prompt),
-            Err(error) => Response::failure(error.to_string()),
-        },
         Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
@@ -1729,10 +1764,15 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     const T2_MAX_ROUNDS: usize = 8;
 
     let started = std::time::Instant::now();
-    let inputs = slot_t2_inputs(state, at_ms).map_err(|error| error.to_string())?;
+    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms))
+        .await
+        .map_err(|error| error.to_string())?;
     let slot_start_ms = inputs.card.slot_start_ms;
 
     ensure_remote_llm_model(state).await;
+    // Reserve the LLM lane for this loop's rounds. Interactive chat still
+    // preempts; other background summaries wait until the guard drops.
+    let lease_hold = state.models.hold_llm_lease();
     let tools = SlotT2Tools {
         store: &state.store,
         card: &inputs.card,
@@ -1745,10 +1785,14 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         agent::AgentLoopConfig {
             max_rounds: T2_MAX_ROUNDS,
             clip_chars: None,
+            priority: afterray_models::JobPriority::Background {
+                lease: Some(lease_hold.id()),
+            },
         },
     )
     .await
     .map_err(|error| error.to_string())?;
+    drop(lease_hold);
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
@@ -1973,14 +2017,21 @@ fn spawn_text_df_maintainer(state: Arc<AppState>) {
         let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
         let mut total = 0_usize;
         loop {
-            let processed =
-                match state.store.advance_text_df(now_ms(), interval_ms, 12) {
-                    Ok(processed) => processed,
-                    Err(error) => {
-                        eprintln!("text.df advance failed: {error}");
-                        0
-                    }
-                };
+            let processed = {
+                let state = Arc::clone(&state);
+                tokio::task::spawn_blocking(move || {
+                    state.store.advance_text_df(now_ms(), interval_ms, 12)
+                })
+                .await
+                .unwrap_or_else(|join| {
+                    eprintln!("text.df task panicked: {join}");
+                    Ok(0)
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("text.df advance failed: {error}");
+                    0
+                })
+            };
             total += processed;
             if processed > 0 && total % 96 < 12 {
                 eprintln!("text.df corpus advanced ({total} slots this run)");

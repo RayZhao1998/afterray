@@ -361,12 +361,62 @@ impl Default for VaultConfig {
 }
 
 pub struct Vault {
+    /// The single writer. SQLite in WAL mode supports many readers beside
+    /// one writer; funnelling reads through this same mutex — the original
+    /// design — serialised the whole store behind whichever caller was
+    /// building a day of slot cards.
     connection: Mutex<Connection>,
+    readers: ReadPool,
+    /// Slot cards for settled half-hours, keyed by slot start. See
+    /// [`Vault::slot_card`] for the eligibility rule.
+    card_cache: Mutex<HashMap<i64, slot::SlotCard>>,
     artifacts_dir: PathBuf,
     artifact_wrap_key: Zeroizing<[u8; 32]>,
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
     max_storage_bytes: AtomicU64,
+}
+
+/// A handful of `PRAGMA query_only` connections, handed out round-robin.
+/// `query_only` makes a misclassified write a loud error instead of a data
+/// race — the pool must never be able to corrupt anything.
+struct ReadPool {
+    connections: Vec<Mutex<Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadPool {
+    const SIZE: usize = 3;
+
+    fn open(path: &Path, key: &Zeroizing<[u8; 32]>) -> Result<Self, StoreError> {
+        let mut connections = Vec::with_capacity(Self::SIZE);
+        for _ in 0..Self::SIZE {
+            let connection = open_keyed_database(path, key)?;
+            connection.execute_batch(
+                "PRAGMA query_only = ON;
+                 PRAGMA busy_timeout = 5000;",
+            )?;
+            connections.push(Mutex::new(connection));
+        }
+        Ok(Self {
+            connections,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Prefers an idle connection; blocks on one only when all are busy.
+    fn get(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.connections.len() {
+            let index = (start + offset) % self.connections.len();
+            if let Ok(guard) = self.connections[index].try_lock() {
+                return guard;
+            }
+        }
+        self.connections[start % self.connections.len()]
+            .lock()
+            .unwrap()
+    }
 }
 
 impl Vault {
@@ -393,9 +443,14 @@ impl Vault {
         let connection =
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
+        connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
         set_database_file_permissions(&database_path)?;
+        // Readers open only after migration has settled the schema.
+        let readers = ReadPool::open(&database_path, &database_key)?;
         let vault = Self {
             connection: Mutex::new(connection),
+            readers,
+            card_cache: Mutex::new(HashMap::new()),
             artifacts_dir,
             artifact_wrap_key: Zeroizing::new(blake3::derive_key(
                 ARTIFACT_WRAP_KEY_CONTEXT,
@@ -477,7 +532,7 @@ impl Vault {
     }
 
     pub fn sessions_sync(&self) -> Result<Vec<Session>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, started_at_ms, ended_at_ms FROM sessions ORDER BY started_at_ms DESC",
         )?;
@@ -492,7 +547,7 @@ impl Vault {
     }
 
     pub fn moments_sync(&self, session_id: &str) -> Result<Vec<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -863,7 +918,7 @@ impl Vault {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, captured_at_ms, application_name, bundle_identifier,
                     window_title, url, document
@@ -893,6 +948,14 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error if the vault cannot be queried.
+    /// How long after a slot ends before its card may be cached. OCR and
+    /// transcripts land minutes after their frames; caching too early would
+    /// freeze a card that is still gaining text.
+    const CARD_CACHE_SETTLE_MS: i64 = 2 * 60 * 60 * 1000;
+    /// Bounded so a long-running daemon cannot grow the cache without limit;
+    /// on overflow the whole map is dropped and simply rebuilds on demand.
+    const CARD_CACHE_CAP: usize = 96;
+
     pub fn slot_card(
         &self,
         at_ms: i64,
@@ -900,6 +963,25 @@ impl Vault {
     ) -> Result<slot::SlotCard, StoreError> {
         let slot_start_ms = slot::slot_start_for(at_ms);
         let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
+
+        // A settled half hour is immutable except for deletion, and every
+        // deletion path flushes this cache. The same card used to be rebuilt
+        // — per-frame AX decryption included — by the day panel, the T2
+        // prompt, and the sweeper, each within minutes of the others.
+        let wall_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default(),
+        )
+        .unwrap_or(i64::MAX);
+        let settled = slot_end_ms.saturating_add(Self::CARD_CACHE_SETTLE_MS) <= wall_ms;
+        if settled
+            && let Some(card) = self.card_cache.lock().unwrap().get(&slot_start_ms)
+        {
+            return Ok(card.clone());
+        }
+
         let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
         // The AX artifact is decrypted once per frame at T1 build time
         // (once per half hour). It yields the two strongest intent signals
@@ -926,12 +1008,21 @@ impl Vault {
             }
         }
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
-        Ok(slot::build_slot_card(
-            slot_start_ms,
-            &rows,
-            idle_ms,
-            capture_interval_ms,
-        ))
+        let card = slot::build_slot_card(slot_start_ms, &rows, idle_ms, capture_interval_ms);
+        if settled {
+            let mut cache = self.card_cache.lock().unwrap();
+            if cache.len() >= Self::CARD_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(slot_start_ms, card.clone());
+        }
+        Ok(card)
+    }
+
+    /// Every path that removes moments must call this: a cached card for a
+    /// half hour whose frames were deleted would resurrect them.
+    fn flush_card_cache(&self) {
+        self.card_cache.lock().unwrap().clear();
     }
 
     /// Folds up to `max_slots` closed-but-uncounted slots into the text DF
@@ -1019,7 +1110,7 @@ impl Vault {
         card: &slot::SlotCard,
     ) -> Result<infoscore::BackgroundStats, StoreError> {
         let (line_keys, tokens) = slot::card_df_queries(card);
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let (slots, watermark_ms) = {
             let mut statement = connection
                 .prepare("SELECT slot_count, watermark_ms FROM text_df_meta WHERE id = 1")?;
@@ -1182,7 +1273,7 @@ impl Vault {
         before_start_ms: i64,
         limit: usize,
     ) -> Result<Vec<slot::PrevCard>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT slot_start_ms, title FROM slot_summaries
               WHERE title IS NOT NULL AND TRIM(title) != '' AND slot_start_ms < ?1
@@ -1227,19 +1318,50 @@ impl Vault {
                 .or_default()
                 .push(row);
         }
-        let mut cards = Vec::new();
+        // Slots are independent — one card's build reads nothing from
+        // another's — and a day holds up to 48 of them. Building serially
+        // made opening the day panel cost the sum of every slot; scoped
+        // threads bound the cost by the slowest slot per lane, with the
+        // reader pool serving `idle_overlap_ms` lookups concurrently.
         let mut starts: Vec<i64> = grouped.keys().copied().collect();
         starts.sort_unstable();
-        for start in starts {
-            let slot_rows = grouped.remove(&start).unwrap_or_default();
-            let idle_ms = self.idle_overlap_ms(start, start + slot::SLOT_DURATION_MS)?;
-            cards.push(slot::build_slot_card(
-                start,
-                &slot_rows,
-                idle_ms,
-                capture_interval_ms,
-            ));
-        }
+        let lanes = starts.len().clamp(1, 4);
+        let work: Vec<(i64, Vec<slot::SlotMomentRow>)> = starts
+            .iter()
+            .map(|start| (*start, grouped.remove(start).unwrap_or_default()))
+            .collect();
+        let mut cards: Vec<(i64, slot::SlotCard)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(lanes);
+            for chunk in work.chunks(work.len().div_ceil(lanes).max(1)) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(start, slot_rows)| {
+                            let idle_ms = self
+                                .idle_overlap_ms(*start, *start + slot::SLOT_DURATION_MS)?;
+                            Ok((
+                                *start,
+                                slot::build_slot_card(
+                                    *start,
+                                    slot_rows,
+                                    idle_ms,
+                                    capture_interval_ms,
+                                ),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, StoreError>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("card build thread panicked"))
+                .collect::<Result<Vec<_>, StoreError>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect();
+        cards.sort_unstable_by_key(|(start, _)| *start);
+        let cards: Vec<slot::SlotCard> = cards.into_iter().map(|(_, card)| card).collect();
         let overlays = self.slot_overlays_for_day(&day)?;
         Ok(slot::assemble_day_summary(
             day,
@@ -1307,7 +1429,7 @@ impl Vault {
         &self,
         local_day: &str,
     ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT slot_start_ms, state, title, bullets_json, category,
                     description, threads_json, entities_json, decisions_json,
@@ -1362,7 +1484,7 @@ impl Vault {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<slot::SlotMomentRow>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.captured_at_ms, m.application_name, m.bundle_identifier,
                     m.window_title, m.url, m.document,
@@ -1401,7 +1523,7 @@ impl Vault {
     ///
     /// Returns an error if the query fails.
     pub fn idle_overlap_ms(&self, from_ms: i64, to_ms: i64) -> Result<i64, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT started_at_ms, ended_at_ms FROM idle_spans
               WHERE started_at_ms < ?2 AND (ended_at_ms IS NULL OR ended_at_ms > ?1)",
@@ -1435,7 +1557,7 @@ impl Vault {
         to_ms: i64,
         limit: usize,
     ) -> Result<Vec<TranscriptLine>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT te.started_at_ms, COALESCE(a.track, 'unknown'), te.text
                FROM text_evidence te
@@ -1464,7 +1586,7 @@ impl Vault {
         to_ms: i64,
         limit: usize,
     ) -> Result<Vec<MomentAt>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, captured_at_ms FROM moments
               WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
@@ -1486,7 +1608,7 @@ impl Vault {
     ///
     /// Returns an error if the query fails.
     pub fn moment_time_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement =
             connection.prepare("SELECT MIN(captured_at_ms), MAX(captured_at_ms) FROM moments")?;
         let mut rows = statement.query([])?;
@@ -1504,7 +1626,7 @@ impl Vault {
     ///
     /// Returns an error if the query fails.
     pub fn moment_nearest(&self, at_ms: i64) -> Result<Option<String>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM moments
               ORDER BY ABS(captured_at_ms - ?1), captured_at_ms
@@ -1538,7 +1660,7 @@ impl Vault {
     ///
     /// Returns an error if the query fails.
     pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
                     (SELECT COUNT(*) FROM conversation_messages m
@@ -1566,7 +1688,7 @@ impl Vault {
     ///
     /// Returns an error if the query fails.
     pub fn conversation(&self, id: &str) -> Result<Option<Conversation>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
                     (SELECT COUNT(*) FROM conversation_messages m
@@ -1624,7 +1746,7 @@ impl Vault {
         &self,
         conversation_id: &str,
     ) -> Result<Vec<ConversationMessage>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, conversation_id, role, content, tool_log, created_at_ms
                FROM conversation_messages
@@ -1711,6 +1833,7 @@ impl Vault {
     }
 
     pub fn delete_moment_and_artifacts(&self, moment_id: &str) -> Result<(), StoreError> {
+        self.flush_card_cache();
         let connection = self.connection.lock().unwrap();
         let artifacts: Vec<Option<String>> = connection.query_row(
             "SELECT image_artifact_id, accessibility_artifact_id, thumbnail_artifact_id
@@ -1764,7 +1887,7 @@ impl Vault {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
                     window_title, url, document, summary, fingerprint
@@ -1781,7 +1904,7 @@ impl Vault {
     }
 
     pub fn latest_memory(&self) -> Result<Option<Memory>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
@@ -1795,6 +1918,7 @@ impl Vault {
     }
 
     pub fn delete_history(&self, from_ms: i64, to_ms: i64) -> Result<usize, StoreError> {
+        self.flush_card_cache();
         if from_ms > to_ms {
             return Ok(0);
         }
@@ -1965,7 +2089,7 @@ impl Vault {
         &self,
         moment_id: &str,
     ) -> Result<Option<(String, Option<String>)>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT text, layout_json FROM text_evidence
@@ -1980,7 +2104,7 @@ impl Vault {
     }
 
     pub fn moment_by_id(&self, moment_id: &str) -> Result<Option<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -2040,7 +2164,7 @@ impl Vault {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT COALESCE(
                        te.moment_id,
@@ -2416,6 +2540,7 @@ impl Vault {
 
     #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
+        self.flush_card_cache();
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
             let mut connection = self.connection.lock().unwrap();
@@ -3957,6 +4082,75 @@ mod tests {
             )
             .unwrap();
         assert!(too_late.is_none());
+    }
+
+    /// The point of the reader pool: a long write transaction must not stall
+    /// reads. Before the pool, one mutex serialised the entire store.
+    #[test]
+    fn reads_proceed_while_a_write_transaction_is_open() {
+        let (_directory, vault) = test_vault(100);
+        let session = vault.create_session_sync(1_000).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"one")
+            .unwrap();
+
+        // Hold the writer open on this thread…
+        let writer = vault.connection.lock().unwrap();
+        let tx = writer.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO text_df (kind, key, df, last_seen_ms) VALUES (9, 'held', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        // …and read from another. With reads behind the same mutex this
+        // deadlocks (single-threaded) — the read must come from the pool.
+        let sessions = vault.sessions_sync().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let rows = vault.slot_moment_rows(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        drop(tx);
+        drop(writer);
+    }
+
+    /// `query_only` turns a misclassified write into an error, never silent
+    /// WAL corruption. This is the guard that makes the pool safe to extend.
+    #[test]
+    fn reader_connections_refuse_writes() {
+        let (_directory, vault) = test_vault(100);
+        let reader = vault.readers.get();
+        let result = reader.execute("CREATE TABLE should_fail (id INTEGER)", []);
+        assert!(result.is_err(), "a pool reader accepted a write");
+    }
+
+    #[test]
+    fn settled_slot_cards_are_cached_until_a_deletion() {
+        let (_directory, vault) = test_vault(100);
+        // Timestamps far in the past: settled by any wall clock.
+        let start = slot_start_for(1_600_000_000_000);
+        let session = vault.create_session_sync(start).unwrap();
+        vault
+            .insert_moment(&session.id, start + 1_000, "image/jpeg", b"one")
+            .unwrap();
+
+        let first = vault.slot_card(start, 10_000).unwrap();
+        assert_eq!(first.facts.moment_count, 1);
+        assert!(
+            vault.card_cache.lock().unwrap().contains_key(&start),
+            "settled card must enter the cache"
+        );
+
+        // A deletion must flush; the rebuilt card reflects the new truth.
+        let deleted = vault
+            .delete_history(start, start + SLOT_DURATION_MS)
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(
+            vault.card_cache.lock().unwrap().is_empty(),
+            "deletion left a stale card behind"
+        );
+        let rebuilt = vault.slot_card(start, 10_000).unwrap();
+        assert_eq!(rebuilt.facts.moment_count, 0);
     }
 
     #[test]

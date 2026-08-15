@@ -32,7 +32,8 @@ pub use process::{
     ProcessAdapter, ProcessAdapterConfig, WORKER_PROTOCOL_VERSION, WorkerRequest, WorkerResponse,
 };
 pub use queue::{
-    CapabilityConcurrency, JobId, JobSnapshot, JobState, ModelQueue, QueueConfig, QueueError,
+    CapabilityConcurrency, JobId, JobPriority, JobSnapshot, JobState, LlmLeaseHold, ModelQueue,
+    QueueConfig, QueueError,
 };
 pub use remote::{
     DEFAULT_OLLAMA_BASE_URL, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, LlmTokenSinkGuard,
