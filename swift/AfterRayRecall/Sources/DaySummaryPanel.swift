@@ -21,6 +21,11 @@ public enum DaySummaryPanelStyle: Sendable {
 /// `Text`. The date that used to pin as a section header becomes a chip
 /// under the panel header, tracking whichever day is scrolled into view.
 public struct DaySummaryPanel: View {
+    /// The pinned day chip is an overlay, so it does not reserve layout space
+    /// in the AppKit scroll view beneath it. Include its height and a small
+    /// reading gap when following a highlighted card.
+    private static let dayChipFollowTopInset: CGFloat = 28
+
     @State private var topDayHeading: String?
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
@@ -29,10 +34,9 @@ public struct DaySummaryPanel: View {
     let nowMs: Int64
     let hasMore: Bool
     let isLoadingMore: Bool
-    /// Bumped by the overlay when a scrub settles; the one moment the list
-    /// follows the playhead. Following every half-hour crossing mid-glide
-    /// was a scrollTo storm that churned rows (and their thumbnails) faster
-    /// than the main thread could keep up.
+    /// Bumped when a scrub settles for one final alignment correction. Live
+    /// following is already throttled to highlighted half-hour changes by
+    /// the document coordinator.
     let followPulse: Int
     let onSelectSlot: (Int64) -> Void
     let onLoadMore: () -> Void
@@ -163,6 +167,7 @@ public struct DaySummaryPanel: View {
             hasMore: hasMore,
             isLoadingMore: isLoadingMore,
             followPulse: followPulse,
+            followTopInset: Self.dayChipFollowTopInset,
             fillsHeight: style == .window,
             onSelectSlot: onSelectSlot,
             onLoadMore: onLoadMore,

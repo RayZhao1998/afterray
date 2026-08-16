@@ -187,6 +187,16 @@ public final class RecallStore: ObservableObject {
         applyPlayhead(ms)
     }
 
+    /// Selects the newest captured moment already loaded in the timeline.
+    /// The app pairs this with its `isLive` state in one UI transaction when
+    /// returning to NOW.
+    @discardableResult
+    public func selectLatestMoment() -> Bool {
+        guard let latest = moments.last else { return false }
+        applyPlayhead(latest.capturedAtMs)
+        return true
+    }
+
     public func loadDaySummary(dayMs: Int64, force: Bool = false) async {
         let key = DaySummaryLayout.localDayKey(ms: dayMs)
         if !force, key == loadedDayKey { return }
