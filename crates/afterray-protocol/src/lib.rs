@@ -13,8 +13,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// because a hang-up no longer cancels — the user presses stop and the model
 /// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
 /// `usage`, `progress` and `compaction` stream events. 9 adds
-/// `CaptureSetPaused`.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
+/// the download queue instead of tearing the whole queue down.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -216,6 +217,10 @@ pub enum Request {
         llm_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         llm_api_key: Option<String>,
+        /// Base URL model downloads resolve against. Empty string restores
+        /// the official huggingface.co endpoint; `None` leaves it unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_download_endpoint: Option<String>,
     },
     LlmProbe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +246,12 @@ pub enum Request {
     PauseModelDownloads,
     ResumeModelDownloads,
     CancelModelDownloads,
+    /// Drops a single pack — active or merely queued — and discards its partial
+    /// files. The rest of the queue keeps going, which is what separates this
+    /// from `CancelModelDownloads`.
+    CancelModelDownload {
+        pack_id: String,
+    },
     RemoveModel {
         pack_id: String,
     },
@@ -455,6 +466,11 @@ pub struct AppSettings {
     /// The catalogue the settings UI renders, so one list serves every client.
     #[serde(default = "summary_language_options")]
     pub language_options: Vec<LanguageOption>,
+    /// Mirror model downloads resolve against; empty means the official
+    /// huggingface.co endpoint. Pack integrity never depends on this — pinned
+    /// packs verify against SHA-256 hashes shipped in the daemon.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_download_endpoint: String,
 }
 
 /// A language a summary can be written in.
@@ -1107,9 +1123,27 @@ mod tests {
                 llm_base_url: None,
                 llm_model: None,
                 llm_api_key: None,
+                model_download_endpoint: None,
             })
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::UpdateSettings {
+                record_audio: None,
+                ui_language: None,
+                summary_language: None,
+                storage_limit_bytes: None,
+                excluded_bundle_ids: None,
+                excluded_domains: None,
+                llm_provider: None,
+                llm_base_url: None,
+                llm_model: None,
+                llm_api_key: None,
+                model_download_endpoint: Some("https://hf-mirror.com".into()),
+            })
+            .unwrap(),
+            r#"{"type":"update_settings","model_download_endpoint":"https://hf-mirror.com"}"#
         );
         assert_eq!(
             serde_json::to_string(&Request::LlmProbe {
@@ -1132,6 +1166,10 @@ mod tests {
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
         assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+        assert!(
+            settings.model_download_endpoint.is_empty(),
+            "no endpoint field means the official one"
+        );
     }
 
     #[test]
@@ -1159,6 +1197,7 @@ mod tests {
             llm_base_url: None,
             llm_model: None,
             llm_api_key: None,
+            model_download_endpoint: None,
         })
         .unwrap();
         assert_eq!(
@@ -1519,9 +1558,27 @@ mod tests {
             r#"{"type":"cancel_model_downloads"}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::CancelModelDownload {
+                pack_id: "embedding".into()
+            })
+            .unwrap(),
+            r#"{"type":"cancel_model_download","pack_id":"embedding"}"#
+        );
+        assert_eq!(
             serde_json::to_string(&ModelPackState::Paused).unwrap(),
             r#""paused""#
         );
+    }
+
+    /// The singular and plural cancels differ by one character on the wire, so
+    /// a typo in either client would silently tear down the whole queue.
+    #[test]
+    fn single_and_whole_queue_cancels_are_distinct_requests() {
+        let single: Request =
+            serde_json::from_str(r#"{"type":"cancel_model_download","pack_id":"asr"}"#).unwrap();
+        assert!(matches!(single, Request::CancelModelDownload { pack_id } if pack_id == "asr"));
+        let all: Request = serde_json::from_str(r#"{"type":"cancel_model_downloads"}"#).unwrap();
+        assert!(matches!(all, Request::CancelModelDownloads));
     }
 
     #[test]

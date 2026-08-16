@@ -430,6 +430,38 @@ final class DaemonWireTests: XCTestCase {
         }
     }
 
+    /// One character separates this from `cancel_model_downloads`, which tears
+    /// the whole queue down instead of dropping a single pack.
+    func testCancelOneModelDownloadRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "cancel_model_download", packID: "embedding")
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "cancel_model_download")
+        XCTAssertEqual(json["pack_id"] as? String, "embedding")
+    }
+
+    func testUpdateModelDownloadEndpointRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", modelDownloadEndpoint: "https://hf-mirror.com")
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["model_download_endpoint"] as? String, "https://hf-mirror.com")
+        XCTAssertEqual(json.count, 2, "a partial settings patch must not carry stray fields")
+    }
+
+    func testAppSettingsDecodesTheDownloadEndpoint() throws {
+        let base = #"{"data_dir":"/d","model_dir":"/m","record_audio":true,"capture_interval_seconds":10"#
+        let withEndpoint = try JSONDecoder().decode(
+            AppSettings.self,
+            from: Data((base + #","model_download_endpoint":"https://hf-mirror.com"}"#).utf8)
+        )
+        XCTAssertEqual(withEndpoint.modelDownloadEndpoint, "https://hf-mirror.com")
+        let without = try JSONDecoder().decode(AppSettings.self, from: Data((base + "}").utf8))
+        XCTAssertEqual(without.modelDownloadEndpoint, "", "an old daemon means the official endpoint")
+    }
+
     func testRemoveModelRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "remove_model", packID: "llm_qwen35_4b_mlx4"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -556,7 +588,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 9)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 10)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {
