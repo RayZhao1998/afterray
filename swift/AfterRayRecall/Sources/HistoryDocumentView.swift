@@ -1,6 +1,35 @@
 import AppKit
 import SwiftUI
 
+enum HistoryDocumentFollow {
+    /// Live scrubbing only needs to move the document when the highlighted
+    /// half hour changes. The settle pulse remains a final correction.
+    static func shouldFollow(
+        previousSlot: Int64?,
+        currentSlot: Int64?,
+        settleRequested: Bool
+    ) -> Bool {
+        settleRequested || (currentSlot != nil && currentSlot != previousSlot)
+    }
+
+    static func targetOriginY(
+        highlightRect: NSRect,
+        viewportHeight: CGFloat,
+        contentHeight: CGFloat,
+        topInset: CGFloat = 0
+    ) -> CGFloat {
+        let maximumOrigin = max(contentHeight - viewportHeight, 0)
+        let visibleTop = min(max(topInset, 0), viewportHeight)
+        // Card bodies vary substantially with the amount of activity in each
+        // half hour. Following their midpoint makes the title jump vertically
+        // whenever the body height changes, so pin the card's beginning below
+        // the floating day chip instead. Document edges are the only reason it
+        // should land elsewhere.
+        let preferredOrigin = highlightRect.minY - visibleTop
+        return min(max(preferredOrigin, 0), maximumOrigin)
+    }
+}
+
 /// The text view that draws the timeline rule behind the document.
 ///
 /// The spine has to be drawn rather than typeset: a continuous line down a
@@ -49,6 +78,12 @@ final class HistoryTextView: NSTextView {
     /// reads as a row, inset from both edges so it never touches them.
     private var highlightCard: NSRect? {
         guard let highlightRect else { return nil }
+        return cardRect(around: highlightRect)
+    }
+
+    /// The coordinator follows the same padded geometry that is drawn. Using
+    /// only the glyph bounds can still leave the card itself clipped.
+    fileprivate func cardRect(around highlightRect: NSRect) -> NSRect {
         return NSRect(
             x: cardPadding.left,
             y: highlightRect.minY - cardPadding.top,
@@ -70,6 +105,9 @@ struct HistoryDocumentView: NSViewRepresentable {
     let hasMore: Bool
     let isLoadingMore: Bool
     let followPulse: Int
+    /// Space occupied by the SwiftUI day chip overlaid above this AppKit
+    /// scroll view. It remains value state owned by the panel.
+    let followTopInset: CGFloat
     /// A window fills whatever height it is given, so the timeline rule runs
     /// the full panel; the overlay card hugs its content instead of
     /// stretching a glass panel around two rows.
@@ -198,6 +236,7 @@ struct HistoryDocumentView: NSViewRepresentable {
         }
 
         func apply(view newView: HistoryDocumentView) {
+            let previousHighlightedSlot = highlightedSlot
             let summariesChanged = renderedSummaries != newView.summaries
             let followRequested = newView.followPulse != lastFollowPulse
             let playheadChanged = view.playheadMs != newView.playheadMs
@@ -209,9 +248,15 @@ struct HistoryDocumentView: NSViewRepresentable {
             if playheadChanged || summariesChanged {
                 refreshHighlight()
             }
-            if followRequested {
-                lastFollowPulse = newView.followPulse
-                followPlayhead()
+            if HistoryDocumentFollow.shouldFollow(
+                previousSlot: previousHighlightedSlot,
+                currentSlot: highlightedSlot,
+                settleRequested: followRequested
+            ) {
+                let followed = followPlayhead()
+                if followRequested, followed {
+                    lastFollowPulse = newView.followPulse
+                }
             }
         }
 
@@ -271,21 +316,47 @@ struct HistoryDocumentView: NSViewRepresentable {
                   let container = textView.textContainer,
                   let range = layout.slotRanges[slotStartMs]
             else { return nil }
+            layoutManager.ensureLayout(for: container)
             let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
             let origin = textView.textContainerOrigin
             return rect.offsetBy(dx: origin.x, dy: origin.y)
         }
 
-        private func followPlayhead() {
+        @discardableResult
+        private func followPlayhead() -> Bool {
             guard let textView,
+                  let scroll,
                   !ScrollFenceRegistry.shared.pointerInsideAnyFence(),
                   let current = highlightedSlot ?? view.summaries.lazy.compactMap({
                       DaySummaryLayout.highlightedSlotStartMs(playheadMs: self.view.playheadMs, slots: $0.slots)
                   }).first,
-                  let range = layout.slotRanges[current]
-            else { return }
-            textView.scrollRangeToVisible(range)
+                  let highlightRect = boundingRect(ofSlot: current),
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer
+            else { return false }
+
+            layoutManager.ensureLayout(for: container)
+            let contentHeight = layoutManager.usedRect(for: container).height
+                + textView.textContainerInset.height * 2
+            let viewportHeight = scroll.contentView.bounds.height
+            guard viewportHeight > 0 else { return false }
+            if textView.frame.height < contentHeight {
+                textView.setFrameSize(NSSize(width: textView.frame.width, height: contentHeight))
+            }
+            let followRect = textView.cardRect(around: highlightRect)
+            let originY = HistoryDocumentFollow.targetOriginY(
+                highlightRect: followRect,
+                viewportHeight: viewportHeight,
+                contentHeight: max(textView.bounds.height, contentHeight),
+                topInset: view.followTopInset
+            )
+            scroll.contentView.scroll(to: NSPoint(
+                x: scroll.contentView.bounds.origin.x,
+                y: originY
+            ))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            return true
         }
 
         // ---------------------------------------------------- attachments

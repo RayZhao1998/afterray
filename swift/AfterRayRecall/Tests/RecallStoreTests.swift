@@ -18,6 +18,16 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(calls, [.init(momentID: "m2", favorite: true)])
     }
 
+    func testSelectLatestMomentRestoresPlayheadToNewestCapture() async {
+        let store = RecallStore(daemon: FakeDaemon())
+        await store.loadTimeline()
+        store.select(playheadMs: 100)
+
+        XCTAssertTrue(store.selectLatestMoment())
+        XCTAssertEqual(store.playheadMs, 200)
+        XCTAssertEqual(store.selectedMoment?.id, "m2")
+    }
+
     func testConnectionFailureStaysInRecoveringState() async {
         let store = RecallStore(daemon: ConnectionFailingDaemon())
 

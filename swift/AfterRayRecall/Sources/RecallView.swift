@@ -56,8 +56,8 @@ public struct RecallView: View {
     @State private var isZoomingTimeline = false
     @State private var layoutCache = TimelineLayoutCache()
     /// True from the first scrub delta until the gesture (and its glide)
-    /// settles. Prefetch and panel-follow both wait for the settle: doing
-    /// either per frame at coast speed was the stutter being reported.
+    /// settles. Expensive prefetch waits for the settle; the summary document
+    /// follows only when its highlighted half-hour changes.
     @State private var isScrubbing = false
     /// Continuous travel stays inside this view. The store binding is committed
     /// once when motion settles, so the app root, history and audio pipeline do
@@ -236,7 +236,7 @@ public struct RecallView: View {
                                 }
                             },
                             summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
-                            playheadMs: playheadMs,
+                            playheadMs: renderedPlayheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
                             hasMore: summaryHistoryHasMore,
                             isLoadingMore: isLoadingSummaryHistory,
@@ -567,6 +567,9 @@ public struct RecallView: View {
                     dragOrigin = nil
                     searchDragOrigin = nil
                     return
+                }
+                if dragOrigin == nil, searchDragOrigin == nil {
+                    isScrubbing = true
                 }
                 if let searchSession {
                     beginScrubbing(holdsPlayhead: false)

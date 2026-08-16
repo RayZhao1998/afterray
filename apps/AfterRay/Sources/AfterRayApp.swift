@@ -1100,7 +1100,7 @@ private struct AfterRayRootView: View {
                 selectSearchFrame(session.selectedIndex)
                 return
             }
-            isLive = true
+            enterLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
             audioPlayer.stop()
@@ -1243,6 +1243,17 @@ private struct AfterRayRootView: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             isLive = false
+        }
+    }
+
+    /// Returning to NOW is one state transition: the timeline's live flag and
+    /// the shared playhead must agree before SwiftUI renders the next frame.
+    private func enterLive() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            store.selectLatestMoment()
+            isLive = true
         }
     }
 

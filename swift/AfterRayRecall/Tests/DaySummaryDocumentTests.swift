@@ -114,10 +114,11 @@ final class DaySummaryDocumentTests: XCTestCase {
             timeZone: utc
         )
         XCTAssertEqual(layout.dayRanges.first?.heading.hasPrefix("Today"), true)
-        let shouted = document.string
-            .split(whereSeparator: { !$0.isLetter })
-            .map(String.init)
-            .filter { $0.count > 2 && $0 == $0.uppercased() && $0 != $0.lowercased() }
+        let words = document.string.split(whereSeparator: { !$0.isLetter })
+        let strings = words.map { String($0) }
+        let shouted = strings.filter {
+            $0.count > 2 && $0 == $0.uppercased() && $0 != $0.lowercased()
+        }
         XCTAssertTrue(shouted.isEmpty, "found all-caps words: \(shouted)")
     }
 
