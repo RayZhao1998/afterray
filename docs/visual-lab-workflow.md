@@ -14,6 +14,7 @@ Visual Lab 用于不启动完整 App、不申请权限、不碰真实 vault 的�
 
 ```sh
 make visual-lab          # Recall surface
+make visual-lab-summary-stress # 7-day mixed 30/10-minute summary history
 make settings-lab        # Settings surface, AI Models page
 # or: swift run afterray-visual-lab -- --settings --models
 ```

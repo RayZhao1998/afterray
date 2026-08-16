@@ -152,6 +152,10 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
             print!("{text}");
             std::io::stdout().flush()?;
         }
+        ChatStreamEvent::Reasoning { text, .. } => {
+            eprint!("{text}");
+            std::io::stderr().flush()?;
+        }
         ChatStreamEvent::Usage {
             prompt_tokens,
             window_tokens,
@@ -164,16 +168,13 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
         ChatStreamEvent::Started { .. } => {}
         ChatStreamEvent::Progress {
             phase,
-            reasoning_deltas,
+            reasoning_deltas: _,
             elapsed_ms,
             round,
         } => {
             // On one line, rewritten in place: this fires every 400 ms while a
             // turn is quiet, and scrolling the terminal would bury the answer.
-            print!(
-                "\r{phase} round={round} {reasoning_deltas} steps {}s   ",
-                elapsed_ms / 1_000
-            );
+            print!("\r{phase} round={round} {}s   ", elapsed_ms / 1_000);
             std::io::stdout().flush()?;
         }
         ChatStreamEvent::Compaction {

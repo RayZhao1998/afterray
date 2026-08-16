@@ -46,6 +46,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
+            refreshSummary()
             return
         }
         let window = NSWindow(
@@ -71,11 +72,24 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        Task {
-            await AfterRayServices.shared.store.loadDaySummary(
-                dayMs: Int64(Date().timeIntervalSince1970 * 1_000),
-                force: true
-            )
+        refreshSummary()
+    }
+
+    /// The retained window can outlive a daemon restart or a lock-screen
+    /// sensitive-state purge. Refresh on every show, including window reuse;
+    /// otherwise one transient connection refusal leaves the placeholder
+    /// document mounted forever.
+    private func refreshSummary() {
+        Task { @MainActor in
+            do {
+                _ = try await DaemonSupervisor.shared.startIfNeeded()
+                await AfterRayServices.shared.store.loadDaySummary(
+                    dayMs: Int64(Date.now.timeIntervalSince1970 * 1_000),
+                    force: true
+                )
+            } catch {
+                AfterRayServices.shared.store.reportFailure(error.localizedDescription)
+            }
         }
     }
 
@@ -96,11 +110,8 @@ private struct HistoryWindowRoot: View {
             hasMore: store.summaryHistoryHasMore,
             isLoadingMore: store.isLoadingSummaryHistory,
             followPulse: 0,
-            onSelectSlot: { slotStartMs in
-                // Jumping to a moment is an overlay affair: bring it up on
-                // the selected half hour. The window stays where it is.
-                AfterRayServices.shared.store.select(playheadMs: slotStartMs)
-                RecallOverlayController.shared.show()
+            onSelectSlot: { slot in
+                RecallOverlayController.shared.show(navigatingTo: slot)
             },
             onLoadMore: {
                 Task { await AfterRayServices.shared.store.loadOlderSummaryHistory() }

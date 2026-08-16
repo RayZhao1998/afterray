@@ -72,19 +72,21 @@ pub type TranscriptLine = (i64, String, String);
 pub type MomentAt = (String, i64);
 
 pub use slot::{
-    AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
-    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
+    AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow,
+    LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotCard,
+    SlotEvidence, SlotExportFacts, SlotFacts, SlotMomentRow, SlotState, SlotSummaryExport,
     SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, T2Card, T2CardV2,
     T2Entity, T2Thread, T2VerifyReport, TimelineEntry, assemble_day_summary,
-    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object, local_day_bounds,
-    local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place,
+    attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
+    extract_json_object, local_day_bounds, local_day_for, next_legacy_slot_boundary,
+    parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place, slot_bounds_for,
     slot_clock_label, slot_start_for, verify_t2_card,
 };
 
 mod readonly;
 pub use readonly::ReadOnlyVault;
 
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// What conversations may occupy, separate from the capture budget.
 ///
@@ -532,6 +534,9 @@ pub struct Vault {
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
     max_storage_bytes: AtomicU64,
+    /// Absent for a new/empty vault. Existing vaults persist the first
+    /// 10-minute boundary so reopening never reinterprets old half-hours.
+    summary_slot_cutover_ms: Option<i64>,
 }
 
 /// A handful of `PRAGMA query_only` connections, handed out round-robin.
@@ -590,8 +595,38 @@ pub struct MessageUpdate<'a> {
     pub usage_json: Option<&'a str>,
 }
 
+type SlotSummaryExportRow = (
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<f32>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
 
 impl Vault {
+    #[must_use]
+    pub const fn summary_slot_cutover_ms(&self) -> Option<i64> {
+        self.summary_slot_cutover_ms
+    }
+
+    #[must_use]
+    pub fn summary_slot_bounds(&self, at_ms: i64) -> slot::SlotBounds {
+        slot::slot_bounds_for(at_ms, self.summary_slot_cutover_ms)
+    }
+
     pub fn open(config: VaultConfig, provider: &dyn KeyProvider) -> Result<Self, StoreError> {
         let database_path = config.data_dir.join("afterray.sqlite3");
         let existing_vault = database_path
@@ -615,6 +650,7 @@ impl Vault {
         let connection =
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
+        let summary_slot_cutover_ms = read_summary_slot_cutover(&connection)?;
         connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
         set_database_file_permissions(&database_path)?;
         // Readers open only after migration has settled the schema.
@@ -631,6 +667,7 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
+            summary_slot_cutover_ms,
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
@@ -1133,8 +1170,9 @@ impl Vault {
         at_ms: i64,
         capture_interval_ms: i64,
     ) -> Result<slot::SlotCard, StoreError> {
-        let slot_start_ms = slot::slot_start_for(at_ms);
-        let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
+        let bounds = self.summary_slot_bounds(at_ms);
+        let slot_start_ms = bounds.start_ms;
+        let slot_end_ms = bounds.end_ms;
 
         // A settled half hour is immutable except for deletion, and every
         // deletion path flushes this cache. The same card used to be rebuilt
@@ -1178,7 +1216,13 @@ impl Vault {
             }
         }
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
-        let card = slot::build_slot_card(slot_start_ms, &rows, idle_ms, capture_interval_ms);
+        let card = slot::build_slot_card_with_end(
+            slot_start_ms,
+            slot_end_ms,
+            &rows,
+            idle_ms,
+            capture_interval_ms,
+        );
         if settled {
             let mut cache = self.card_cache.lock().unwrap();
             if cache.len() >= Self::CARD_CACHE_CAP {
@@ -1214,7 +1258,7 @@ impl Vault {
         max_slots: usize,
     ) -> Result<usize, StoreError> {
         const BACKFILL_REACH_MS: i64 = 14 * 24 * 60 * 60 * 1000;
-        let current_slot = slot::slot_start_for(now_ms);
+        let current_slot = self.summary_slot_bounds(now_ms).start_ms;
         let floor = now_ms.saturating_sub(BACKFILL_REACH_MS);
         let mut watermark = {
             let connection = self.connection.lock().unwrap();
@@ -1223,19 +1267,20 @@ impl Vault {
             let mut rows = statement.query([])?;
             match rows.next()? {
                 Some(row) => row.get::<_, i64>(0)?,
-                None => slot::slot_start_for(floor),
+                None => self.summary_slot_bounds(floor).start_ms,
             }
         }
-        .max(slot::slot_start_for(floor));
+        .max(self.summary_slot_bounds(floor).start_ms);
 
         let mut processed = 0_usize;
         while processed < max_slots {
-            if watermark + slot::SLOT_DURATION_MS > current_slot.min(now_ms) {
+            let bounds = self.summary_slot_bounds(watermark);
+            if bounds.end_ms > current_slot.min(now_ms) {
                 break; // only slots that have fully closed
             }
-            let slot_start = watermark;
-            watermark += slot::SLOT_DURATION_MS;
-            let rows = self.slot_moment_rows(slot_start, slot_start + slot::SLOT_DURATION_MS)?;
+            let slot_start = bounds.start_ms;
+            watermark = bounds.end_ms;
+            let rows = self.slot_moment_rows(slot_start, bounds.end_ms)?;
             let (line_keys, tokens) = slot::df_contribution(&rows);
             let connection = self.connection.lock().unwrap();
             let tx = connection.unchecked_transaction()?;
@@ -1367,13 +1412,18 @@ impl Vault {
                 evidence_json = excluded.evidence_json,
                 producer = excluded.producer,
                 produced_at_ms = excluded.produced_at_ms,
-                latency_ms = excluded.latency_ms",
+                latency_ms = excluded.latency_ms,
+                description = NULL,
+                threads_json = NULL,
+                entities_json = NULL,
+                decisions_json = NULL,
+                not_captured_json = NULL",
             params![
                 id,
                 card.slot_start_ms,
                 card.slot_end_ms,
                 card.local_day,
-                SLOT_SUMMARY_SCHEMA_VERSION,
+                LEGACY_SLOT_SUMMARY_SCHEMA_VERSION,
                 facts_json,
                 card.theme_key,
                 artifacts_json,
@@ -1414,14 +1464,16 @@ impl Vault {
         self.put_t2_summary(card, &compat, producer, produced_at_ms, latency_ms)?;
         self.connection.lock().unwrap().execute(
             "UPDATE slot_summaries SET
-                description = ?2,
-                threads_json = ?3,
-                entities_json = ?4,
-                decisions_json = ?5,
-                not_captured_json = ?6
+                schema_version = ?2,
+                description = ?3,
+                threads_json = ?4,
+                entities_json = ?5,
+                decisions_json = ?6,
+                not_captured_json = ?7
               WHERE slot_start_ms = ?1",
             params![
                 card.slot_start_ms,
+                SLOT_SUMMARY_SCHEMA_VERSION,
                 t2.description.trim(),
                 serde_json::to_string(&t2.threads).ok(),
                 serde_json::to_string(&t2.entities).ok(),
@@ -1464,6 +1516,107 @@ impl Vault {
         Ok(cards)
     }
 
+    /// Returns one slot's user-visible facts and parsed persisted `P2`. The
+    /// query deliberately does not select evidence_json, artifacts, prompts,
+    /// tool results, or model completion text.
+    #[allow(clippy::too_many_lines)]
+    pub fn slot_summary_export(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SlotSummaryExport, StoreError> {
+        let card = self.slot_card(at_ms, capture_interval_ms)?;
+        let connection = self.readers.get();
+        let row: Option<SlotSummaryExportRow> = connection
+            .query_row(
+                "SELECT state, generation, schema_version, title, bullets_json, artifacts_json,
+                        category, description, threads_json, entities_json,
+                        decisions_json, not_captured_json, confidence, produced_at_ms, producer,
+                        latency_ms, slot_end_ms
+                   FROM slot_summaries
+                  WHERE slot_start_ms = ?1",
+                [card.slot_start_ms],
+                |row| {
+                    Ok((
+                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                        row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+                        row.get(15)?, row.get(16)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            state_raw, generation, schema_version, title, bullets_json, artifacts_json, category,
+            description, threads_json, entities_json, decisions_json, not_captured_json, confidence,
+            produced_at_ms, producer, latency_ms, stored_end_ms,
+        )) = row else {
+            return Ok(slot::SlotSummaryExport {
+                slot_start_ms: card.slot_start_ms,
+                slot_end_ms: card.slot_end_ms,
+                state: slot::SlotSummaryState::from_t1(card.state),
+                schema_version: None,
+                summary: None,
+                facts: slot::SlotExportFacts::from(&card.facts),
+                generation: None,
+                producer: None,
+                produced_at_ms: None,
+                latency_ms: None,
+            });
+        };
+
+        let summary = title.as_ref().map(|title| {
+            if schema_version >= slot::SLOT_SUMMARY_SCHEMA_VERSION {
+                serde_json::to_value(slot::T2CardV2 {
+                    title: title.clone(),
+                    description: description.unwrap_or_default(),
+                    threads: threads_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    entities: entities_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    decisions: decisions_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    not_captured: not_captured_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    category,
+                    confidence,
+                })
+                .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::to_value(slot::T2Card {
+                    artifacts: artifacts_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    title: title.clone(),
+                    bullets: bullets_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_default(),
+                    category,
+                    confidence,
+                })
+                .unwrap_or(serde_json::Value::Null)
+            }
+        });
+        Ok(slot::SlotSummaryExport {
+            slot_start_ms: card.slot_start_ms,
+            slot_end_ms: stored_end_ms.unwrap_or(card.slot_end_ms),
+            state: slot::SlotSummaryState::parse(&state_raw)
+                .unwrap_or(slot::SlotSummaryState::Degraded),
+            schema_version: Some(schema_version),
+            summary,
+            facts: slot::SlotExportFacts::from(&card.facts),
+            generation: Some(generation),
+            producer,
+            produced_at_ms,
+            latency_ms,
+        })
+    }
+
     /// The day panel payload: every occupied slot that day, with T2 titles
     /// when they exist and T1 facts otherwise.
     ///
@@ -1483,8 +1636,9 @@ impl Vault {
         let rows = self.slot_moment_rows(day_start_ms, day_end_ms)?;
         let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
         for row in rows {
+            let bounds = self.summary_slot_bounds(row.captured_at_ms);
             grouped
-                .entry(slot::slot_start_for(row.captured_at_ms))
+                .entry(bounds.start_ms)
                 .or_default()
                 .push(row);
         }
@@ -1507,12 +1661,13 @@ impl Vault {
                     chunk
                         .iter()
                         .map(|(start, slot_rows)| {
-                            let idle_ms =
-                                self.idle_overlap_ms(*start, *start + slot::SLOT_DURATION_MS)?;
+                            let bounds = self.summary_slot_bounds(*start);
+                            let idle_ms = self.idle_overlap_ms(bounds.start_ms, bounds.end_ms)?;
                             Ok((
                                 *start,
-                                slot::build_slot_card(
-                                    *start,
+                                slot::build_slot_card_with_end(
+                                    bounds.start_ms,
+                                    bounds.end_ms,
                                     slot_rows,
                                     idle_ms,
                                     capture_interval_ms,
@@ -1601,7 +1756,7 @@ impl Vault {
     ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT slot_start_ms, state, title, bullets_json, category,
+            "SELECT slot_start_ms, slot_end_ms, state, schema_version, title, bullets_json, category,
                     description, threads_json, entities_json, decisions_json,
                     not_captured_json
                FROM slot_summaries
@@ -1610,30 +1765,51 @@ impl Vault {
         )?;
         let rows = statement.query_map(params![local_day], |row| {
             let start: i64 = row.get(0)?;
-            let state_raw: String = row.get(1)?;
-            let title: Option<String> = row.get(2)?;
-            let bullets_json: Option<String> = row.get(3)?;
-            let category: Option<String> = row.get(4)?;
-            let description: Option<String> = row.get(5)?;
-            let threads_json: Option<String> = row.get(6)?;
-            let entities_json: Option<String> = row.get(7)?;
-            let decisions_json: Option<String> = row.get(8)?;
-            let not_captured_json: Option<String> = row.get(9)?;
+            let slot_end_ms: i64 = row.get(1)?;
+            let state_raw: String = row.get(2)?;
+            let schema_version: i64 = row.get(3)?;
+            let title: Option<String> = row.get(4)?;
+            let bullets_json: Option<String> = row.get(5)?;
+            let category: Option<String> = row.get(6)?;
+            let description: Option<String> = row.get(7)?;
+            let threads_json: Option<String> = row.get(8)?;
+            let entities_json: Option<String> = row.get(9)?;
+            let decisions_json: Option<String> = row.get(10)?;
+            let not_captured_json: Option<String> = row.get(11)?;
+            let is_v2 = schema_version >= slot::SLOT_SUMMARY_SCHEMA_VERSION;
             let parse_list =
                 |json: Option<String>| json.and_then(|raw| serde_json::from_str(&raw).ok());
             let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
+            let description = if is_v2 {
+                description.filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            let threads = if is_v2 {
+                threads_json.and_then(|raw| serde_json::from_str(&raw).ok())
+            } else {
+                None
+            };
+            let entities = if is_v2 {
+                entities_json.and_then(|raw| serde_json::from_str(&raw).ok())
+            } else {
+                None
+            };
+            let decisions = if is_v2 { parse_list(decisions_json) } else { None };
+            let not_captured = if is_v2 { parse_list(not_captured_json) } else { None };
             Ok((
                 start,
                 slot::StoredSlotOverlay {
+                    slot_end_ms: Some(slot_end_ms),
                     state: slot::SlotSummaryState::parse(&state_raw),
                     title,
                     bullets,
                     category,
-                    description: description.filter(|text| !text.is_empty()),
-                    threads: threads_json.and_then(|raw| serde_json::from_str(&raw).ok()),
-                    entities: entities_json.and_then(|raw| serde_json::from_str(&raw).ok()),
-                    decisions: parse_list(decisions_json),
-                    not_captured: parse_list(not_captured_json),
+                    description,
+                    threads,
+                    entities,
+                    decisions,
+                    not_captured,
                 },
             ))
         })?;
@@ -3277,6 +3453,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_16(connection)?;
     migrate_schema_18(connection, from_version)?;
     migrate_schema_19(connection)?;
+    migrate_schema_20(connection, from_version)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3289,6 +3466,19 @@ fn stored_schema_version(connection: &Connection) -> Result<u32, StoreError> {
     Ok(version
         .and_then(|held| u32::try_from(held).ok())
         .unwrap_or(0))
+}
+
+const SUMMARY_SLOT_CUTOVER_KEY: &str = "summary_slot_cutover_ms";
+
+fn read_summary_slot_cutover(connection: &Connection) -> Result<Option<i64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT value_int FROM vault_meta WHERE key = ?1",
+            [SUMMARY_SLOT_CUTOVER_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
 }
 
 fn moment_column_names(connection: &Connection) -> Result<Vec<String>, StoreError> {
@@ -3749,6 +3939,37 @@ fn migrate_schema_19(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Freezes the old slot geometry once, at the next half-hour boundary after
+/// the final moment captured by a pre-v20 vault. Empty/new vaults deliberately
+/// store no marker and use 10-minute slots from their first moment.
+fn migrate_schema_20(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vault_meta (
+           key TEXT PRIMARY KEY,
+           value_int INTEGER
+         );",
+    )?;
+    if from_version >= 20 || read_summary_slot_cutover(connection)?.is_some() {
+        return Ok(());
+    }
+    let latest: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(captured_at_ms) FROM moments",
+            [],
+            |row| row.get(0),
+        )?;
+    if let Some(latest) = latest {
+        connection.execute(
+            "INSERT INTO vault_meta (key, value_int) VALUES (?1, ?2)",
+            params![
+                SUMMARY_SLOT_CUTOVER_KEY,
+                slot::next_legacy_slot_boundary(latest),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_schema_18(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
     if from_version >= 18 {
         return Ok(());
@@ -4154,6 +4375,235 @@ mod pipeline_bench;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn new_vault_starts_with_ten_minute_summary_slots() {
+        let (_directory, vault) = test_vault(10);
+        assert_eq!(vault.summary_slot_cutover_ms(), None);
+        let bounds = vault.summary_slot_bounds(1_786_699_244_105);
+        assert_eq!(bounds.end_ms - bounds.start_ms, CURRENT_SLOT_DURATION_MS);
+    }
+
+    #[test]
+    fn schema_20_persists_one_contiguous_summary_slot_cutover() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let key = [29_u8; 32];
+        let captured_at_ms = 1_786_699_244_105;
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(captured_at_ms).unwrap();
+            vault
+                .insert_moment(&session.id, captured_at_ms, "image/jpeg", b"frame")
+                .unwrap();
+            let connection = vault.connection.lock().unwrap();
+            connection.execute("DELETE FROM vault_meta", []).unwrap();
+            connection
+                .execute("UPDATE schema_meta SET version = 19", [])
+                .unwrap();
+        }
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let cutover = next_legacy_slot_boundary(captured_at_ms);
+        assert_eq!(vault.summary_slot_cutover_ms(), Some(cutover));
+        let before = vault.summary_slot_bounds(cutover - 1);
+        let after = vault.summary_slot_bounds(cutover);
+        assert_eq!(before.end_ms, after.start_ms);
+        assert_eq!(before.end_ms - before.start_ms, SLOT_DURATION_MS);
+        assert_eq!(after.end_ms - after.start_ms, CURRENT_SLOT_DURATION_MS);
+    }
+
+    #[test]
+    fn schema_20_upgrade_preserves_legacy_v1_summary_shape_and_half_hour_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let key = [31_u8; 32];
+        let legacy_start = slot_start_for(1_786_699_244_105);
+        let captured_at_ms = legacy_start + 60_000;
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(captured_at_ms).unwrap();
+            vault
+                .insert_moment(&session.id, captured_at_ms, "image/jpeg", b"legacy frame")
+                .unwrap();
+            let card = vault.slot_card(captured_at_ms, 10_000).unwrap();
+            assert_eq!(card.slot_start_ms, legacy_start);
+            vault
+                .put_t2_summary(
+                    &card,
+                    &T2Card {
+                        artifacts: vec!["legacy.rs".into()],
+                        title: "Legacy summary".into(),
+                        bullets: vec!["Old bullet remains readable".into()],
+                        category: Some("coding".into()),
+                        confidence: Some(0.8),
+                    },
+                    "legacy:model",
+                    captured_at_ms,
+                    Some(42),
+                )
+                .unwrap();
+            let connection = vault.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE slot_summaries SET slot_end_ms = ?2 WHERE slot_start_ms = ?1",
+                    params![legacy_start, legacy_start + SLOT_DURATION_MS],
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE slot_summaries DROP COLUMN description;
+                     ALTER TABLE slot_summaries DROP COLUMN threads_json;
+                     ALTER TABLE slot_summaries DROP COLUMN entities_json;
+                     ALTER TABLE slot_summaries DROP COLUMN decisions_json;
+                     ALTER TABLE slot_summaries DROP COLUMN not_captured_json;
+                     DELETE FROM vault_meta;
+                     UPDATE schema_meta SET version = 15;",
+                )
+                .unwrap();
+        }
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        assert_eq!(
+            vault.summary_slot_cutover_ms(),
+            Some(legacy_start + SLOT_DURATION_MS)
+        );
+        let day = vault.day_summary(captured_at_ms, 10_000).unwrap();
+        let legacy = day
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == legacy_start)
+            .expect("legacy summary remains in its original slot");
+        assert_eq!(legacy.slot_end_ms, legacy_start + SLOT_DURATION_MS);
+        assert_eq!(legacy.title.as_deref(), Some("Legacy summary"));
+        assert_eq!(
+            legacy.bullets.as_deref(),
+            Some(["Old bullet remains readable".to_owned()].as_slice())
+        );
+        assert!(legacy.description.is_none());
+        assert!(legacy.threads.is_none());
+
+        let exported = vault.slot_summary_export(captured_at_ms, 10_000).unwrap();
+        assert_eq!(
+            exported.schema_version,
+            Some(LEGACY_SLOT_SUMMARY_SCHEMA_VERSION)
+        );
+        let summary = exported.summary.expect("legacy structured summary exports");
+        assert_eq!(summary["title"], "Legacy summary");
+        assert_eq!(summary["bullets"][0], "Old bullet remains readable");
+        assert!(summary.get("description").is_none());
+    }
+
+    #[test]
+    fn writing_v1_after_v2_clears_v2_only_columns() {
+        let (_directory, vault) = test_vault(10);
+        let bounds = vault.summary_slot_bounds(1_600_000_000_000);
+        let session = vault.create_session_sync(bounds.start_ms).unwrap();
+        vault
+            .insert_moment(
+                &session.id,
+                bounds.start_ms + 1_000,
+                "image/jpeg",
+                b"frame",
+            )
+            .unwrap();
+        let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
+        vault
+            .put_t2_summary_v2(
+                &card,
+                &T2CardV2 {
+                    title: "New shape".into(),
+                    description: "Must be cleared".into(),
+                    threads: vec![slot::T2Thread {
+                        name: "Thread".into(),
+                        prose: "Must also be cleared".into(),
+                        moment_ids: Vec::new(),
+                    }],
+                    ..T2CardV2::default()
+                },
+                "test",
+                bounds.end_ms,
+                None,
+            )
+            .unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: Vec::new(),
+                    title: "Old shape again".into(),
+                    bullets: vec!["Only this bullet remains".into()],
+                    category: None,
+                    confidence: None,
+                },
+                "legacy:test",
+                bounds.end_ms + 1,
+                None,
+            )
+            .unwrap();
+
+        let row: (i64, Option<String>, Option<String>) = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT schema_version, description, threads_json
+                   FROM slot_summaries WHERE slot_start_ms = ?1",
+                [bounds.start_ms],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, None, None));
+    }
+
+    #[test]
+    fn slot_summary_export_is_structured_and_excludes_capture_evidence() {
+        let (_directory, vault) = test_vault(10);
+        let bounds = vault.summary_slot_bounds(1_600_000_000_000);
+        let session = vault.create_session_sync(bounds.start_ms).unwrap();
+        for offset in [1_000, 20_000, 40_000] {
+            vault
+                .insert_moment(
+                    &session.id,
+                    bounds.start_ms + offset,
+                    "image/jpeg",
+                    b"private pixels",
+                )
+                .unwrap();
+        }
+        let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
+        let summary = slot::T2CardV2 {
+            title: "Exported parsed card".into(),
+            description: "Visible description".into(),
+            threads: vec![slot::T2Thread {
+                name: "Implementation".into(),
+                prose: "Completed the structured export.".into(),
+                moment_ids: card.evidence.moment_ids.clone(),
+            }],
+            decisions: vec!["Keep the export bounded".into()],
+            not_captured: vec!["Release result not shown".into()],
+            ..slot::T2CardV2::default()
+        };
+        vault
+            .put_t2_summary_v2(&card, &summary, "test", bounds.end_ms, Some(25))
+            .unwrap();
+
+        let exported = vault.slot_summary_export(bounds.start_ms, 10_000).unwrap();
+        assert_eq!(exported.slot_end_ms, bounds.end_ms);
+        assert_eq!(exported.schema_version, Some(SLOT_SUMMARY_SCHEMA_VERSION));
+        assert_eq!(exported.generation, Some(1));
+        assert!(exported.summary.is_some());
+        let json = serde_json::to_string(&exported).unwrap();
+        for forbidden in ["ocr", "accessibility", "evidence", "prompt", "completion", "tool_result"] {
+            assert!(!json.contains(forbidden), "export leaked {forbidden}: {json}");
+        }
+    }
 
     /// Conversations were outside every budget: an unbounded growth path, and
     /// reasoning made each row bigger. They now have their own pool, and the

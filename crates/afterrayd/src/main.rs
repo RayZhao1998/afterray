@@ -812,6 +812,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         }
         Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
         Request::SlotBackfill { days } => slot_backfill(state, days).await,
+        Request::SlotSummaryExport { at_ms } => {
+            run_store(state, move |s| {
+                let interval_ms = i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                into_response(s.store.slot_summary_export(at_ms, interval_ms))
+            })
+            .await
+        }
         Request::DaySummary { day_ms } => {
             run_store(state, move |s| {
                 let interval_ms = i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
@@ -2475,12 +2482,13 @@ fn t2_may_run(conditions: MachineConditions) -> Result<(), String> {
 fn slots_awaiting_t2(state: &Arc<AppState>, now: i64, lookback_days: i64) -> Vec<i64> {
     let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
     let mut due = Vec::new();
-    for day in 0..=lookback_days.max(0) {
-        let day_ms = now - day * 24 * 60 * 60 * 1000;
+    let mut day_ms = now;
+    for _ in 0..=lookback_days.max(0) {
         let Ok(summary) = state.store.day_summary(day_ms, interval_ms) else {
             continue;
         };
         due.extend(due_slot_starts(&summary.slots, now));
+        day_ms = summary.day_start_ms.saturating_sub(1);
     }
     due.sort_unstable();
     due.dedup();

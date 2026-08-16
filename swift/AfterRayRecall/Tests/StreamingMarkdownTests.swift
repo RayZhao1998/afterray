@@ -83,4 +83,37 @@ final class StreamingMarkdownTests: XCTestCase {
         let blocks = StreamingMarkdown.blocks(from: "> leftover light\n\n---")
         XCTAssertEqual(blocks, [.quote("leftover light"), .rule])
     }
+
+    func testStandaloneMomentImageBecomesTrustedMediaBlock() {
+        let source = "Before\n\n![2:14 Safari](afterray://moment/moment-123)\n\nAfter"
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: source),
+            [
+                .paragraph("Before"),
+                .momentImage(label: "2:14 Safari", momentID: "moment-123"),
+                .paragraph("After"),
+            ]
+        )
+    }
+
+    func testExternalAndLocalImagesStaySelectableText() {
+        for source in [
+            "![remote](https://example.com/image.jpg)",
+            "![local](file:///tmp/private.png)",
+            "![inline](data:image/png;base64,AAAA)",
+        ] {
+            XCTAssertEqual(StreamingMarkdown.blocks(from: source), [.paragraph(source)])
+        }
+    }
+
+    func testPartialOrEmbeddedMomentImageDoesNotLoadMedia() {
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: "![still streaming](afterray://moment/abc"),
+            [.paragraph("![still streaming](afterray://moment/abc")]
+        )
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here"),
+            [.paragraph("See ![frame](afterray://moment/abc) here")]
+        )
+    }
 }

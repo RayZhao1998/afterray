@@ -260,6 +260,13 @@ can reveal the folder or copy a diagnostic report.
 | `AFTERRAY_CODESIGN_IDENTITY` | Signing identity for dev and release builds | First `Developer ID Application` identity |
 | `AFTERRAY_NOTARY_PROFILE` | `notarytool` keychain profile used by `make release` | — |
 
+`make dev` preserves an explicit `AFTERRAY_DATA_DIR` across watch-mode app
+relaunches. To run the development UI against the installed app's local vault:
+
+```sh
+AFTERRAY_DATA_DIR="$HOME/Library/Application Support/AfterRay" make dev
+```
+
 ## Releasing
 
 Production distribution uses a Developer ID-signed, hardened, notarized DMG

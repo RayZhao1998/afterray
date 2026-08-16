@@ -18,6 +18,7 @@ public enum DaySummaryDocument {
     /// Link scheme for jump affordances inside the document. The URL host
     /// carries the slot start in milliseconds.
     public static let slotLinkScheme = "afterray-slot"
+    public static let detailsLinkScheme = "afterray-slot-details"
 
     /// Carried by each app-icon run, and shrunk to `hairlineFont` by the
     /// hosting view when an icon proves unresolvable, so a line whose icons
@@ -25,6 +26,10 @@ public enum DaySummaryDocument {
     public static let iconRunFont = NSFont.systemFont(ofSize: 11)
     /// Thin enough to add nothing to a line's height.
     public static let hairlineFont = NSFont.systemFont(ofSize: 1)
+    /// AppKit counterpart of `RecallPalette.ray`, shared by the timestamp's
+    /// default, hover, and current states so the link does not change hue as
+    /// it becomes more prominent.
+    public static let accentColor = NSColor(red: 1, green: 0.20, blue: 0.14, alpha: 1)
 
     /// Where the timeline rule is drawn, in text-container coordinates.
     public static let spineX: CGFloat = 44
@@ -39,6 +44,11 @@ public enum DaySummaryDocument {
 
     public static func slotStart(from url: URL) -> Int64? {
         guard url.scheme == slotLinkScheme else { return nil }
+        return url.host.flatMap(Int64.init)
+    }
+
+    public static func detailsSlotStart(from url: URL) -> Int64? {
+        guard url.scheme == detailsLinkScheme else { return nil }
         return url.host.flatMap(Int64.init)
     }
 
@@ -101,6 +111,7 @@ public enum DaySummaryDocument {
     public static func build(
         summaries: [DaySummary],
         nowMs: Int64,
+        expandedSlotStarts: Set<Int64> = [],
         timeZone: TimeZone = .current
     ) -> (document: NSAttributedString, layout: Layout) {
         let text = NSMutableAttributedString()
@@ -131,7 +142,12 @@ public enum DaySummaryDocument {
 
             for slot in DaySummaryLayout.displayOrder(summary.slots) {
                 let slotStart = text.length
-                let timeRange = appendSlot(slot, to: text, timeZone: timeZone)
+                let timeRange = appendSlot(
+                    slot,
+                    to: text,
+                    expanded: expandedSlotStarts.contains(slot.slotStartMs),
+                    timeZone: timeZone
+                )
                 layout.timeRanges[slot.slotStartMs] = timeRange
                 layout.slotRanges[slot.slotStartMs] = NSRange(
                     location: slotStart,
@@ -142,11 +158,12 @@ public enum DaySummaryDocument {
         return (text, layout)
     }
 
-    /// Appends one half hour and returns the range of its time chip.
+    /// Appends one slot and returns the range of its time chip.
     @discardableResult
     private static func appendSlot(
         _ slot: DaySlotSummary,
         to text: NSMutableAttributedString,
+        expanded: Bool,
         timeZone: TimeZone
     ) -> NSRange {
         let row = DaySummaryLayout.rowText(slot: slot, timeZone: timeZone)
@@ -158,8 +175,9 @@ public enum DaySummaryDocument {
             string: row.time,
             attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.4),
+                .foregroundColor: accentColor.withAlphaComponent(0.72),
                 .link: slotLink(startMs: slot.slotStartMs),
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
                 .paragraphStyle: titleParagraph,
             ]
         ))
@@ -177,21 +195,45 @@ public enum DaySummaryDocument {
 
         for detail in row.detail {
             text.append(NSAttributedString(
-                string: "·\t",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: NSColor.white.withAlphaComponent(0.34),
-                    .paragraphStyle: bulletParagraph,
-                ]
-            ))
-            text.append(NSAttributedString(
                 string: detail + "\n",
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 11),
                     .foregroundColor: NSColor.white.withAlphaComponent(0.68),
-                    .paragraphStyle: bulletParagraph,
+                    .paragraphStyle: descriptionParagraph,
                 ]
             ))
+        }
+
+        let sections = DaySummaryLayout.expandedSections(slot: slot)
+        if !sections.isEmpty {
+            // Full details is the sole secondary action for a summary entry.
+            text.append(actionLink(
+                expanded ? "Hide details" : "Full details",
+                scheme: detailsLinkScheme,
+                startMs: slot.slotStartMs
+            ))
+            if expanded {
+                for section in sections {
+                    if let heading = section.heading {
+                        text.append(NSAttributedString(
+                            string: heading + "\n",
+                            attributes: [
+                                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                                .foregroundColor: NSColor.white.withAlphaComponent(0.78),
+                                .paragraphStyle: bulletParagraph,
+                            ]
+                        ))
+                    }
+                    text.append(NSAttributedString(
+                        string: section.body + "\n",
+                        attributes: [
+                            .font: NSFont.systemFont(ofSize: 11),
+                            .foregroundColor: NSColor.white.withAlphaComponent(0.64),
+                            .paragraphStyle: bulletParagraph,
+                        ]
+                    ))
+                }
+            }
         }
 
         // Status gets its own line. Sharing one with the icons made a row of
@@ -251,6 +293,19 @@ public enum DaySummaryDocument {
         return timeRange
     }
 
+    private static func actionLink(_ title: String, scheme: String, startMs: Int64) -> NSAttributedString {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.48),
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .paragraphStyle: metaParagraph,
+        ]
+        if let url = URL(string: "\(scheme)://\(startMs)") {
+            attributes[.link] = url
+        }
+        return NSAttributedString(string: title + "\n", attributes: attributes)
+    }
+
     // ---------------------------------------------------------- paragraphs
 
     /// Everything hangs off `textX`; the tab interval repeats it so a chip
@@ -297,6 +352,15 @@ public enum DaySummaryDocument {
 
     private static let bulletParagraph: NSParagraphStyle = {
         let style = indented(firstLine: textX, wrap: bulletTextX, tab: bulletTextX)
+        style.paragraphSpacing = 3
+        style.lineSpacing = 1
+        return style
+    }()
+
+    /// The default card carries one prose description, not a list. It shares
+    /// the title's text edge; only expanded detail sections are subordinate.
+    private static let descriptionParagraph: NSParagraphStyle = {
+        let style = indented(firstLine: textX, wrap: textX, tab: textX)
         style.paragraphSpacing = 3
         style.lineSpacing = 1
         return style

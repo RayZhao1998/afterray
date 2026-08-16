@@ -6,6 +6,21 @@ public typealias RecallImageLoader = (String) async throws -> Data
 public typealias RecallArtifactLoader = (String) async throws -> Data
 public typealias RecallOcrLoader = @Sendable (String) async throws -> OcrEvidence
 
+/// Resolves the presentation state that owns both the recalled still and its
+/// opaque backdrop. During a fast scrub the transient value is authoritative:
+/// waiting for the bound value to settle leaves a full-screen dark layer over
+/// NOW after the still has already been removed. This is presentation state,
+/// not a request to decode or retain a special "live" screenshot.
+enum RecallPresentation {
+    static func isLive(committed: Bool, transient: Bool?) -> Bool {
+        transient ?? committed
+    }
+
+    static func showsHistoryBackdrop(committed: Bool, transient: Bool?) -> Bool {
+        !isLive(committed: committed, transient: transient)
+    }
+}
+
 public struct RecallView: View {
     public let moments: [RecallMoment]
     @Binding public var playheadMs: Int64
@@ -38,6 +53,7 @@ public struct RecallView: View {
     /// Detach the history panel into a standalone window; nil hides the
     /// affordance (Visual Lab, snapshots).
     public var onPopOutHistory: (() -> Void)?
+    public var onOpenSummarySlot: ((DaySlotSummary) -> Void)?
     public var onVisibleDayChange: ((Int64) -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
@@ -57,7 +73,7 @@ public struct RecallView: View {
     @State private var layoutCache = TimelineLayoutCache()
     /// True from the first scrub delta until the gesture (and its glide)
     /// settles. Expensive prefetch waits for the settle; the summary document
-    /// follows only when its highlighted half-hour changes.
+    /// follows only when its highlighted slot changes.
     @State private var isScrubbing = false
     /// Continuous travel stays inside this view. The store binding is committed
     /// once when motion settles, so the app root, history and audio pipeline do
@@ -99,6 +115,7 @@ public struct RecallView: View {
         isLoadingSummaryHistory: Bool = false,
         onLoadOlderSummaryHistory: (() -> Void)? = nil,
         onPopOutHistory: (() -> Void)? = nil,
+        onOpenSummarySlot: ((DaySlotSummary) -> Void)? = nil,
         onVisibleDayChange: ((Int64) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
@@ -130,6 +147,7 @@ public struct RecallView: View {
         self.isLoadingSummaryHistory = isLoadingSummaryHistory
         self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
         self.onPopOutHistory = onPopOutHistory
+        self.onOpenSummarySlot = onOpenSummarySlot
         self.onVisibleDayChange = onVisibleDayChange
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
@@ -151,7 +169,7 @@ public struct RecallView: View {
     }
 
     private var renderedIsLive: Bool {
-        scrubIsLive ?? isLive
+        RecallPresentation.isLive(committed: isLive, transient: scrubIsLive)
     }
 
     private var displayedArtifactID: String? {
@@ -175,7 +193,10 @@ public struct RecallView: View {
 
     public var body: some View {
         ZStack {
-            if !renderedIsLive {
+            if RecallPresentation.showsHistoryBackdrop(
+                committed: isLive,
+                transient: scrubIsLive
+            ) {
                 RecallPalette.background.ignoresSafeArea()
             }
 
@@ -241,7 +262,13 @@ public struct RecallView: View {
                             hasMore: summaryHistoryHasMore,
                             isLoadingMore: isLoadingSummaryHistory,
                             followPulse: followPulse,
-                            onSelectSlot: { selectPlayhead(playheadMs: $0) },
+                            onSelectSlot: { slot in
+                                if let onOpenSummarySlot {
+                                    onOpenSummarySlot(slot)
+                                } else {
+                                    selectPlayhead(playheadMs: slot.slotStartMs)
+                                }
+                            },
                             onLoadMore: { onLoadOlderSummaryHistory?() }
                         )
                         // The panel owns every scroll that starts over it —

@@ -88,7 +88,13 @@ build_and_launch_app() {
     printf '%s\n' 'Build failed. The previous AfterRay instance remains available.' >&2
     return 1
   fi
-  open -n "$app_bundle"
+  open_args=(-n)
+  # LaunchServices does not reliably inherit the invoking shell's environment.
+  # Preserve an explicit vault override across every watch-mode relaunch.
+  if [[ -n "${AFTERRAY_DATA_DIR:-}" ]]; then
+    open_args+=(--env "AFTERRAY_DATA_DIR=$AFTERRAY_DATA_DIR")
+  fi
+  open "${open_args[@]}" "$app_bundle"
   printf '%s\n' 'AfterRay relaunched. Watching for changes…'
 }
 

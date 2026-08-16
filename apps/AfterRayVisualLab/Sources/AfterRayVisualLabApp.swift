@@ -47,6 +47,8 @@ private struct VisualLabView: View {
         ? .stress
         : .long
     @State private var daySummaryKind: DaySummaryLabKind = .matching
+    private let summaryStress = CommandLine.arguments.contains("--summary-stress")
+    private let summaryStressHistory: [DaySummary]
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     /// Clicking the status capsule walks the states so every label and dot
     /// colour is reachable without a daemon.
@@ -70,6 +72,9 @@ private struct VisualLabView: View {
         let hotKeys = RecallHotKeyStore(storageKey: "dev.afterray.visual-lab.hotkey")
         _labHotKeys = State(initialValue: hotKeys)
         _onboardingModel = State(initialValue: Self.makeOnboardingModel(hotKeys: hotKeys))
+        summaryStressHistory = CommandLine.arguments.contains("--summary-stress")
+            ? DaySummary.mockMixedSlotWeek(around: RecallScenario.long.moments[12].capturedAtMs)
+            : []
     }
 
     private var moments: [RecallMoment] {
@@ -157,6 +162,7 @@ private struct VisualLabView: View {
                 recordingState: labRecordingState,
                 onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
                 daySummary: labDaySummary,
+                summaryHistory: summaryStressHistory,
                 searchSession: searchSession,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader,
@@ -350,6 +356,8 @@ private struct VisualLabView: View {
                 AfterRayChatView(
                     model: chat,
                     onClose: {},
+                    onOpenMoment: { _ in },
+                    thumbnailLoader: MockSearchData.thumbnailLoader,
                     fillsAvailableSpace: true
                 )
                 .padding(28)

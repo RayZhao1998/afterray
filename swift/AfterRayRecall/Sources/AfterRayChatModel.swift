@@ -11,6 +11,7 @@ public protocol AfterRayChatModeling: ObservableObject {
     var isLoadingHistory: Bool { get }
     var streamText: String { get }
     var streamTools: [ChatToolCall] { get }
+    var streamReasoning: [ChatReasoningRound] { get }
     var errorMessage: String? { get }
     var statusMessage: String? { get }
     /// Context occupancy for the turn in progress, or the last one in this
@@ -45,6 +46,7 @@ public extension AfterRayChatModeling {
             messages: messages,
             streamingText: streamText,
             streamingTools: streamTools,
+            streamingReasoning: streamReasoning,
             isSending: isSending,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             liveCompactions: isSending ? compactionNotices : [],
@@ -64,6 +66,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var isLoadingHistory = false
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
+    @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
@@ -119,6 +122,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         messages = []
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
         errorMessage = nil
         contextUsage = nil
@@ -150,6 +154,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         isSending = true
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
         cancelStreamPresentation()
         // A new turn starts from this conversation's stored history, not from
@@ -182,6 +187,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
         errorMessage = nil
         statusMessage = nil
@@ -203,7 +209,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 ChatStreamReducer.apply(event, to: &state)
                 scheduleStreamPresentation(
                     state,
-                    immediately: !event.isTextToken
+                    immediately: !event.isTextDelta
                 )
                 if let conversationId = state.conversationId {
                     bindConversation(conversationId)
@@ -250,6 +256,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             await refresh()
             streamText = ""
             streamTools = []
+            streamReasoning = []
             streamProgress = nil
             errorMessage = nil
             statusMessage = nil
@@ -278,6 +285,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         }
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
     }
 
@@ -291,6 +299,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         cancelStreamPresentation()
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
         guard let conversationId = selectedID, !conversationId.isEmpty else { return }
         await loadHistory(conversationId)
@@ -311,12 +320,13 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         }
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamProgress = nil
     }
 
-    /// Token traffic can be much faster than the display. Publishing at most
-    /// once per 33 ms keeps Markdown layout and bottom-follow near 30 Hz while
-    /// tool/progress/done events remain immediate.
+    /// Token and reasoning traffic can be much faster than the display.
+    /// Publishing at most once per 33 ms keeps layout and bottom-follow near
+    /// 30 Hz while tool/progress/done events remain immediate.
     private func scheduleStreamPresentation(
         _ state: ChatStreamState,
         immediately: Bool
@@ -346,6 +356,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     private func presentStream(_ state: ChatStreamState) {
         if streamText != state.text { streamText = state.text }
         if streamTools != state.tools { streamTools = state.tools }
+        if streamReasoning != state.reasoning { streamReasoning = state.reasoning }
         if streamProgress != state.progress { streamProgress = state.progress }
         if let usage = state.usage, contextUsage != usage { contextUsage = usage }
         if !state.compactions.isEmpty, compactionNotices != state.compactions {

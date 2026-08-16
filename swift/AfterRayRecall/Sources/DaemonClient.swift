@@ -27,6 +27,7 @@ public protocol RecallDaemonServing: Sendable {
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func daySummary(dayMs: Int64) async throws -> DaySummary
     func summaryHistory(beforeMs: Int64?, limit: Int) async throws -> SummaryHistoryPage
+    func slotSummaryExport(atMs: Int64) async throws -> SlotSummaryExport
     func artifact(id: String) async throws -> ArtifactPayload
     func gopSegment(id: String) async throws -> ArtifactPayload
     func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload
@@ -53,6 +54,10 @@ public extension RecallDaemonServing {
 
     func summaryHistory(beforeMs _: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
         SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
+    }
+
+    func slotSummaryExport(atMs _: Int64) async throws -> SlotSummaryExport {
+        throw DaemonClientError.rejected("summary export is not available")
     }
 
     func thumbnail(momentID _: String, maxEdge _: Int?) async throws -> ArtifactPayload {
@@ -179,7 +184,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 10
+    public static let protocolVersion = 12
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -426,6 +431,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
+    public func slotSummaryExport(atMs: Int64) async throws -> SlotSummaryExport {
+        try await request(
+            WireRequest(type: "slot_summary_export", atMs: atMs),
+            as: SlotSummaryExport.self
+        )
+    }
+
     public func recallWindow(sessionID: String, centerMs: Int64, limit: Int = 120) async throws -> [RecallMoment] {
         try await request(
             WireRequest(type: "recall_window", sessionID: sessionID, centerMs: centerMs, limit: limit),
@@ -528,6 +540,7 @@ struct WireRequest: Encodable, Equatable {
     var sinceMs: Int64?
     var dayMs: Int64?
     var beforeMs: Int64?
+    var atMs: Int64?
     var recordAudio: Bool?
     var reason: String?
     var paused: Bool?
@@ -568,6 +581,7 @@ struct WireRequest: Encodable, Equatable {
         case sinceMs = "since_ms"
         case dayMs = "day_ms"
         case beforeMs = "before_ms"
+        case atMs = "at_ms"
         case recordAudio = "record_audio"
         case reason
         case paused
@@ -610,6 +624,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(sinceMs, forKey: .sinceMs)
         try container.encodeIfPresent(dayMs, forKey: .dayMs)
         try container.encodeIfPresent(beforeMs, forKey: .beforeMs)
+        try container.encodeIfPresent(atMs, forKey: .atMs)
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encodeIfPresent(paused, forKey: .paused)

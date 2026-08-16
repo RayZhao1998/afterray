@@ -55,7 +55,14 @@ final class ChatWireTests: XCTestCase {
         XCTAssertEqual(progress.reasoningDeltas, 131)
         XCTAssertEqual(progress.elapsedMs, 2_400)
         XCTAssertEqual(progress.title, "Thinking")
-        XCTAssertEqual(progress.detail, "131 steps · 2.4s")
+        XCTAssertEqual(progress.detail, "2.4s")
+    }
+
+    func testReasoningDecodesFromTheWire() throws {
+        let event = try ChatStreamEventDecoder.decode(
+            line: Data(#"{"kind":"reasoning","text":"checking the timeline","round":2}"#.utf8)
+        )
+        XCTAssertEqual(event, .reasoning(text: "checking the timeline", round: 2))
     }
 
     /// A phase this build has never heard of must still show something. Blanking
@@ -97,6 +104,22 @@ final class ChatWireTests: XCTestCase {
         ChatStreamReducer.apply(.progress(progress), to: &state)
         ChatStreamReducer.apply(.done(messageId: "m", conversationId: "c"), to: &state)
         XCTAssertNil(state.progress)
+    }
+
+    func testReasoningAccumulatesByRound() {
+        var state = ChatStreamState()
+        ChatStreamReducer.apply(.reasoning(text: "checking ", round: 1), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "history", round: 1), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "using evidence", round: 2), to: &state)
+
+        XCTAssertEqual(
+            state.reasoning,
+            [
+                ChatReasoningRound(round: 1, text: "checking history"),
+                ChatReasoningRound(round: 2, text: "using evidence"),
+            ]
+        )
+        XCTAssertTrue(state.receivedWork)
     }
 
     func testUsageAndCompactionDecodeFromTheWire() throws {

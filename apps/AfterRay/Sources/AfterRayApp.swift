@@ -56,6 +56,13 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_: Notification) {
         AfterRayLog.install()
         AfterRayLog.info("application launched")
+        Task {
+            do {
+                try await SummaryExportFileStore.shared.prepareForLaunch()
+            } catch {
+                AfterRayLog.error("summary export cleanup failed: \(error.localizedDescription)")
+            }
+        }
         // Before anything else that could wedge: a hung main thread under a
         // status-bar-level, all-spaces overlay is a locked screen. The
         // watchdog samples the stall for the log, then kills the process so
@@ -79,6 +86,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
         Task { @MainActor in
             RecallOverlayController.shared.stop()
+            try? await SummaryExportFileStore.shared.cleanupAll()
             await DaemonSupervisor.shared.shutdown()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -493,10 +501,9 @@ final class RecallOverlayController: RecallHotKeyBinding {
         }
     }
 
-    func show() {
+    func show(navigatingTo summarySlot: DaySlotSummary? = nil) {
         guard let panel else { return }
         PermissionGuideController.shared.hide()
-        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: nil)
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
@@ -508,6 +515,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         panel.makeFirstResponder(panel)
+        // Publish only after the panel is key. The query bar handles this on
+        // the next main-actor turn, so its text field becomes first responder
+        // instead of losing a race to the panel itself.
+        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: summarySlot)
         AfterRayMenuBar.shared.setOverlayVisible(true)
         OverlayVisibility.shared.set(true)
         setCapturePaused(true)
@@ -938,6 +949,7 @@ private struct AfterRayRootView: View {
     @State private var isLive = true
     @State private var isChatPresented = false
     @State private var queryMode = ImmersiveQueryMode.search
+    @State private var queryFocusRequest: UInt64 = 0
     private let images = AfterRayServices.shared.images
 
     init() {}
@@ -977,6 +989,7 @@ private struct AfterRayRootView: View {
                 Task { await store.loadOlderSummaryHistory() }
             },
             onPopOutHistory: { HistoryWindowController.shared.show() },
+            onOpenSummarySlot: openSummarySlot,
             onVisibleDayChange: { dayMs in
                 Task { await store.loadDaySummary(dayMs: dayMs) }
             },
@@ -991,16 +1004,16 @@ private struct AfterRayRootView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(permissions.allGranted ? 1 : 0)
-        .background(
-            isLive || !permissions.allGranted
-                ? Color.clear
-                : Color(red: 0.025, green: 0.022, blue: 0.026)
-        )
+        // RecallView alone owns the full-screen history backdrop because it
+        // can see transient scrub state. A second backdrop here only sees the
+        // settled binding and covers the live desktop during a fast flick to
+        // NOW after RecallView has already removed the captured still.
         .overlay(alignment: .top) {
             VStack(spacing: 8) {
                 ImmersiveQueryBar(
                     model: control,
                     mode: $queryMode,
+                    focusRequest: queryFocusRequest,
                     onSubmit: submitQuery,
                     onOpenChat: { openChat() },
                     onStepResult: { delta in
@@ -1036,7 +1049,10 @@ private struct AfterRayRootView: View {
                 AfterRayChatOverlay(
                     model: chat,
                     onClose: { isChatPresented = false },
-                    onOpenMoment: openChatMoment
+                    onOpenMoment: openChatMoment,
+                    thumbnailLoader: { momentID in
+                        try await images.thumbnail(momentID: momentID).bytes
+                    }
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
@@ -1090,17 +1106,28 @@ private struct AfterRayRootView: View {
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
+            if permissions.allGranted, !settings.isPresented, !isChatPresented {
+                queryFocusRequest &+= 1
+            }
             // A search outlives the overlay being dismissed, and its filmstrip
             // comes back parked on the frame it was left on. Going live anyway
             // put "NOW" on the clock above a still from hours ago, so reopening
             // into a live search lands back on the selected result instead.
-            if let session = control.searchSession, session.selectedFrame != nil {
+            let selectedSearch = control.searchSession?.selectedFrame != nil
+            switch OverlayOpenRoute.resolve(
+                summarySlot: notification.object as? DaySlotSummary,
+                hasSelectedSearch: selectedSearch
+            ) {
+            case .summary(let slot):
+                openSummarySlot(slot)
+            case .selectedSearch:
+                guard let session = control.searchSession else { return }
                 selectSearchFrame(session.selectedIndex)
-                return
+            case .live:
+                enterLive()
             }
-            enterLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
             audioPlayer.stop()
@@ -1126,7 +1153,26 @@ private struct AfterRayRootView: View {
             chat.clearSensitiveState()
             isChatPresented = false
             clearRecallDecodedImageCache()
+            RecallThumbnailCache.shared.clearSensitiveData()
             Task { await images.clearSensitiveData() }
+            Task { try? await SummaryExportFileStore.shared.cleanupAll() }
+        }
+    }
+
+    private func openSummarySlot(_ slot: DaySlotSummary) {
+        isLive = false
+        audioPlayer.stop()
+        if let anchor = slot.anchorMomentId {
+            if !store.selectLoaded(momentID: anchor) {
+                Task {
+                    await store.openMoment(id: anchor)
+                    if store.selectedMoment?.id != anchor {
+                        store.select(playheadMs: slot.slotStartMs)
+                    }
+                }
+            }
+        } else {
+            store.select(playheadMs: slot.slotStartMs)
         }
     }
 
@@ -1437,6 +1483,7 @@ private struct AfterRaySettingsOverlay: View {
 private struct ImmersiveQueryBar: View {
     @ObservedObject var model: AfterRayControlModel
     @Binding var mode: ImmersiveQueryMode
+    let focusRequest: UInt64
     let onSubmit: () -> Void
     let onOpenChat: () -> Void
     let onStepResult: (Int) -> Void
@@ -1516,6 +1563,17 @@ private struct ImmersiveQueryBar: View {
         .padding(.horizontal, 14)
         .frame(height: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
+        .task(id: focusRequest) {
+            guard focusRequest > 0 else { return }
+            // The hosting tree stays mounted while the NSPanel is hidden, so
+            // FocusState may still be true from the previous opening. Reset it
+            // before requesting focus again or SwiftUI can treat the request as
+            // a no-op and leave the panel itself as first responder.
+            isInputFocused = false
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            isInputFocused = true
+        }
     }
 
     private func toggleMode() {

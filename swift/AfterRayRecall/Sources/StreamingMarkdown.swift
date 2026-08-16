@@ -6,6 +6,7 @@ import Foundation
 public enum MarkdownBlock: Equatable, Sendable {
     case heading(level: Int, text: String)
     case paragraph(String)
+    case momentImage(label: String, momentID: String)
     case bulletedList([String])
     case numberedList([String])
     case code(language: String?, text: String, closed: Bool)
@@ -49,6 +50,12 @@ public enum StreamingMarkdown {
                     index += 1
                 }
                 blocks.append(.heading(level: level, text: text))
+                continue
+            }
+
+            if let image = momentImageMatch(line) {
+                blocks.append(.momentImage(label: image.label, momentID: image.momentID))
+                index += 1
                 continue
             }
 
@@ -152,10 +159,27 @@ public enum StreamingMarkdown {
     private static func isStructural(_ line: String) -> Bool {
         fenceMatch(line) != nil
             || headingMatch(line) != nil
+            || momentImageMatch(line) != nil
             || isRule(line)
             || bulletMatch(line) != nil
             || numberedMatch(line) != nil
             || quoteMatch(line) != nil
+    }
+
+    /// Agent-authored images are deliberately narrower than general Markdown.
+    /// Only a standalone, protocol-backed moment reference becomes media; an
+    /// http/file/data image stays ordinary selectable text and never triggers
+    /// a resource read.
+    private static func momentImageMatch(_ line: String) -> (label: String, momentID: String)? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^!\[([^\]\n]{0,160})\]\(afterray://moment/([A-Za-z0-9-]+)\)\s*$"#
+        ) else { return nil }
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = regex.firstMatch(in: line, range: range), match.range == range,
+              let labelRange = Range(match.range(at: 1), in: line),
+              let momentRange = Range(match.range(at: 2), in: line)
+        else { return nil }
+        return (String(line[labelRange]), String(line[momentRange]))
     }
 
     private static func fenceMatch(_ line: String) -> String? {

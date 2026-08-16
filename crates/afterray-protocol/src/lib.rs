@@ -14,8 +14,10 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
 /// `usage`, `progress` and `compaction` stream events. 9 adds
 /// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
-/// the download queue instead of tearing the whole queue down.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// the download queue instead of tearing the whole queue down. 11 streams the
+/// model's reasoning so the chat UI can show thinking as it happens. 12 adds
+/// the privacy-bounded parsed summary export.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +124,12 @@ pub enum Request {
     /// days; this is how older history gets filled in.
     SlotBackfill {
         days: i64,
+    },
+    /// Parsed persisted P2 plus visible facts and generation metadata. This
+    /// never returns capture evidence, prompts, tool results, or raw model
+    /// completions.
+    SlotSummaryExport {
+        at_ms: i64,
     },
     /// Every occupied half-hour on the local day containing `day_ms`.
     /// Slots the model has never touched are included with facts only.
@@ -924,6 +932,11 @@ pub enum ChatStreamEvent {
     Token {
         text: String,
     },
+    /// One incremental reasoning fragment from a model that exposes it.
+    Reasoning {
+        text: String,
+        round: usize,
+    },
     /// How full the context window is, once per round.
     ///
     /// Context pressure was invisible from every angle before this: the user
@@ -1103,6 +1116,12 @@ mod tests {
             json,
             r#"{"type":"summary_history","before_ms":42,"limit":7}"#
         );
+    }
+
+    #[test]
+    fn slot_summary_export_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::SlotSummaryExport { at_ms: 42 }).unwrap();
+        assert_eq!(json, r#"{"type":"slot_summary_export","at_ms":42}"#);
     }
 
     #[test]
@@ -1366,6 +1385,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&usage).unwrap(),
             r#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#
+        );
+        let reasoning = ChatStreamEvent::Reasoning {
+            text: "checking the timeline".into(),
+            round: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&reasoning).unwrap(),
+            r#"{"kind":"reasoning","text":"checking the timeline","round":2}"#
         );
         let progress = ChatStreamEvent::Progress {
             phase: "thinking".into(),

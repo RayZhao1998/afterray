@@ -134,6 +134,56 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
 }
 
 public extension DaySummary {
+    static func mockMixedSlotWeek(around nowMs: Int64) -> [DaySummary] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let now = Date(timeIntervalSince1970: TimeInterval(nowMs) / 1_000)
+        return (0..<7).map { dayOffset in
+            let date = calendar.date(byAdding: .day, value: -dayOffset, to: now) ?? now
+            let bounds = DaySummaryLayout.dayBounds(ms: Int64(date.timeIntervalSince1970 * 1_000))
+            let ten: Int64 = 10 * 60 * 1_000
+            let thirty: Int64 = 30 * 60 * 1_000
+            var slots: [DaySlotSummary] = []
+            var cursor = bounds.start
+            while cursor < bounds.end {
+                let duration: Int64
+                if dayOffset < 3 {
+                    duration = ten
+                } else if dayOffset == 3 {
+                    duration = cursor < bounds.start + (bounds.end - bounds.start) / 2 ? thirty : ten
+                } else {
+                    duration = thirty
+                }
+                let index = slots.count
+                let isV2 = index.isMultiple(of: 3)
+                slots.append(DaySlotSummary(
+                    slotStartMs: cursor,
+                    slotEndMs: min(cursor + duration, bounds.end),
+                    state: "done",
+                    anchorMomentId: "summary-stress-\(dayOffset)-\(index)",
+                    facts: DaySlotFacts(
+                        apps: [DayAppFact(name: index.isMultiple(of: 2) ? "Xcode" : "Lody", ms: duration - 60_000)],
+                        momentCount: 8
+                    ),
+                    title: "Summary \(dayOffset + 1).\(index + 1)",
+                    bullets: isV2 ? nil : ["Legacy detail one", "Legacy detail two"],
+                    category: "coding",
+                    description: isV2 ? "Implemented and validated one focused part of the summary sidebar." : nil,
+                    threads: isV2 ? [SummaryThread(name: "Implementation", prose: "Changed the component and kept the unfinished state visible.")] : nil,
+                    decisions: isV2 ? ["Keep details collapsed by default."] : nil,
+                    notCaptured: isV2 && index.isMultiple(of: 9) ? ["Release validation was not run."] : nil
+                ))
+                cursor += duration
+            }
+            return DaySummary(
+                day: DaySummaryLayout.localDayKey(ms: bounds.start),
+                dayStartMs: bounds.start,
+                dayEndMs: bounds.end,
+                slots: slots
+            )
+        }
+    }
+
     static func mockRich(around playheadMs: Int64) -> DaySummary {
         let bounds = DaySummaryLayout.dayBounds(ms: playheadMs)
         let current = DaySummaryLayout.slotStartMs(atMs: playheadMs)

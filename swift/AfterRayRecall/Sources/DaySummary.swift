@@ -50,6 +50,11 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
     public let title: String?
     public let bullets: [String]?
     public let category: String?
+    public let description: String?
+    public let threads: [SummaryThread]?
+    public let entities: [SummaryEntity]?
+    public let decisions: [String]?
+    public let notCaptured: [String]?
 
     public init(
         slotStartMs: Int64,
@@ -59,7 +64,12 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         facts: DaySlotFacts,
         title: String? = nil,
         bullets: [String]? = nil,
-        category: String? = nil
+        category: String? = nil,
+        description: String? = nil,
+        threads: [SummaryThread]? = nil,
+        entities: [SummaryEntity]? = nil,
+        decisions: [String]? = nil,
+        notCaptured: [String]? = nil
     ) {
         self.slotStartMs = slotStartMs
         self.slotEndMs = slotEndMs
@@ -69,6 +79,11 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         self.title = title
         self.bullets = bullets
         self.category = category
+        self.description = description
+        self.threads = threads
+        self.entities = entities
+        self.decisions = decisions
+        self.notCaptured = notCaptured
     }
 
     enum CodingKeys: String, CodingKey {
@@ -80,6 +95,8 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         case title
         case bullets
         case category
+        case description, threads, entities, decisions
+        case notCaptured = "not_captured"
     }
 
     public init(from decoder: Decoder) throws {
@@ -93,6 +110,11 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         title = try container.decodeIfPresent(String.self, forKey: .title)
         bullets = try container.decodeIfPresent([String].self, forKey: .bullets)
         category = try container.decodeIfPresent(String.self, forKey: .category)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        threads = try container.decodeIfPresent([SummaryThread].self, forKey: .threads)
+        entities = try container.decodeIfPresent([SummaryEntity].self, forKey: .entities)
+        decisions = try container.decodeIfPresent([String].self, forKey: .decisions)
+        notCaptured = try container.decodeIfPresent([String].self, forKey: .notCaptured)
     }
 }
 
@@ -154,8 +176,19 @@ public enum DaySummaryClipboard {
     public static func slotText(_ slot: DaySlotSummary, timeZone: TimeZone = .current) -> String {
         let text = DaySummaryLayout.rowText(slot: slot, timeZone: timeZone)
         var lines = ["\(text.time) \(text.primary)"]
-        for detail in text.detail {
-            lines.append("  - \(detail)")
+        let expanded = DaySummaryLayout.expandedSections(slot: slot)
+        if expanded.isEmpty {
+            for detail in text.detail {
+                lines.append("  - \(detail)")
+            }
+        } else {
+            for section in expanded {
+                if let heading = section.heading {
+                    lines.append("  \(heading): \(section.body)")
+                } else {
+                    lines.append("  - \(section.body)")
+                }
+            }
         }
         if let badge = text.badge {
             lines.append("  (\(badge))")
@@ -184,13 +217,13 @@ public struct DaySummaryRowText: Equatable, Sendable {
     public let time: String
     public let primary: String
     /// The written summary under the title. The panel is the only place a
-    /// half hour's card is ever read, so it carries the whole body — a
+    /// slot's card is ever read, so it carries the whole body — a
     /// truncated one sends the user back to the timeline to guess.
     public let detail: [String]
     public let isT2: Bool
     /// Why this row is showing raw activity instead of a summary. Nil once a
     /// model has written a card. Without it a fallback row reads as if the
-    /// half hour genuinely amounted to "Zed 14m · Chrome 9m", when in fact
+    /// slot genuinely amounted to "Zed 6m · Chrome 3m", when in fact
     /// nothing has looked at it yet.
     public let badge: String?
 
@@ -209,10 +242,15 @@ public struct DaySummaryRowText: Equatable, Sendable {
     }
 }
 
+public struct DaySummaryExpandedSection: Equatable, Sendable {
+    public let heading: String?
+    public let body: String
+}
+
 /// Slot grouping, highlight, and row copy — kept pure so Visual Lab and
 /// production share one implementation and the tests can pin the wording.
 public enum DaySummaryLayout {
-    public static let slotDurationMs: Int64 = 30 * 60 * 1_000
+    public static let slotDurationMs: Int64 = 10 * 60 * 1_000
     public static let expandedStorageKey = "dev.afterray.daySummaryExpanded"
 
     public static func localDayKey(ms: Int64, timeZone: TimeZone = .current) -> String {
@@ -246,7 +284,7 @@ public enum DaySummaryLayout {
         let date = Date(timeIntervalSince1970: TimeInterval(atMs) / 1_000)
         var parts = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
         let minute = parts.minute ?? 0
-        parts.minute = minute < 30 ? 0 : 30
+        parts.minute = (minute / 10) * 10
         parts.second = 0
         parts.nanosecond = 0
         let aligned = calendar.date(from: parts) ?? date
@@ -265,7 +303,7 @@ public enum DaySummaryLayout {
         return slots.contains(where: { $0.slotStartMs == start }) ? start : nil
     }
 
-    /// Panel display order: newest half-hour first, matching how every feed
+    /// Panel display order: newest slot first, matching how every feed
     /// the user lives in orders time. Storage and the chat tool keep
     /// chronological order; this is presentation only.
     public static func displayOrder(_ slots: [DaySlotSummary]) -> [DaySlotSummary] {
@@ -320,19 +358,65 @@ public enum DaySummaryLayout {
 
     public static func rowText(slot: DaySlotSummary, timeZone: TimeZone = .current) -> DaySummaryRowText {
         let time = timeLabel(slotStartMs: slot.slotStartMs, timeZone: timeZone)
-        let detail = (slot.bullets ?? [])
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
         if let title = slot.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-            return DaySummaryRowText(time: time, primary: title, detail: detail, isT2: true)
+            let description = shortDescription(slot: slot)
+            return DaySummaryRowText(
+                time: time,
+                primary: title,
+                detail: description.isEmpty ? [] : [description],
+                isT2: true
+            )
         }
         return DaySummaryRowText(
             time: time,
             primary: factLine(apps: slot.facts.apps),
-            detail: detail,
+            detail: [],
             isT2: false,
             badge: fallbackBadge(state: slot.state)
         )
+    }
+
+
+    public static func shortDescription(slot: DaySlotSummary) -> String {
+        let source: String
+        if let description = slot.description, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            source = description
+        } else {
+            source = (slot.bullets ?? []).joined(separator: " ")
+        }
+        return String(normalizedParagraph(source).prefix(400))
+    }
+
+    public static func expandedSections(slot: DaySlotSummary) -> [DaySummaryExpandedSection] {
+        if let threads = slot.threads, !threads.isEmpty {
+            var sections = threads.compactMap { thread -> DaySummaryExpandedSection? in
+                let body = normalizedParagraph(thread.prose)
+                guard !body.isEmpty else { return nil }
+                let heading = normalizedParagraph(thread.name)
+                return DaySummaryExpandedSection(heading: heading.isEmpty ? nil : heading, body: body)
+            }
+            if let decisions = slot.decisions?.filter({ !normalizedParagraph($0).isEmpty }), !decisions.isEmpty {
+                sections.append(DaySummaryExpandedSection(
+                    heading: "Decisions",
+                    body: decisions.map(normalizedParagraph).joined(separator: "\n")
+                ))
+            }
+            if let missing = slot.notCaptured?.filter({ !normalizedParagraph($0).isEmpty }), !missing.isEmpty {
+                sections.append(DaySummaryExpandedSection(
+                    heading: "Not captured",
+                    body: missing.map(normalizedParagraph).joined(separator: "\n")
+                ))
+            }
+            return sections
+        }
+        return (slot.bullets ?? []).compactMap { bullet in
+            let body = normalizedParagraph(bullet)
+            return body.isEmpty ? nil : DaySummaryExpandedSection(heading: nil, body: body)
+        }
+    }
+
+    private static func normalizedParagraph(_ text: String) -> String {
+        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
 
     /// Names the reason a row has no summary. "Not summarised" and "Summary

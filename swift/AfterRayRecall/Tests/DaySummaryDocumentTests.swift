@@ -52,8 +52,30 @@ final class DaySummaryDocumentTests: XCTestCase {
         let range = try! XCTUnwrap(layout.slotRanges[slotStart])
         let slotText = (document.string as NSString).substring(with: range)
         XCTAssertTrue(slotText.contains("only slot"))
-        XCTAssertTrue(slotText.contains("·\tread the code"))
-        XCTAssertTrue(slotText.contains("·\twrote a fix"))
+        XCTAssertTrue(slotText.contains("read the code wrote a fix"))
+        XCTAssertFalse(slotText.contains("·\t"), "the single description is prose, not a list item")
+        XCTAssertTrue(slotText.contains("Full details"))
+        XCTAssertFalse(slotText.localizedCaseInsensitiveContains("json"))
+
+        let timeRange = try! XCTUnwrap(layout.timeRanges[slotStart])
+        let attributedTimeColor = document.attribute(
+            .foregroundColor,
+            at: timeRange.location,
+            effectiveRange: nil
+        ) as? NSColor
+        let timeColor = try! XCTUnwrap(attributedTimeColor?.usingColorSpace(.deviceRGB))
+        XCTAssertEqual(timeColor.redComponent, 1, accuracy: 0.001)
+        XCTAssertEqual(timeColor.greenComponent, 0.20, accuracy: 0.001)
+        XCTAssertEqual(timeColor.blueComponent, 0.14, accuracy: 0.001)
+
+        let descriptionLocation = (document.string as NSString).range(of: "read the code").location
+        let descriptionStyle = document.attribute(
+            .paragraphStyle,
+            at: descriptionLocation,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        XCTAssertEqual(descriptionStyle?.firstLineHeadIndent, DaySummaryDocument.textX)
+        XCTAssertEqual(descriptionStyle?.headIndent, DaySummaryDocument.textX)
 
         // The time chip links to the slot so clicking it jumps the timeline.
         var foundLink = false
@@ -65,6 +87,28 @@ final class DaySummaryDocumentTests: XCTestCase {
             }
         }
         XCTAssertTrue(foundLink, "the slot's time chip must link to it")
+    }
+
+    func testTimestampAndDetailsLinksRouteIndependently() throws {
+        let summary = day(start: 0, titles: ["only slot"], bullets: ["first", "second"])
+        let slotStart = try XCTUnwrap(summary.slots.first?.slotStartMs)
+        let (document, layout) = DaySummaryDocument.build(
+            summaries: [summary],
+            nowMs: dayMs,
+            expandedSlotStarts: [slotStart],
+            timeZone: utc
+        )
+        let range = try XCTUnwrap(layout.slotRanges[slotStart])
+        var routes: Set<String> = []
+        document.enumerateAttribute(.link, in: range) { value, _, _ in
+            guard let url = value as? URL else { return }
+            if DaySummaryDocument.slotStart(from: url) == slotStart { routes.insert("timestamp") }
+            if DaySummaryDocument.detailsSlotStart(from: url) == slotStart { routes.insert("details") }
+        }
+        XCTAssertEqual(routes, ["timestamp", "details"])
+        let slotText = (document.string as NSString).substring(with: range)
+        XCTAssertTrue(slotText.contains("first"))
+        XCTAssertTrue(slotText.contains("second"))
     }
 
     func testLayoutLookupsResolveCharacterPositions() {

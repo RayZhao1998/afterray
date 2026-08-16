@@ -2,18 +2,101 @@ import XCTest
 @testable import AfterRayRecall
 
 final class DaySummaryLayoutTests: XCTestCase {
+    func testV2DescriptionAndThreadsDecodeAndDescriptionIsBounded() throws {
+        let description = String(repeating: "界", count: 410)
+        let json = """
+        {
+          "slot_start_ms": 0,
+          "slot_end_ms": 600000,
+          "state": "done",
+          "facts": {"apps": [], "moment_count": 3},
+          "title": "完成总结侧栏",
+          "description": "\(description)",
+          "threads": [{"name":"UI","prose":"展示完整工作线","moment_ids":["m1"]}],
+          "decisions": ["默认折叠"],
+          "not_captured": ["未执行发布"]
+        }
+        """
+        let slot = try JSONDecoder().decode(DaySlotSummary.self, from: Data(json.utf8))
+        XCTAssertEqual(DaySummaryLayout.shortDescription(slot: slot).count, 400)
+        XCTAssertEqual(slot.threads?.first?.momentIds, ["m1"])
+        XCTAssertEqual(DaySummaryLayout.expandedSections(slot: slot).map(\.heading), ["UI", "Decisions", "Not captured"])
+    }
+
+    func testV2ThreadWithoutMomentIdsDecodesAsNoCitations() throws {
+        let json = #"""
+        {
+          "slot_start_ms": 0,
+          "slot_end_ms": 1800000,
+          "state": "done",
+          "facts": {"apps": [], "moment_count": 3},
+          "title": "Older v2 card",
+          "description": "The model did not cite a frame.",
+          "threads": [{"name":"Implementation","prose":"Completed the change."}]
+        }
+        """#
+
+        let slot = try JSONDecoder().decode(DaySlotSummary.self, from: Data(json.utf8))
+        XCTAssertEqual(slot.threads?.first?.momentIds, [])
+        XCTAssertEqual(slot.threads?.first?.prose, "Completed the change.")
+    }
+
+    func testV1BulletsProvideBoundedDescriptionAndFullExpandedDetails() {
+        let slot = DaySlotSummary(
+            slotStartMs: 0,
+            slotEndMs: 1_800_000,
+            state: "done",
+            facts: DaySlotFacts(apps: []),
+            title: "Legacy",
+            bullets: [String(repeating: "a", count: 390), String(repeating: "b", count: 30)]
+        )
+        XCTAssertEqual(DaySummaryLayout.shortDescription(slot: slot).count, 400)
+        XCTAssertEqual(DaySummaryLayout.expandedSections(slot: slot).count, 2)
+        XCTAssertNil(DaySummaryLayout.expandedSections(slot: slot).first?.heading)
+    }
+
+    func testOriginalV1WirePayloadDecodesWithoutAnyV2Fields() throws {
+        let json = #"""
+        {
+          "slot_start_ms": 1786698000000,
+          "slot_end_ms": 1786699800000,
+          "state": "done",
+          "facts": {
+            "apps": [{"name":"Xcode","bundle_identifier":"com.apple.dt.Xcode","ms":900000}],
+            "moment_count": 12
+          },
+          "title": "Legacy summary",
+          "bullets": ["First old bullet", "Second old bullet"],
+          "category": "coding"
+        }
+        """#
+
+        let slot = try JSONDecoder().decode(DaySlotSummary.self, from: Data(json.utf8))
+        XCTAssertEqual(slot.slotEndMs - slot.slotStartMs, 30 * 60 * 1_000)
+        XCTAssertEqual(slot.title, "Legacy summary")
+        XCTAssertEqual(slot.bullets, ["First old bullet", "Second old bullet"])
+        XCTAssertNil(slot.anchorMomentId)
+        XCTAssertNil(slot.description)
+        XCTAssertNil(slot.threads)
+        XCTAssertEqual(
+            DaySummaryLayout.shortDescription(slot: slot),
+            "First old bullet Second old bullet"
+        )
+        XCTAssertEqual(DaySummaryLayout.expandedSections(slot: slot).count, 2)
+    }
+
     private let shanghai = TimeZone(identifier: "Asia/Shanghai")!
 
-    func testSlotStartAlignsToLocalHalfHour() {
+    func testSlotStartAlignsToLocalTenMinutes() {
         let day = DaySummaryLayout.dayBounds(ms: 1_786_698_000_000, timeZone: shanghai)
         let sixteen = day.start + 16 * 3_600 * 1_000
         let at = sixteen + 17 * 60 * 1_000
         let start = DaySummaryLayout.slotStartMs(atMs: at, timeZone: shanghai)
-        XCTAssertEqual(start, sixteen)
-        XCTAssertEqual(DaySummaryLayout.timeLabel(slotStartMs: start, timeZone: shanghai), "16:00")
+        XCTAssertEqual(start, sixteen + 10 * 60 * 1_000)
+        XCTAssertEqual(DaySummaryLayout.timeLabel(slotStartMs: start, timeZone: shanghai), "16:10")
         XCTAssertEqual(DaySummaryLayout.slotStartMs(atMs: start, timeZone: shanghai), start)
         XCTAssertEqual(
-            DaySummaryLayout.slotStartMs(atMs: start + 29 * 60 * 1_000, timeZone: shanghai),
+            DaySummaryLayout.slotStartMs(atMs: start + 9 * 60 * 1_000, timeZone: shanghai),
             start
         )
         XCTAssertEqual(
@@ -65,9 +148,7 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertEqual(factsText.primary, "Xcode 22m · Safari 6m")
     }
 
-    /// The panel is where a slot card is actually read. Dropping the bullets
-    /// left the user with a title and no way to see what the half hour was.
-    func testRowCarriesTheWholeSummaryBody() {
+    func testRowDefaultsToOneShortDescriptionAndExpansionKeepsWholeBody() {
         let utc = TimeZone(secondsFromGMT: 0)!
         let card = DaySlotSummary(
             slotStartMs: 0,
@@ -78,7 +159,11 @@ final class DaySummaryLayoutTests: XCTestCase {
             bullets: ["  Read the IVF length check  ", "", "Patched the packer"]
         )
         let text = DaySummaryLayout.rowText(slot: card, timeZone: utc)
-        XCTAssertEqual(text.detail, ["Read the IVF length check", "Patched the packer"])
+        XCTAssertEqual(text.detail, ["Read the IVF length check Patched the packer"])
+        XCTAssertEqual(
+            DaySummaryLayout.expandedSections(slot: card).map(\.body),
+            ["Read the IVF length check", "Patched the packer"]
+        )
 
         let bare = DaySummaryLayout.rowText(slot: slot(start: 0, title: nil), timeZone: utc)
         XCTAssertTrue(bare.detail.isEmpty)

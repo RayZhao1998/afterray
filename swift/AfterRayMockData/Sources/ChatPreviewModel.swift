@@ -8,7 +8,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case tools
     case pressure
-    /// A thinking model mid-turn: reasoning is streaming, nothing is visible.
+    /// A thinking model mid-turn with live reasoning visible.
     case thinking
     /// A finished answer with its reasoning kept beside it, and a turn that
     /// was stopped part-way but kept what it had.
@@ -45,6 +45,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var isLoadingHistory = false
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
+    @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
@@ -68,6 +69,9 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
+        streamReasoning = scenario == .thinking
+            ? [ChatReasoningRound(round: 1, text: "Checking the recent timeline and weighing the strongest evidence…")]
+            : []
         errorMessage = nil
         statusMessage = nil
         let fixture = ChatFixtures.load(scenario)
@@ -92,6 +96,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
+        streamReasoning = []
         selectedID = id
         messages = store[id] ?? []
         // Same rule as the real model: occupancy belongs to a turn, so it does
@@ -107,6 +112,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         messages = []
         streamText = ""
         streamTools = []
+        streamReasoning = []
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -159,6 +165,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = true
         streamText = ""
         streamTools = []
+        streamReasoning = []
         var state = ChatStreamState()
         let events = script ?? ChatFixtures.replyScript
         for event in events {
@@ -166,6 +173,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
             ChatStreamReducer.apply(event, to: &state)
             streamText = state.text
             streamTools = state.tools
+            streamReasoning = state.reasoning
             if let usage = state.usage { contextUsage = usage }
             if !state.compactions.isEmpty { compactionNotices = state.compactions }
             streamProgress = state.progress
@@ -179,6 +187,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
+        streamReasoning = []
         streamTask = nil
     }
 
@@ -223,6 +232,8 @@ public enum ChatFixtures {
     ```
 
     Then a shorter pass through Safari on the protocol notes.
+
+    ![14:18 · Xcode build error](afterray://moment/moment-18)
 
     1. Slot card for 14:00
     2. Transcript around the stand-up

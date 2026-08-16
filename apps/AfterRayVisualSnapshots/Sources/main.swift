@@ -105,7 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
-            + captionScenes + chatScenes
+            + mixedHistoryScene + captionScenes + chatScenes
     }
 }
 
@@ -523,6 +523,37 @@ private var historyPanelScene: [SnapshotScene] {
     ]
 }
 
+/// A production-scale mixed history: legacy 30-minute rows before the vault
+/// cutover and 10-minute v2 rows after it. Keeping all seven days in the
+/// document catches rebuild and scrolling regressions even though the snapshot
+/// itself only shows the newest viewport.
+@MainActor
+private var mixedHistoryScene: [SnapshotScene] {
+    let playheadMs = RecallScenario.long.moments[12].capturedAtMs
+    let summaries = DaySummary.mockMixedSlotWeek(around: playheadMs)
+    return [
+        SnapshotScene(
+            name: "18-history-panel-mixed-30-10",
+            size: CGSize(width: 420, height: 820),
+            settleSeconds: 1.4,
+            content: AnyView(
+                DaySummaryPanel(
+                    style: .window,
+                    summaries: summaries,
+                    playheadMs: playheadMs,
+                    nowMs: playheadMs,
+                    hasMore: false,
+                    isLoadingMore: false,
+                    followPulse: 0,
+                    onSelectSlot: { _ in },
+                    onLoadMore: {}
+                )
+                .frame(width: 420, height: 820)
+            )
+        ),
+    ]
+}
+
 MainActor.assumeIsolated { SnapshotRunner.main() }
 
 
@@ -684,6 +715,7 @@ private var chatScenes: [SnapshotScene] {
         // Reasoning kept beside the answer, folded away, and a turn that was
         // stopped part-way keeping what it had produced.
         chatScene(name: "20-chat-reasoning", scenario: .reasoning),
+        chatScene(name: "21-chat-moment-citation", scenario: .markdown),
     ]
 }
 
@@ -695,7 +727,12 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
         size: CGSize(width: 980, height: 680),
         settleSeconds: 1.2,
         content: AnyView(
-            AfterRayChatView(model: model, onClose: {})
+            AfterRayChatView(
+                model: model,
+                onClose: {},
+                onOpenMoment: { _ in },
+                thumbnailLoader: MockSearchData.thumbnailLoader
+            )
                 .frame(width: 980, height: 680)
         )
     )

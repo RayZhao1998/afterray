@@ -27,6 +27,7 @@ public struct DaySummaryPanel: View {
     private static let dayChipFollowTopInset: CGFloat = 28
 
     @State private var topDayHeading: String?
+    @State private var expandedSlotStarts: Set<Int64> = []
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
@@ -35,10 +36,10 @@ public struct DaySummaryPanel: View {
     let hasMore: Bool
     let isLoadingMore: Bool
     /// Bumped when a scrub settles for one final alignment correction. Live
-    /// following is already throttled to highlighted half-hour changes by
+    /// following is already throttled to highlighted slot changes by
     /// the document coordinator.
     let followPulse: Int
-    let onSelectSlot: (Int64) -> Void
+    let onSelectSlot: (DaySlotSummary) -> Void
     let onLoadMore: () -> Void
 
     public init(
@@ -50,7 +51,7 @@ public struct DaySummaryPanel: View {
         hasMore: Bool,
         isLoadingMore: Bool,
         followPulse: Int,
-        onSelectSlot: @escaping (Int64) -> Void,
+        onSelectSlot: @escaping (DaySlotSummary) -> Void,
         onLoadMore: @escaping () -> Void
     ) {
         self.style = style
@@ -169,7 +170,9 @@ public struct DaySummaryPanel: View {
             followPulse: followPulse,
             followTopInset: Self.dayChipFollowTopInset,
             fillsHeight: style == .window,
+            expandedSlotStarts: expandedSlotStarts,
             onSelectSlot: onSelectSlot,
+            onToggleDetails: toggleDetails,
             onLoadMore: onLoadMore,
             onTopDayChange: { heading in
                 if topDayHeading != heading { topDayHeading = heading }
@@ -181,6 +184,14 @@ public struct DaySummaryPanel: View {
         )
         .padding(.horizontal, 6)
         .padding(.bottom, 8)
+    }
+
+    private func toggleDetails(slotStartMs: Int64) {
+        if expandedSlotStarts.contains(slotStartMs) {
+            expandedSlotStarts.remove(slotStartMs)
+        } else {
+            expandedSlotStarts.insert(slotStartMs)
+        }
     }
 }
 

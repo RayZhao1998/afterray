@@ -41,6 +41,9 @@ final class ChatTranscriptTests: XCTestCase {
             streamingTools: [
                 ChatToolCall(id: "t1", name: "list_moments", argsJSON: "{}")
             ],
+            streamingReasoning: [
+                ChatReasoningRound(round: 1, text: "checking history")
+            ],
             isSending: true,
             nowMs: 9
         )
@@ -49,6 +52,7 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertEqual(bubbles[1].text, "hel")
         XCTAssertTrue(bubbles[1].isStreaming)
         XCTAssertEqual(bubbles[1].tools.map(\.name), ["list_moments"])
+        XCTAssertEqual(bubbles[1].reasoning.first?.text, "checking history")
     }
 
     func testUnknownRoleDecodesAsAssistant() throws {

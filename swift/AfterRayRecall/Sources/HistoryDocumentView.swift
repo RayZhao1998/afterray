@@ -3,7 +3,7 @@ import SwiftUI
 
 enum HistoryDocumentFollow {
     /// Live scrubbing only needs to move the document when the highlighted
-    /// half hour changes. The settle pulse remains a final correction.
+    /// slot changes. The settle pulse remains a final correction.
     static func shouldFollow(
         previousSlot: Int64?,
         currentSlot: Int64?,
@@ -21,7 +21,7 @@ enum HistoryDocumentFollow {
         let maximumOrigin = max(contentHeight - viewportHeight, 0)
         let visibleTop = min(max(topInset, 0), viewportHeight)
         // Card bodies vary substantially with the amount of activity in each
-        // half hour. Following their midpoint makes the title jump vertically
+        // slot. Following its midpoint makes the title jump vertically
         // whenever the body height changes, so pin the card's beginning below
         // the floating day chip instead. Document edges are the only reason it
         // should land elsewhere.
@@ -37,24 +37,31 @@ enum HistoryDocumentFollow {
 /// border would break at every paragraph — the seams are exactly what the
 /// eye reads as "misaligned".
 final class HistoryTextView: NSTextView {
-    /// The text extent of the current half hour, in view coordinates. The
+    /// The text extent of the current slot, in view coordinates. The
     /// card drawn around it is padded out from this: a highlight clamped to
     /// the glyphs reads as a printing error, not as a selected row.
     var highlightRect: NSRect?
+    var hoverRect: NSRect?
+    var onHoverPoint: ((NSPoint?) -> Void)?
+    private var hoverTrackingArea: NSTrackingArea?
 
-    /// Breathing room between the current half hour's text and the edge of
+    /// Breathing room between the current slot's text and the edge of
     /// its card, and how round that card's corners are.
     private let cardPadding = NSEdgeInsets(top: 7, left: 4, bottom: 7, right: 6)
     private let cardRadius: CGFloat = 9
 
     override func draw(_ dirtyRect: NSRect) {
         let x = (textContainerInset.width + DaySummaryDocument.spineX).rounded()
-        let ray = NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1)
+        let ray = DaySummaryDocument.accentColor
 
         if let card = highlightCard, card.intersects(dirtyRect) {
             let path = NSBezierPath(roundedRect: card, xRadius: cardRadius, yRadius: cardRadius)
             ray.withAlphaComponent(0.10).setFill()
             path.fill()
+        }
+        if let hoverRect, hoverRect.intersects(dirtyRect) {
+            NSColor.white.withAlphaComponent(0.035).setFill()
+            NSBezierPath(roundedRect: cardRect(around: hoverRect), xRadius: cardRadius, yRadius: cardRadius).fill()
         }
 
         NSColor.white.withAlphaComponent(0.09).setFill()
@@ -74,7 +81,7 @@ final class HistoryTextView: NSTextView {
         super.draw(dirtyRect)
     }
 
-    /// The padded card behind the current half hour: full panel width so it
+    /// The padded card behind the current slot: full panel width so it
     /// reads as a row, inset from both edges so it never touches them.
     private var highlightCard: NSRect? {
         guard let highlightRect else { return nil }
@@ -90,6 +97,29 @@ final class HistoryTextView: NSTextView {
             width: max(bounds.width - cardPadding.left - cardPadding.right, 0),
             height: highlightRect.height + cardPadding.top + cardPadding.bottom
         )
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        onHoverPoint?(convert(event.locationInWindow, from: nil))
+        super.mouseMoved(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverPoint?(nil)
+        super.mouseExited(with: event)
     }
 
 }
@@ -112,7 +142,9 @@ struct HistoryDocumentView: NSViewRepresentable {
     /// the full panel; the overlay card hugs its content instead of
     /// stretching a glass panel around two rows.
     let fillsHeight: Bool
-    let onSelectSlot: (Int64) -> Void
+    let expandedSlotStarts: Set<Int64>
+    let onSelectSlot: (DaySlotSummary) -> Void
+    let onToggleDetails: (Int64) -> Void
     let onLoadMore: () -> Void
     /// Reports the heading of the topmost visible day as the user scrolls,
     /// for the pinned-date chip the document flow cannot pin itself.
@@ -186,9 +218,11 @@ struct HistoryDocumentView: NSViewRepresentable {
         private var frameObserver: NSObjectProtocol?
         private var layout = DaySummaryDocument.Layout()
         private var renderedSummaries: [DaySummary] = []
+        private var renderedExpandedSlotStarts: Set<Int64> = []
         private var renderedNowKey: Int64 = 0
         private var lastFollowPulse = 0
         private var highlightedSlot: Int64?
+        private var hoveredSlot: Int64?
         private var boundsObserver: NSObjectProtocol?
         private var loadingAttachments: Set<ObjectIdentifier> = []
         /// One load-more request per document build: bounds-change fires on
@@ -203,6 +237,9 @@ struct HistoryDocumentView: NSViewRepresentable {
         func attach(textView: HistoryTextView, scroll: NSScrollView) {
             self.textView = textView
             self.scroll = scroll
+            textView.onHoverPoint = { [weak self] point in
+                self?.updateHover(at: point)
+            }
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
                 object: scroll.contentView,
@@ -213,7 +250,7 @@ struct HistoryDocumentView: NSViewRepresentable {
                 }
             }
             // A width change rewraps every paragraph, so the measured extent
-            // of the current half hour moves with it.
+            // of the current slot moves with it.
             textView.postsFrameChangedNotifications = true
             frameObserver = NotificationCenter.default.addObserver(
                 forName: NSView.frameDidChangeNotification,
@@ -238,14 +275,15 @@ struct HistoryDocumentView: NSViewRepresentable {
         func apply(view newView: HistoryDocumentView) {
             let previousHighlightedSlot = highlightedSlot
             let summariesChanged = renderedSummaries != newView.summaries
+            let expansionChanged = renderedExpandedSlotStarts != newView.expandedSlotStarts
             let followRequested = newView.followPulse != lastFollowPulse
             let playheadChanged = view.playheadMs != newView.playheadMs
             view = newView
 
-            if summariesChanged {
+            if summariesChanged || expansionChanged {
                 rebuild()
             }
-            if playheadChanged || summariesChanged {
+            if playheadChanged || summariesChanged || expansionChanged {
                 refreshHighlight()
             }
             if HistoryDocumentFollow.shouldFollow(
@@ -265,10 +303,15 @@ struct HistoryDocumentView: NSViewRepresentable {
         private func rebuild() {
             guard let textView else { return }
             renderedSummaries = view.summaries
+            renderedExpandedSlotStarts = view.expandedSlotStarts
             // Day headings depend on "today"; key the rebuild so a rollover
             // refreshes labels without rebuilding on every millisecond tick.
             renderedNowKey = view.nowMs / 60_000
-            let built = DaySummaryDocument.build(summaries: view.summaries, nowMs: view.nowMs)
+            let built = DaySummaryDocument.build(
+                summaries: view.summaries,
+                nowMs: view.nowMs,
+                expandedSlotStarts: view.expandedSlotStarts
+            )
             layout = built.layout
             let selected = textView.selectedRanges
             textView.textStorage?.setAttributedString(built.document)
@@ -296,11 +339,17 @@ struct HistoryDocumentView: NSViewRepresentable {
             guard force || current != highlightedSlot else { return }
             if let previous = highlightedSlot, let range = layout.timeRanges[previous] {
                 layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+                layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: range)
             }
             if let current, let range = layout.timeRanges[current] {
                 layoutManager.addTemporaryAttribute(
                     .foregroundColor,
-                    value: NSColor(red: 1, green: 0.34, blue: 0.25, alpha: 1),
+                    value: DaySummaryDocument.accentColor,
+                    forCharacterRange: range
+                )
+                layoutManager.addTemporaryAttribute(
+                    .underlineStyle,
+                    value: NSUnderlineStyle.thick.rawValue,
                     forCharacterRange: range
                 )
             }
@@ -322,6 +371,53 @@ struct HistoryDocumentView: NSViewRepresentable {
             let origin = textView.textContainerOrigin
             return rect.offsetBy(dx: origin.x, dy: origin.y)
         }
+
+        private func updateHover(at point: NSPoint?) {
+            guard let textView else { return }
+            let previous = hoveredSlot
+            guard let point,
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer
+            else {
+                if let previous, let range = layout.timeRanges[previous] {
+                    textView.layoutManager?.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+                    textView.layoutManager?.removeTemporaryAttribute(.underlineStyle, forCharacterRange: range)
+                }
+                hoveredSlot = nil
+                textView.hoverRect = nil
+                refreshHighlight(force: true)
+                textView.needsDisplay = true
+                return
+            }
+            let origin = textView.textContainerOrigin
+            let containerPoint = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+            let glyph = layoutManager.glyphIndex(for: containerPoint, in: container)
+            let character = layoutManager.characterIndexForGlyph(at: glyph)
+            let next = layout.slotStart(at: character)
+            if next != previous {
+                if let previous, let range = layout.timeRanges[previous] {
+                    layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+                    layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: range)
+                }
+                if let next, let range = layout.timeRanges[next] {
+                    layoutManager.addTemporaryAttribute(
+                        .foregroundColor,
+                        value: DaySummaryDocument.accentColor.withAlphaComponent(0.88),
+                        forCharacterRange: range
+                    )
+                    layoutManager.addTemporaryAttribute(
+                        .underlineStyle,
+                        value: NSUnderlineStyle.thick.rawValue,
+                        forCharacterRange: range
+                    )
+                }
+                hoveredSlot = next
+                refreshHighlight(force: true)
+            }
+            textView.hoverRect = next.flatMap(boundingRect(ofSlot:))
+            textView.needsDisplay = true
+        }
+
 
         @discardableResult
         private func followPlayhead() -> Bool {
@@ -488,15 +584,26 @@ struct HistoryDocumentView: NSViewRepresentable {
         // ------------------------------------------------------ delegate
 
         func textView(_: NSTextView, clickedOnLink link: Any, at _: Int) -> Bool {
-            guard let url = link as? URL,
-                  let slotStart = DaySummaryDocument.slotStart(from: url)
-            else { return false }
-            view.onSelectSlot(slotStart)
-            return true
+            guard let url = link as? URL else { return false }
+            if let slotStart = DaySummaryDocument.slotStart(from: url),
+               let slot = slot(startingAt: slotStart)
+            {
+                view.onSelectSlot(slot)
+                return true
+            }
+            if let slotStart = DaySummaryDocument.detailsSlotStart(from: url) {
+                view.onToggleDetails(slotStart)
+                return true
+            }
+            return false
+        }
+
+        private func slot(startingAt startMs: Int64) -> DaySlotSummary? {
+            view.summaries.lazy.flatMap(\.slots).first { $0.slotStartMs == startMs }
         }
 
         /// Native selection already gives arbitrary-range copy; these add the
-        /// structured shortcuts (whole half hour, whole day) the row and
+        /// structured shortcuts (whole slot, whole day) the row and
         /// section menus used to carry.
         func textView(
             _: NSTextView,
@@ -509,7 +616,7 @@ struct HistoryDocumentView: NSViewRepresentable {
                let slot = view.summaries.lazy.flatMap(\.slots).first(where: { $0.slotStartMs == slotStart })
             {
                 let item = NSMenuItem(
-                    title: "Copy This Half Hour",
+                    title: "Copy This Slot",
                     action: #selector(copySlotText(_:)),
                     keyEquivalent: ""
                 )

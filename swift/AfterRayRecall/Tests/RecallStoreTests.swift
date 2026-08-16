@@ -36,6 +36,22 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.loadState, .ready)
     }
 
+    func testForcedDaySummaryRefreshRecoversAfterTransientConnectionFailure() async {
+        let expected = summaryDay("recovered", startingAt: 400)
+        let daemon = FlakySummaryDaemon(summary: expected)
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadDaySummary(dayMs: expected.dayStartMs, force: true)
+        XCTAssertEqual(store.daySummary, .empty)
+        XCTAssertTrue(store.summaryHistory.isEmpty)
+
+        await store.loadDaySummary(dayMs: expected.dayStartMs, force: true)
+        XCTAssertEqual(store.daySummary, expected)
+        XCTAssertEqual(store.summaryHistory, [expected])
+        let requestCount = await daemon.daySummaryRequestCount()
+        XCTAssertEqual(requestCount, 2)
+    }
+
     func testStartupFailureIsNotHiddenByConnectionRetry() async {
         let store = RecallStore(daemon: ConnectionFailingDaemon())
         store.reportFailure("afterrayd exited during startup (status 1).\n\nError: key provider: A required entitlement isn't present.")
@@ -381,6 +397,41 @@ private actor ConnectionFailingDaemon: RecallDaemonServing {
         throw DaemonClientError.connection("Connection refused")
     }
     func setFavorite(momentID _: String, favorite _: Bool) async throws {}
+}
+
+private actor FlakySummaryDaemon: RecallDaemonServing {
+    private let summary: DaySummary
+    private var requestCount = 0
+
+    init(summary: DaySummary) {
+        self.summary = summary
+    }
+
+    func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+
+    func daySummary(dayMs _: Int64) async throws -> DaySummary {
+        requestCount += 1
+        if requestCount == 1 {
+            throw DaemonClientError.connection("Connection refused")
+        }
+        return summary
+    }
+
+    func summaryHistory(beforeMs _: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
+        SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
+    }
+
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "image/png", bytes: Data())
+    }
+
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
+
+    func daySummaryRequestCount() -> Int { requestCount }
 }
 
 private actor FakeDaemon: RecallDaemonServing {

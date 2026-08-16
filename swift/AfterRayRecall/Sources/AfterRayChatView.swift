@@ -8,6 +8,7 @@ private enum ChatMetrics {
     static let sidebarWidth: CGFloat = 228
     static let bubbleRadius: CGFloat = 12
     static let gutter: CGFloat = 20
+    static let bottomAnchorID = "afterray-chat-bottom-anchor"
 }
 
 private enum ChatPalette {
@@ -31,17 +32,22 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     @ObservedObject var model: Model
     var onClose: () -> Void
     var onOpenMoment: ((String) -> Void)?
+    var thumbnailLoader: RecallThumbnailLoader?
     var fillsAvailableSpace: Bool
+    @State private var autoScrollState = ChatAutoScrollState()
+    @State private var scrollToLatestRequest: UInt64 = 0
 
     public init(
         model: Model,
         onClose: @escaping () -> Void,
         onOpenMoment: ((String) -> Void)? = nil,
+        thumbnailLoader: RecallThumbnailLoader? = nil,
         fillsAvailableSpace: Bool = false
     ) {
         self.model = model
         self.onClose = onClose
         self.onOpenMoment = onOpenMoment
+        self.thumbnailLoader = thumbnailLoader
         self.fillsAvailableSpace = fillsAvailableSpace
     }
 
@@ -194,38 +200,91 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
 
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    if model.bubbles.isEmpty, !model.isSending {
-                        emptyState
-                            .padding(.top, 48)
-                    }
-                    ForEach(model.bubbles) { bubble in
-                        if bubble.role == .compaction {
-                            ChatCompactionRule(text: bubble.text)
-                                .id(bubble.id)
-                        } else {
-                            ChatBubbleView(bubble: bubble)
-                                .id(bubble.id)
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        if model.bubbles.isEmpty, !model.isSending {
+                            emptyState
+                                .padding(.top, 48)
                         }
+                        ForEach(model.bubbles) { bubble in
+                            if bubble.role == .compaction {
+                                ChatCompactionRule(text: bubble.text)
+                                    .id(bubble.id)
+                            } else {
+                                ChatBubbleView(
+                                    bubble: bubble,
+                                    thumbnailLoader: thumbnailLoader,
+                                    onOpenMoment: onOpenMoment
+                                )
+                                    .id(bubble.id)
+                            }
+                        }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(ChatMetrics.bottomAnchorID)
                     }
+                    .background(
+                        ChatScrollObserver(onChange: handleScrollMetrics)
+                    )
+                    .padding(.horizontal, ChatMetrics.gutter)
+                    .padding(.vertical, 16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.horizontal, ChatMetrics.gutter)
-                .padding(.vertical, 16)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(ScrollFenceView())
+                .task(id: scrollToLatestRequest) {
+                    guard scrollToLatestRequest > 0 else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    proxy.scrollTo(ChatMetrics.bottomAnchorID, anchor: .bottom)
+                }
+
+                if autoScrollState.shouldShowLatestButton {
+                    ChatLatestButton(action: followLatest)
+                        .padding(14)
+                        .transition(.opacity)
+                }
             }
             .onChange(of: model.bubbles.last?.text) { _, _ in
-                if let last = model.bubbles.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                requestLatestScrollIfFollowing()
             }
-            .onChange(of: model.isSending) { _, _ in
-                if let last = model.bubbles.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+            .onChange(of: model.isSending) { _, isSending in
+                if isSending {
+                    autoScrollState.followLatest()
                 }
+                requestLatestScrollIfFollowing()
+            }
+            .onChange(of: model.selectedID) { _, _ in
+                autoScrollState.resetForConversation()
+                requestLatestScroll()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func handleScrollMetrics(_ metrics: ChatScrollMetrics) {
+        autoScrollState.observe(
+            distanceFromBottom: metrics.distanceFromBottom,
+            isUserScrolling: metrics.isUserScrolling
+        )
+        if autoScrollState.isFollowingLatest,
+           metrics.distanceFromBottom > 1 {
+            requestLatestScroll()
+        }
+    }
+
+    private func requestLatestScrollIfFollowing() {
+        guard autoScrollState.isFollowingLatest else { return }
+        requestLatestScroll()
+    }
+
+    private func followLatest() {
+        autoScrollState.followLatest()
+        requestLatestScroll()
+    }
+
+    private func requestLatestScroll() {
+        scrollToLatestRequest &+= 1
     }
 
     private var emptyState: some View {
@@ -427,8 +486,22 @@ private struct ChatConversationRow: View {
 
 private struct ChatBubbleView: View {
     let bubble: ChatBubble
+    let thumbnailLoader: RecallThumbnailLoader?
+    let onOpenMoment: ((String) -> Void)?
     @State private var toolsExpanded = false
-    @State private var reasoningExpanded = false
+    @State private var reasoningExpanded: Bool
+    @State private var copied = false
+
+    init(
+        bubble: ChatBubble,
+        thumbnailLoader: RecallThumbnailLoader?,
+        onOpenMoment: ((String) -> Void)?
+    ) {
+        self.bubble = bubble
+        self.thumbnailLoader = thumbnailLoader
+        self.onOpenMoment = onOpenMoment
+        _reasoningExpanded = State(initialValue: bubble.isStreaming)
+    }
 
     var body: some View {
         HStack {
@@ -440,7 +513,7 @@ private struct ChatBubbleView: View {
                 if !bubble.tools.isEmpty {
                     toolChip
                 }
-                if !bubble.text.isEmpty || bubble.isStreaming {
+                if !bubble.text.isEmpty || (bubble.isStreaming && bubble.reasoning.isEmpty) {
                     bubbleBody
                 }
             }
@@ -457,12 +530,8 @@ private struct ChatBubbleView: View {
         return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
     }
 
-    /// The model's reasoning, folded away.
-    ///
-    /// Collapsed by default and never streamed: it is long, unedited, and for
-    /// "what did I do today" the user wants the answer, not the deliberation.
-    /// Kept reachable because when an answer looks wrong, the reasoning is
-    /// usually where the wrongness is visible.
+    /// Live reasoning stays open while it is arriving. Stored reasoning folds
+    /// after the answer completes, but remains available for inspection.
     private var reasoningChip: some View {
         DisclosureGroup(isExpanded: $reasoningExpanded) {
             VStack(alignment: .leading, spacing: 10) {
@@ -494,7 +563,13 @@ private struct ChatBubbleView: View {
     }
 
     private var reasoningLabel: String {
-        bubble.reasoning.count > 1
+        if bubble.isStreaming {
+            if let progress = bubble.progress {
+                return "\(progress.title) · \(progress.detail)"
+            }
+            return "Thinking"
+        }
+        return bubble.reasoning.count > 1
             ? "Thought it through in \(bubble.reasoning.count) rounds"
             : "Thought it through"
     }
@@ -560,7 +635,12 @@ private struct ChatBubbleView: View {
                 if let progress = bubble.progress, bubble.text.isEmpty {
                     ChatWorkingIndicator(progress: progress)
                 } else {
-                    ChatMarkdownView(blocks: bubble.markdownBlocks)
+                    ChatMarkdownView(
+                        blocks: bubble.markdownBlocks,
+                        thumbnailLoader: thumbnailLoader,
+                        onOpenMoment: onOpenMoment
+                    )
+                        .textSelection(.enabled)
                     if bubble.isStreaming {
                         ChatStreamCaret()
                     }
@@ -572,6 +652,25 @@ private struct ChatBubbleView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(ChatPalette.tertiary)
                     }
+                    if !bubble.isStreaming, !bubble.text.isEmpty {
+                        HStack {
+                            Spacer(minLength: 0)
+                            Button(action: copyOutput) {
+                                Label(
+                                    copied ? "Copied" : "Copy",
+                                    systemImage: copied ? "checkmark" : "doc.on.doc"
+                                )
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundStyle(copied ? ChatPalette.accent : ChatPalette.tertiary)
+                                .padding(.horizontal, 7)
+                                .frame(height: 24)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(copied ? "Agent output copied" : "Copy agent output")
+                            .accessibilityIdentifier("chat-copy-output-\(bubble.id)")
+                        }
+                    }
                 }
             }
         }
@@ -582,6 +681,19 @@ private struct ChatBubbleView: View {
             RoundedRectangle(cornerRadius: ChatMetrics.bubbleRadius, style: .continuous)
                 .strokeBorder(bubbleStroke, lineWidth: 1)
         }
+        .task(id: copied) {
+            guard copied else { return }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            copied = false
+        }
+    }
+
+    private func copyOutput() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(bubble.text, forType: .string)
+        copied = true
     }
 
     private var bubbleBackground: Color {
@@ -595,6 +707,8 @@ private struct ChatBubbleView: View {
 
 private struct ChatMarkdownView: View {
     let blocks: [MarkdownBlock]
+    let thumbnailLoader: RecallThumbnailLoader?
+    let onOpenMoment: ((String) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -611,6 +725,13 @@ private struct ChatMarkdownView: View {
                         .foregroundStyle(ChatPalette.label)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                case .momentImage(let label, let momentID):
+                    ChatMomentCitationView(
+                        label: label,
+                        momentID: momentID,
+                        thumbnailLoader: thumbnailLoader,
+                        onOpenMoment: onOpenMoment
+                    )
                 case .bulletedList(let items):
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(items.enumerated()), id: \.offset) { _, item in
@@ -914,15 +1035,18 @@ public struct AfterRayChatOverlay<Model: AfterRayChatModeling>: View {
     @ObservedObject var model: Model
     var onClose: () -> Void
     var onOpenMoment: ((String) -> Void)?
+    var thumbnailLoader: RecallThumbnailLoader?
 
     public init(
         model: Model,
         onClose: @escaping () -> Void,
-        onOpenMoment: ((String) -> Void)? = nil
+        onOpenMoment: ((String) -> Void)? = nil,
+        thumbnailLoader: RecallThumbnailLoader? = nil
     ) {
         self.model = model
         self.onClose = onClose
         self.onOpenMoment = onOpenMoment
+        self.thumbnailLoader = thumbnailLoader
     }
 
     public var body: some View {
@@ -931,7 +1055,12 @@ public struct AfterRayChatOverlay<Model: AfterRayChatModeling>: View {
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onClose)
-            AfterRayChatView(model: model, onClose: onClose, onOpenMoment: onOpenMoment)
+            AfterRayChatView(
+                model: model,
+                onClose: onClose,
+                onOpenMoment: onOpenMoment,
+                thumbnailLoader: thumbnailLoader
+            )
                 .recallGlass(in: .rounded(14))
                 .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
         }

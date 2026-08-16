@@ -1,5 +1,7 @@
 # 30 分钟 Slot 总结与 Accessibility 管线
 
+> 实现更新（2026-08-16）：新总结固定使用 10 分钟墙钟 slot；旧 vault 在持久化切换点前保留 30 分钟历史。下文仍写 30 分钟的部分属于历史设计背景。
+
 > 状态：Draft 0.1，2026-08-14
 > 范围：Timeline 的时间分片总结（Slot 层）、Accessibility 数据的利用方式、以及两者之间的数据契约。
 > 关系：本文是 [`afterray-v1-spec.md`](./afterray-v1-spec.md) §5.2（LOD 金字塔）、§4.5（每日总结）、§10（Accessibility）、§14.1（内置 Agent）的实现级展开。与 spec 冲突处以本文标注为准，并在文末列出需要回改 spec 的条目。

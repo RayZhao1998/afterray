@@ -33,8 +33,11 @@ afterray ask '<question>'
 
 ### Whole days
 
-Half-hour slots the daemon has already summarised — cheaper and better
-structured than searching a day span moment by moment.
+Wall-clock slots the daemon has already summarised — 10 minutes for new
+history, with upgraded vaults retaining 30-minute rows before their persisted
+cutover. They are cheaper and better structured than searching a day span
+moment by moment; always trust each row's `slot_start_ms`/`slot_end_ms` rather
+than assuming a duration.
 
 ```sh
 afterray slot day --at-ms <ms> --json          # every occupied slot of that day

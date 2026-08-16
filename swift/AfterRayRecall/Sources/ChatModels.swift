@@ -381,18 +381,11 @@ public struct ChatProgress: Equatable, Sendable {
         phase == .thinking ? "Thinking" : "Working"
     }
 
-    /// A number the user can watch change. An animation alone cannot answer
-    /// "is it stuck" — a spinner spins just as happily over a dead socket —
-    /// so the readout is the part that carries the proof.
-    ///
-    /// Reasoning deltas when the model is producing them, because they show the
-    /// model working rather than the connection merely being open; elapsed time
-    /// otherwise, because it is the only thing moving.
+    /// Elapsed time is honest and readable. `reasoningDeltas` is transport
+    /// activity, not a count of semantic steps, so it must not be presented as
+    /// one to the user.
     public var detail: String {
-        if reasoningDeltas > 0 {
-            return "\(reasoningDeltas) steps · \(seconds)"
-        }
-        return seconds
+        seconds
     }
 
     private var seconds: String {
@@ -448,6 +441,7 @@ public enum ChatStreamEvent: Equatable, Sendable {
     case toolCall(name: String, argsJSON: String)
     case toolResult(name: String, chars: Int, truncated: Bool = false, dropped: Int = 0)
     case token(text: String)
+    case reasoning(text: String, round: Int)
     case usage(ChatContextUsage)
     case started(messageId: String, conversationId: String)
     case progress(ChatProgress)
@@ -515,6 +509,11 @@ public enum ChatStreamEventDecoder {
             )
         case "token":
             return .token(text: object["text"] as? String ?? "")
+        case "reasoning":
+            return .reasoning(
+                text: object["text"] as? String ?? "",
+                round: intValue(object["round"]) ?? 0
+            )
         case "usage":
             return .usage(
                 ChatContextUsage(
@@ -565,6 +564,7 @@ public enum ChatStreamEventDecoder {
 public struct ChatStreamState: Equatable, Sendable {
     public var text: String
     public var tools: [ChatToolCall]
+    public var reasoning: [ChatReasoningRound]
     public var conversationId: String?
     public var messageId: String?
     public var error: String?
@@ -580,6 +580,7 @@ public struct ChatStreamState: Equatable, Sendable {
     public init(
         text: String = "",
         tools: [ChatToolCall] = [],
+        reasoning: [ChatReasoningRound] = [],
         conversationId: String? = nil,
         messageId: String? = nil,
         error: String? = nil,
@@ -590,6 +591,7 @@ public struct ChatStreamState: Equatable, Sendable {
     ) {
         self.text = text
         self.tools = tools
+        self.reasoning = reasoning
         self.conversationId = conversationId
         self.messageId = messageId
         self.error = error
@@ -600,7 +602,7 @@ public struct ChatStreamState: Equatable, Sendable {
     }
 
     public var receivedWork: Bool {
-        !text.isEmpty || !tools.isEmpty
+        !text.isEmpty || !tools.isEmpty || !reasoning.isEmpty
     }
 
     public var shouldFallbackToSend: Bool {
@@ -660,6 +662,13 @@ public enum ChatStreamReducer {
             // The answer is now its own proof of life. Leaving the indicator up
             // beside it would put two "it is working" signals on screen.
             state.progress = nil
+        case .reasoning(let text, let round):
+            guard !text.isEmpty else { break }
+            if let index = state.reasoning.lastIndex(where: { $0.round == round }) {
+                state.reasoning[index].text += text
+            } else {
+                state.reasoning.append(ChatReasoningRound(round: round, text: text))
+            }
         case .done(let messageId, let conversationId):
             state.progress = nil
             if !messageId.isEmpty { state.messageId = messageId }
@@ -673,9 +682,11 @@ public enum ChatStreamReducer {
 }
 
 extension ChatStreamEvent {
-    var isTextToken: Bool {
-        if case .token = self { return true }
-        return false
+    var isTextDelta: Bool {
+        switch self {
+        case .token, .reasoning: true
+        default: false
+        }
     }
 }
 
@@ -878,6 +889,7 @@ public enum ChatTranscript {
         messages: [ChatMessage],
         streamingText: String = "",
         streamingTools: [ChatToolCall] = [],
+        streamingReasoning: [ChatReasoningRound] = [],
         isSending: Bool = false,
         nowMs: Int64 = 0,
         liveCompactions: [ChatCompactionNotice] = [],
@@ -920,7 +932,8 @@ public enum ChatTranscript {
                     tools: streamingTools,
                     isStreaming: true,
                     createdAtMs: nowMs,
-                    progress: progress
+                    progress: progress,
+                    reasoning: streamingReasoning
                 )
             )
         }
