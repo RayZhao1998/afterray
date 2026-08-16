@@ -12,6 +12,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 - `build-release.sh` — full pipeline: version checks, assemble `AfterRay.app` by hand (SwiftPM emits bare binaries), sign, notarize, staple, DMG + zip into `dist/`. Modes: default / `--skip-notarization` / `--local`.
 - `publish-release.sh` — uploads zip + DMG to R2 bucket `afterray-releases` under `artifacts/`, then updates the `releases.json` index last (publish-release.sh:36-38) so a partial failure leaves installs on the previous release.
+- `tag-release.sh` — after appcast verification, creates and pushes annotated `v<version>` at the exact published `origin/main` commit.
 - `fetch-sparkle-tools.sh` — Sparkle 2.9.5 tools (`sign_update`, `generate_keys`) into `.afterray-dev/sparkle-tools/`, tarball SHA-256 pinned (fetch-sparkle-tools.sh:10-13). Once per machine.
 
 ## Invariants
@@ -21,6 +22,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 - arm64-only (build-release.sh:96); every shipped binary is `lipo`-verified.
 - Signing is inside-out, never `--deep`; Sparkle's `Autoupdate`/`Updater.app` are signed individually (build-release.sh:379+). Sparkle XPCServices/Headers are pruned from the embedded framework — the app is not sandboxed.
 - The Sparkle update zip is built from the *stapled* bundle — the notarization ticket must be in the archive or offline first-launch fails Gatekeeper.
+- A release tag is created only after the public appcast contains the matching version and build; tags never move.
 - Dev builds need a stable signing identity or TCC (Screen Recording) permission resets on every rebuild (run-v0.sh:183+); ad-hoc fallback uses a fixed identifier + designated requirement.
 - Script style: `set -Eeuo pipefail`, exit 64 for usage errors, guard every `rm -rf` with a path-prefix check.
 
@@ -28,7 +30,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 - `make dev` / `make dev-ui` / `make v0` / `make v0-daemon` / `make open` / `make stop`
 - `make release-preflight` (needs explicit `AFTERRAY_CODESIGN_IDENTITY` + `AFTERRAY_NOTARY_PROFILE`; checks remote release-index collisions before a costly build) / `make release` (runs that preflight) / `make release-local` (needs neither)
-- `make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json` / `make publish-dry-run MANIFEST=…` / `make publish MANIFEST=…` — production steps always use one explicit manifest; never select an artifact by `dist/` ordering.
+- `make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json` / `make publish-dry-run MANIFEST=…` / `make publish MANIFEST=…` / `make tag-release MANIFEST=…` — production steps always use one explicit manifest; never select an artifact by `dist/` ordering. Tag only after publish and public appcast verification.
 - `make models` → `download-models/download.sh` — pure wrapper over `afterray download` (builds the CLI first if missing); override pack with `AFTERRAY_DOWNLOAD_ONLY`, dir with `AFTERRAY_MODEL_DIR`.
 
 ## Watch out

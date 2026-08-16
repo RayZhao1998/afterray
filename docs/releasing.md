@@ -196,6 +196,19 @@ After publishing, fetch `appcast.xml` and `/download/latest` to confirm that
 the feed contains the intended version, build, archive signature, and latest
 DMG redirect.
 
+### Tag the published source
+
+Every published release has an immutable annotated Git tag named
+`v<marketing-version>`. Create it only after the public appcast check above:
+
+```sh
+make tag-release MANIFEST=dist/AfterRay-<version>-arm64.json
+```
+
+The command refuses a dirty checkout, a commit other than `origin/main`, a
+manifest whose build does not match that commit, or an appcast missing the
+matching version/build. It never moves an existing tag.
+
 ### The signing key
 
 Updates are verified with an EdDSA key pair. The public half lives in
