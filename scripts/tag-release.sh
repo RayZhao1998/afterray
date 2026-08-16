@@ -56,14 +56,6 @@ git fetch origin main --quiet
 [[ "$build" == "$(git rev-list --count HEAD)" ]] \
   || die "manifest build $build does not match HEAD"
 
-tag="v$version"
-if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-  [[ "$(git rev-parse "$tag^{commit}")" == "$(git rev-parse HEAD)" ]] \
-    || die "existing $tag points at a different commit"
-else
-  git tag -a "$tag" -m "AfterRay $version (build $build)"
-fi
-
 appcast_path="$(mktemp /tmp/afterray-appcast.XXXXXX.xml)"
 cleanup() {
   rm -f -- "$appcast_path"
@@ -86,6 +78,14 @@ for item in root.findall('./channel/item'):
 else:
     sys.exit(f'appcast does not contain {version} build {build}')
 PYTHON
+
+tag="v$version"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  [[ "$(git rev-parse "$tag^{commit}")" == "$(git rev-parse HEAD)" ]] \
+    || die "existing $tag points at a different commit"
+else
+  git tag -a "$tag" -m "AfterRay $version (build $build)"
+fi
 
 git push origin "refs/tags/$tag"
 printf 'Tagged and pushed %s at %s.\n' "$tag" "$(git rev-parse --short HEAD)"
