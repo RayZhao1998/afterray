@@ -878,6 +878,112 @@ private struct SendableAssetWriter: @unchecked Sendable {
     let value: AVAssetWriter
 }
 
+/// Keeps an excluded app's audio off disk while it is frontmost.
+///
+/// A screenshot can be deleted after the fact, because the accessibility
+/// snapshot that names the app arrives right behind it. Audio has no such
+/// snapshot, and a finished `m4a` segment covers five minutes that cannot be
+/// sliced apart afterwards — so the only place the exclusion can be honoured
+/// is here, before a sample buffer reaches the writer.
+///
+/// The frontmost app is polled rather than observed: the shim's main thread
+/// sits blocked in `readLine` between commands and never services a run loop,
+/// so `NSWorkspace` activation notifications would not be delivered. It reads
+/// the same source the capture path already trusts (`main.swift:781`).
+///
+/// Polling alone would still leak, in two ways: the stream starts delivering
+/// audio before the daemon's list has been read off stdin, and a switch into
+/// an excluded app is noticed up to one interval late. So this gate does not
+/// answer "is an excluded app in front *now*" — it answers "which stretch of
+/// the recent past is known to have had none". Samples are held until a check
+/// vouches for the moment they were recorded, and are dropped otherwise. No
+/// sample from an unvouched-for moment is ever handed to a writer.
+private final class ExcludedAudioGate: @unchecked Sendable {
+    /// Audio is held for up to this long before it can be written, so this is
+    /// added latency on a five-minute segment, not exposure.
+    private static let pollInterval = DispatchTimeInterval.milliseconds(100)
+
+    /// What the checks so far establish about the foreground.
+    enum Foreground {
+        /// The most recent check found an excluded app in front.
+        case excluded
+        /// Every check from `from` through `through` (uptime nanoseconds)
+        /// found no excluded app, so a sample that arrived inside that span
+        /// was recorded while none was in front.
+        case clear(from: UInt64, through: UInt64)
+        /// Nothing is established yet: either the daemon's list has not
+        /// arrived, or no check has run since an excluded app was in front.
+        case unknown
+    }
+
+    private let lock = NSLock()
+    /// `nil` until the daemon sends the list. An app in front before that
+    /// point cannot be judged — it may well be one the user excluded — so
+    /// this is what keeps the startup window closed.
+    private var excluded: Set<String>?
+    private var foreground: Foreground = .unknown
+    private var timer: DispatchSourceTimer?
+
+    var state: Foreground {
+        lock.lock()
+        defer { lock.unlock() }
+        return foreground
+    }
+
+    /// The daemon sends the list once at startup and again on every change.
+    func setExcludedBundles(_ bundleIds: [String]) {
+        let normalized = Set(bundleIds.map { $0.lowercased() })
+        lock.lock()
+        excluded = normalized
+        lock.unlock()
+        refresh()
+    }
+
+    func start(queue: DispatchQueue) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: Self.pollInterval)
+        timer.setEventHandler { [weak self] in self?.refresh() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    private func refresh() {
+        lock.lock()
+        let excluded = self.excluded
+        lock.unlock()
+        // Before the list arrives the foreground stays unknown, and held
+        // audio stays held.
+        guard let excluded else { return }
+        // Nothing excluded is the common case; skip the AppKit query entirely.
+        let frontmost = excluded.isEmpty
+            ? nil
+            : NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.lowercased()
+        let isExcluded = frontmost.map(excluded.contains) ?? false
+        let now = DispatchTime.now().uptimeNanoseconds
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isExcluded else {
+            if case .excluded = foreground {} else {
+                log("audio suppressed for \(frontmost ?? "an excluded app")")
+            }
+            foreground = .excluded
+            return
+        }
+        if case let .clear(from, _) = foreground {
+            // Extend the run: everything from `from` to now is vouched for.
+            foreground = .clear(from: from, through: now)
+        } else {
+            // First clear check after startup or after an excluded stretch.
+            // The run starts here; nothing recorded earlier can be vouched for.
+            if case .excluded = foreground {
+                log("audio resumed after \(frontmost ?? "an excluded app")")
+            }
+            foreground = .clear(from: now, through: now)
+        }
+    }
+}
+
 private final class AudioSegmentWriter {
     private let kind: ArtifactKind
     private let outputDirectory: URL
@@ -888,6 +994,15 @@ private final class AudioSegmentWriter {
     private var startedAt: CMTime?
     private var startedAtMs: Int64?
     private var outputURL: URL?
+    /// Samples wait here until a foreground check vouches for the moment they
+    /// were recorded. Nothing reaches the file before that.
+    private var pending: [(arrivedAt: UInt64, buffer: CMSampleBuffer)] = []
+
+    /// If confirmation never comes — the daemon never sent a list, or the poll
+    /// stalled — the oldest samples are dropped rather than held forever. At
+    /// roughly one buffer per 20 ms this is over a second of slack against a
+    /// 100 ms poll, and what it drops is audio nothing can vouch for anyway.
+    private static let maximumPending = 64
 
     init(kind: ArtifactKind, outputDirectory: URL, segmentDuration: Double, events: EventWriter) {
         self.kind = kind
@@ -896,7 +1011,33 @@ private final class AudioSegmentWriter {
         self.events = events
     }
 
-    func append(_ sampleBuffer: CMSampleBuffer) {
+    /// Takes a sample without writing it. It becomes writable only once a
+    /// `release` covers the moment it arrived.
+    func hold(_ sampleBuffer: CMSampleBuffer, arrivedAt: UInt64) {
+        guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        pending.append((arrivedAt, sampleBuffer))
+        if pending.count > Self.maximumPending {
+            pending.removeFirst(pending.count - Self.maximumPending)
+        }
+    }
+
+    /// Writes the held samples that arrived inside a stretch known to have had
+    /// no excluded app in front, and drops anything older — no check can vouch
+    /// for that any more, so it must not be written.
+    func release(from: UInt64, through: UInt64) {
+        guard !pending.isEmpty else { return }
+        var held: [(arrivedAt: UInt64, buffer: CMSampleBuffer)] = []
+        for entry in pending {
+            if entry.arrivedAt > through {
+                held.append(entry)
+            } else if entry.arrivedAt >= from {
+                append(entry.buffer)
+            }
+        }
+        pending = held
+    }
+
+    private func append(_ sampleBuffer: CMSampleBuffer) {
         guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
         let timestamp = sampleBuffer.presentationTimeStamp
         if let startedAt, CMTimeGetSeconds(timestamp - startedAt) >= segmentDuration {
@@ -915,8 +1056,20 @@ private final class AudioSegmentWriter {
         }
     }
 
+    /// Held samples are dropped rather than flushed: capture is stopping, so
+    /// no check will ever vouch for the moment they were recorded.
     func finish() {
+        pending.removeAll()
         finishSegment(waitForCompletion: true)
+    }
+
+    /// Closes the open segment so that whatever comes next starts a new file.
+    /// Called when an excluded app takes the foreground: everything still held
+    /// is dropped, and the audio from here on must not extend a file already
+    /// on disk.
+    func suspend() {
+        pending.removeAll()
+        finishSegment()
     }
 
     private func beginSegment(sampleBuffer: CMSampleBuffer, timestamp: CMTime) throws {
@@ -1000,6 +1153,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
     private let events: EventWriter
     private let systemAudio: AudioSegmentWriter?
     private let microphone: AudioSegmentWriter?
+    let audioGate = ExcludedAudioGate()
 
     init(options: Options, events: EventWriter) {
         self.events = events
@@ -1027,12 +1181,39 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
         case .screen:
             break
         case .audio:
-            systemAudio?.append(sampleBuffer)
+            ingest(sampleBuffer, into: systemAudio)
         case .microphone:
-            microphone?.append(sampleBuffer)
+            ingest(sampleBuffer, into: microphone)
         @unknown default:
             break
         }
+    }
+
+    /// Nothing is written until a foreground check vouches for the moment the
+    /// sample was recorded. Writing first and cutting on the next check would
+    /// leave every sample since the previous check inside a file the daemon
+    /// then imports into the vault and hands to ASR — which is exactly the
+    /// audio an exclusion is supposed to prevent.
+    private func ingest(_ sampleBuffer: CMSampleBuffer, into writer: AudioSegmentWriter?) {
+        let arrivedAt = DispatchTime.now().uptimeNanoseconds
+        switch audioGate.state {
+        case .excluded:
+            suspendAudio()
+        case .unknown:
+            writer?.hold(sampleBuffer, arrivedAt: arrivedAt)
+        case let .clear(from, through):
+            writer?.hold(sampleBuffer, arrivedAt: arrivedAt)
+            writer?.release(from: from, through: through)
+        }
+    }
+
+    /// Both tracks are cut, not just the one whose buffer arrived: the
+    /// microphone can be silent while system audio plays, and a segment left
+    /// open across the excluded stretch would join the audio on either side of
+    /// it into one file.
+    private func suspendAudio() {
+        systemAudio?.suspend()
+        microphone?.suspend()
     }
 
     func stream(_: SCStream, didStopWithError error: any Error) {
@@ -1061,11 +1242,17 @@ private func captureScreen(
         outputDirectory: options.outputDirectory,
         events: events
     )
-    if case .privateBrowsing? = accessibility { return }
-    if case .foregroundChanged? = accessibility {
+    // No accessibility snapshot means no exclusion check: the daemon decides
+    // whether a frame may be kept from the bundle id and URL in that snapshot
+    // alone, so a screenshot sent without one can never be evaluated and would
+    // stay in the vault whatever the user excluded. Skipping the tick loses a
+    // frame; sending it loses the guarantee.
+    guard let accessibility else { return }
+    if case .privateBrowsing = accessibility { return }
+    if case .foregroundChanged = accessibility {
         return
     }
-    if case let .artifact(accessibilityURL, context)? = accessibility,
+    if case let .artifact(accessibilityURL, context) = accessibility,
        !foregroundCaptureContextIsCurrent(context)
     {
         try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1079,7 +1266,7 @@ private func captureScreen(
             contentFilter: filter,
             configuration: configuration
         )
-        if case let .artifact(accessibilityURL, context)? = accessibility,
+        if case let .artifact(accessibilityURL, context) = accessibility,
            !foregroundCaptureContextIsCurrent(context)
         {
             try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1098,7 +1285,7 @@ private func captureScreen(
             endedAtMs: now,
             requestId: requestId
         ))
-        if case let .artifact(accessibilityURL, _)? = accessibility {
+        if case let .artifact(accessibilityURL, _) = accessibility {
             events.send(.artifact(
                 kind: .accessibility,
                 url: accessibilityURL,
@@ -1109,7 +1296,7 @@ private func captureScreen(
         }
     } catch {
         try? FileManager.default.removeItem(at: screenURL)
-        if case let .artifact(accessibilityURL, _)? = accessibility {
+        if case let .artifact(accessibilityURL, _) = accessibility {
             try? FileManager.default.removeItem(at: accessibilityURL)
         }
         throw error
@@ -1119,10 +1306,12 @@ private func captureScreen(
 private struct InputCommand: Decodable {
     let command: String
     let requestId: String?
+    let bundleIds: [String]?
 
     enum CodingKeys: String, CodingKey {
         case command
         case requestId = "request_id"
+        case bundleIds = "bundle_ids"
     }
 }
 
@@ -1177,6 +1366,11 @@ private enum AfterRayCaptureShim {
             let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)
             if options.recordAudio {
+                // Its own queue: the sample handler must never wait on this,
+                // and the main thread is blocked in `readLine` most of the time.
+                output.audioGate.start(
+                    queue: DispatchQueue(label: "dev.afterray.capture.foreground", qos: .utility)
+                )
                 try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
                 try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
             }
@@ -1203,6 +1397,8 @@ private enum AfterRayCaptureShim {
                             options: options,
                             events: events
                         )
+                    case "set_excluded_bundles":
+                        output.audioGate.setExcludedBundles(command.bundleIds ?? [])
                     case "stop":
                         try await stream.stopCapture()
                         callbackQueue.sync { output.finishAudio() }
