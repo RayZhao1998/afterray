@@ -40,6 +40,8 @@ pub struct CaptureConfig {
     pub audio_segment_seconds: u64,
     pub jpeg_quality: f64,
     pub record_audio: bool,
+    /// Stable `ColorSync` display UUID. Empty follows the macOS main display.
+    pub capture_display_uuid: String,
 }
 
 impl CaptureConfig {
@@ -51,6 +53,7 @@ impl CaptureConfig {
             audio_segment_seconds: 300,
             jpeg_quality: 0.95,
             record_audio: true,
+            capture_display_uuid: String::new(),
         }
     }
 
@@ -162,6 +165,7 @@ struct RunningShim {
 pub struct MacOsCaptureBackend {
     config: CaptureConfig,
     record_audio: AtomicBool,
+    capture_display_uuid: std::sync::Mutex<String>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     running: Mutex<Option<RunningShim>>,
     events_tx: mpsc::Sender<Result<CaptureEvent, CaptureError>>,
@@ -173,9 +177,11 @@ impl MacOsCaptureBackend {
     pub fn new(config: CaptureConfig) -> Arc<Self> {
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
         let record_audio = AtomicBool::new(config.record_audio);
+        let capture_display_uuid = config.capture_display_uuid.clone();
         Arc::new(Self {
             config,
             record_audio,
+            capture_display_uuid: std::sync::Mutex::new(capture_display_uuid),
             excluded_bundle_ids: std::sync::Mutex::new(Vec::new()),
             running: Mutex::new(None),
             events_tx,
@@ -190,6 +196,21 @@ impl MacOsCaptureBackend {
     #[must_use]
     pub fn record_audio(&self) -> bool {
         self.record_audio.load(Ordering::Relaxed)
+    }
+
+    pub fn set_capture_display_uuid(&self, uuid: String) {
+        *self
+            .capture_display_uuid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = uuid;
+    }
+
+    #[must_use]
+    pub fn capture_display_uuid(&self) -> String {
+        self.capture_display_uuid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Replaces the audio exclusion list and pushes it to a running helper.
@@ -262,11 +283,20 @@ impl MacOsCaptureBackend {
         if !self.record_audio() {
             command.arg("--no-audio");
         }
+        let display_uuid = self.capture_display_uuid();
+        if !display_uuid.is_empty() {
+            command.arg("--display-uuid").arg(&display_uuid);
+        }
         eprintln!(
-            "capture: spawning {} --output-dir {} audio={}",
+            "capture: spawning {} --output-dir {} audio={} display={}",
             self.config.shim_path.display(),
             self.config.output_dir.display(),
-            self.record_audio()
+            self.record_audio(),
+            if display_uuid.is_empty() {
+                "main"
+            } else {
+                &display_uuid
+            }
         );
         let mut child = command
             .stdin(Stdio::piped())
@@ -440,6 +470,14 @@ mod tests {
             config.validate(),
             Err(CaptureError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn display_selection_defaults_to_main_and_can_be_replaced() {
+        let backend = MacOsCaptureBackend::new(CaptureConfig::new("shim", "/tmp/output"));
+        assert!(backend.capture_display_uuid().is_empty());
+        backend.set_capture_display_uuid("DISPLAY-UUID".to_owned());
+        assert_eq!(backend.capture_display_uuid(), "DISPLAY-UUID");
     }
 
     #[test]

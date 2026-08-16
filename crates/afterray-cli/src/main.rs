@@ -448,6 +448,7 @@ async fn request_from_command(
             summary_language,
         } => Request::UpdateSettings {
             record_audio: None,
+            capture_display_uuid: None,
             ui_language,
             summary_language,
             storage_limit_bytes: None,

@@ -215,6 +215,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.uiLanguage, "auto")
         XCTAssertEqual(settings.summaryLanguage, "auto")
         XCTAssertTrue(settings.languageOptions.isEmpty)
+        XCTAssertTrue(settings.captureDisplayUUID.isEmpty)
 
         let picker = settings.languagePickerOptions(selected: settings.uiLanguage)
         XCTAssertEqual(picker.map(\.code), ["auto"])
@@ -266,6 +267,25 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["type"] as? String, "update_settings")
         XCTAssertEqual(json["ui_language"] as? String, "zh-Hans")
         XCTAssertEqual(json["summary_language"] as? String, "ja")
+    }
+
+    func testUpdateSettingsRequestIncludesCaptureDisplayUUID() throws {
+        let uuid = "4E4A790B-74CE-47DE-A62A-1F0F2F79A958"
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", captureDisplayUUID: uuid)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["capture_display_uuid"] as? String, uuid)
+    }
+
+    func testAppSettingsDecodesCaptureDisplayUUID() throws {
+        let uuid = "4E4A790B-74CE-47DE-A62A-1F0F2F79A958"
+        let json = """
+        {"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"capture_display_uuid":"\(uuid)"}
+        """
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.captureDisplayUUID, uuid)
     }
 
     func testUpdateSettingsRequestIncludesStorageLimit() throws {
@@ -588,7 +608,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 10)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 11)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {

@@ -173,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut capture_config = CaptureConfig::new(shim_path, staging_dir.clone());
     capture_config.record_audio = persisted.record_audio;
+    capture_config.capture_display_uuid = persisted.capture_display_uuid.clone();
     let capture = MacOsCaptureBackend::new(capture_config);
 
     let worker_path = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
@@ -469,6 +470,9 @@ struct AppState {
 struct PersistedSettings {
     #[serde(default = "default_record_audio")]
     record_audio: bool,
+    /// Empty follows the main display; otherwise a stable ColorSync UUID.
+    #[serde(default)]
+    capture_display_uuid: String,
     #[serde(default = "default_storage_limit_bytes")]
     storage_limit_bytes: u64,
     #[serde(default = "default_excluded_bundle_ids")]
@@ -538,6 +542,7 @@ impl Default for PersistedSettings {
     fn default() -> Self {
         Self {
             record_audio: true,
+            capture_display_uuid: String::new(),
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: default_excluded_bundle_ids(),
             excluded_domains: Vec::new(),
@@ -904,6 +909,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
             record_audio,
+            capture_display_uuid,
             ui_language,
             summary_language,
             storage_limit_bytes,
@@ -919,6 +925,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 state,
                 SettingsPatch {
                     record_audio,
+                    capture_display_uuid,
                     ui_language,
                     summary_language,
                     storage_limit_bytes,
@@ -1225,6 +1232,7 @@ fn current_settings(state: &AppState) -> AppSettings {
         model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
+        capture_display_uuid: state.capture.capture_display_uuid(),
         storage_limit_bytes: state.store.storage_limit_bytes(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
@@ -1269,6 +1277,7 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
     let llm = current_llm_config(state);
     PersistedSettings {
         record_audio: state.capture.record_audio(),
+        capture_display_uuid: state.capture.capture_display_uuid(),
         storage_limit_bytes: state.store.storage_limit_bytes(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
@@ -1305,6 +1314,7 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
 /// one parameter as the surface grows.
 struct SettingsPatch {
     record_audio: Option<bool>,
+    capture_display_uuid: Option<String>,
     ui_language: Option<String>,
     summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
@@ -1320,6 +1330,7 @@ struct SettingsPatch {
 async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
     let SettingsPatch {
         record_audio,
+        capture_display_uuid,
         ui_language,
         summary_language,
         storage_limit_bytes,
@@ -1331,6 +1342,25 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         llm_api_key,
         model_download_endpoint,
     } = patch;
+    if let Some(uuid) = capture_display_uuid {
+        let cleaned = uuid.trim().to_ascii_uppercase();
+        if !cleaned.is_empty() && Uuid::parse_str(&cleaned).is_err() {
+            return Response::failure("capture display UUID is invalid");
+        }
+        let previous = state.capture.capture_display_uuid();
+        state.capture.set_capture_display_uuid(cleaned.clone());
+        if let Err(error) = persist_current_settings(state) {
+            state.capture.set_capture_display_uuid(previous);
+            return Response::failure(format!("could not save display preference: {error}"));
+        }
+        if previous != cleaned
+            && let Err(error) = restart_capture_runtime(state).await
+        {
+            return Response::failure(format!(
+                "display preference saved, but capture could not restart: {error}"
+            ));
+        }
+    }
     if let Some(endpoint) = model_download_endpoint {
         let cleaned = endpoint.trim().trim_end_matches('/').to_owned();
         // Same origin policy as the LLM endpoint: https, or plain http only to
@@ -3915,6 +3945,25 @@ mod tests {
         std::fs::write(settings_path(directory.path()), br#"{"record_audio":true}"#).unwrap();
         let legacy = load_persisted_settings(directory.path());
         assert!(legacy.model_download_endpoint.is_empty());
+    }
+
+    #[test]
+    fn capture_display_round_trips_and_legacy_settings_follow_main() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = PersistedSettings {
+            capture_display_uuid: "4E4A790B-74CE-47DE-A62A-1F0F2F79A958".to_owned(),
+            ..PersistedSettings::default()
+        };
+        save_persisted_settings(directory.path(), &settings).unwrap();
+        let reloaded = load_persisted_settings(directory.path());
+        assert_eq!(reloaded.capture_display_uuid, settings.capture_display_uuid);
+
+        std::fs::write(settings_path(directory.path()), br#"{"record_audio":true}"#).unwrap();
+        assert!(
+            load_persisted_settings(directory.path())
+                .capture_display_uuid
+                .is_empty()
+        );
     }
 
     /// The field is gone from what we write but has to survive what we read,

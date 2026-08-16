@@ -2,6 +2,7 @@
 import AfterRayCapturePolicy
 import ApplicationServices
 import AppKit
+import ColorSync
 import CoreGraphics
 import CoreMedia
 import Foundation
@@ -28,12 +29,14 @@ private struct Options {
     let audioSegmentSeconds: Double
     let jpegQuality: Double
     let recordAudio: Bool
+    let displayUUID: String?
 
     static func parse(_ arguments: [String]) throws -> Self {
         var outputDirectory: URL?
         var audioSegmentSeconds = 300.0
         var jpegQuality = 0.95
         var recordAudio = true
+        var displayUUID: String?
         var index = 1
         while index < arguments.count {
             let key = arguments[index]
@@ -59,6 +62,12 @@ private struct Options {
                     throw ShimError.invalidArguments("JPEG quality must be between zero and one")
                 }
                 jpegQuality = parsed
+            case "--display-uuid":
+                let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty else {
+                    throw ShimError.invalidArguments("display UUID must not be empty")
+                }
+                displayUUID = cleaned.uppercased()
             default:
                 throw ShimError.invalidArguments("unknown option \(key)")
             }
@@ -71,7 +80,8 @@ private struct Options {
             outputDirectory: outputDirectory,
             audioSegmentSeconds: audioSegmentSeconds,
             jpegQuality: jpegQuality,
-            recordAudio: recordAudio
+            recordAudio: recordAudio,
+            displayUUID: displayUUID
         )
     }
 }
@@ -1332,8 +1342,24 @@ private enum AfterRayCaptureShim {
                 false,
                 onScreenWindowsOnly: true
             )
-            guard let display = content.displays.first else { throw ShimError.noDisplay }
-            log("got display id=\(display.displayID) \(display.width)x\(display.height) apps=\(content.applications.count)")
+            guard !content.displays.isEmpty else { throw ShimError.noDisplay }
+            let preferredDisplay = options.displayUUID.flatMap { preferredUUID in
+                content.displays.first {
+                    displayUUID(for: $0.displayID) == preferredUUID
+                }
+            }
+            let display = preferredDisplay
+                ?? content.displays.first { $0.displayID == CGMainDisplayID() }
+                ?? content.displays[0]
+            let displayFallbackMessage = options.displayUUID.flatMap { requestedUUID in
+                preferredDisplay == nil
+                    ? "Display \(requestedUUID) is unavailable; capturing the main display instead"
+                    : nil
+            }
+            log(
+                "got display id=\(display.displayID) uuid=\(displayUUID(for: display.displayID) ?? "unknown") "
+                    + "\(display.width)x\(display.height) apps=\(content.applications.count)"
+            )
 
             let configuration = SCStreamConfiguration()
             configuration.width = display.width
@@ -1378,6 +1404,9 @@ private enum AfterRayCaptureShim {
             try await stream.startCapture()
             log("startCapture returned, sending ready")
             events.send(.ready(display: display))
+            if let displayFallbackMessage {
+                events.send(.warning(code: "display_unavailable", message: displayFallbackMessage))
+            }
 
             let decoder = JSONDecoder()
             while let line = readLine(strippingNewline: true) {
@@ -1446,4 +1475,10 @@ private func nativePixelSize(for display: SCDisplay) -> (width: Int, height: Int
         width: Int((CGFloat(display.width) * scale).rounded()),
         height: Int((CGFloat(display.height) * scale).rounded())
     )
+}
+
+private func displayUUID(for displayID: CGDirectDisplayID) -> String? {
+    guard let unmanaged = CGDisplayCreateUUIDFromDisplayID(displayID) else { return nil }
+    let uuid = unmanaged.takeRetainedValue()
+    return (CFUUIDCreateString(nil, uuid) as String).uppercased()
 }

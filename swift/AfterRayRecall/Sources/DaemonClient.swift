@@ -118,6 +118,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
+    func updateCaptureDisplay(uuid: String) async throws -> AppSettings
     func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
@@ -162,6 +163,10 @@ public extension AfterRayDaemonServing {
         throw DaemonClientError.rejected("changing the download endpoint is not available")
     }
 
+    func updateCaptureDisplay(uuid _: String) async throws -> AppSettings {
+        throw DaemonClientError.rejected("changing the capture display is not available")
+    }
+
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
         try await updateSettings(
             recordAudio: recordAudio,
@@ -179,7 +184,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 10
+    public static let protocolVersion = 11
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -232,6 +237,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func settings() async throws -> AppSettings {
         try await request(WireRequest(type: "settings"), as: AppSettings.self)
+    }
+
+    public func updateCaptureDisplay(uuid: String) async throws -> AppSettings {
+        try await request(
+            WireRequest(type: "update_settings", captureDisplayUUID: uuid),
+            as: AppSettings.self
+        )
     }
 
     public func updateSettings(
@@ -529,6 +541,7 @@ struct WireRequest: Encodable, Equatable {
     var dayMs: Int64?
     var beforeMs: Int64?
     var recordAudio: Bool?
+    var captureDisplayUUID: String?
     var reason: String?
     var paused: Bool?
     var packID: String?
@@ -569,6 +582,7 @@ struct WireRequest: Encodable, Equatable {
         case dayMs = "day_ms"
         case beforeMs = "before_ms"
         case recordAudio = "record_audio"
+        case captureDisplayUUID = "capture_display_uuid"
         case reason
         case paused
         case packID = "pack_id"
@@ -611,6 +625,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(dayMs, forKey: .dayMs)
         try container.encodeIfPresent(beforeMs, forKey: .beforeMs)
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
+        try container.encodeIfPresent(captureDisplayUUID, forKey: .captureDisplayUUID)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encodeIfPresent(paused, forKey: .paused)
         try container.encodeIfPresent(packID, forKey: .packID)

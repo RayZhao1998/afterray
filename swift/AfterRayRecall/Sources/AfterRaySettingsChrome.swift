@@ -16,9 +16,11 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadRateBytesPerSecond: Double? { get }
     var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
+    var isUpdatingCaptureDisplay: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
     var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
+    var captureDisplays: [CaptureDisplayOption] { get }
     var excludedBundleIds: [String] { get }
     var excludedDomains: [String] { get }
     var isUpdatingExclusions: Bool { get }
@@ -47,6 +49,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
+    func setCaptureDisplay(uuid: String) async
     func setStorageLimitBytes(_ bytes: UInt64) async
     func setUiLanguage(_ code: String) async
     func setSummaryLanguage(_ code: String) async
@@ -530,6 +533,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
 
         SettingsSection(title: "Capture") {
+            CaptureDisplayPicker(
+                displays: model.captureDisplays,
+                selection: captureDisplayBinding,
+                isUpdating: model.isUpdatingCaptureDisplay
+            )
+            SettingsSeparator()
             SettingsRow(
                 title: "Record audio",
                 subtitle: "System audio and microphone for transcripts. Recordings already in the vault stay."
@@ -763,6 +772,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         Binding(
             get: { model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes },
             set: { bytes in Task { await model.setStorageLimitBytes(bytes) } }
+        )
+    }
+
+    private var captureDisplayBinding: Binding<String> {
+        Binding(
+            get: { model.settings?.captureDisplayUUID ?? "" },
+            set: { uuid in Task { await model.setCaptureDisplay(uuid: uuid) } }
         )
     }
 
@@ -1749,6 +1765,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
 // MARK: - Building blocks
 
+func captureDisplayPreviewSize(aspectRatio: CGFloat, container: CGSize) -> CGSize {
+    guard
+        aspectRatio.isFinite,
+        aspectRatio > 0,
+        container.width > 0,
+        container.height > 0
+    else { return .zero }
+    if aspectRatio > container.width / container.height {
+        return CGSize(width: container.width, height: container.width / aspectRatio)
+    }
+    return CGSize(width: container.height * aspectRatio, height: container.height)
+}
+
 /// Header + one card. The card wraps `content` in a single container, so a
 /// section with several children stays one surface instead of one card each.
 private struct SettingsSection<Content: View>: View {
@@ -1846,6 +1875,166 @@ private struct SettingsRow<Trailing: View>: View {
         .padding(.horizontal, SettingsMetrics.rowInset)
         .padding(.vertical, 11)
         .frame(minHeight: SettingsMetrics.rowMinHeight)
+    }
+}
+
+private struct CaptureDisplayPicker: View {
+    let displays: [CaptureDisplayOption]
+    @Binding var selection: String
+    let isUpdating: Bool
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 138, maximum: 172), spacing: 12, alignment: .top),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Display")
+                        .font(.settingsRowTitle)
+                        .foregroundStyle(SettingsPalette.label)
+                    Text("Choose which display AfterRay includes in screenshots.")
+                        .font(.settingsRowSubtitle)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                }
+                Spacer(minLength: 12)
+                if isUpdating {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                ForEach(displays) { display in
+                    displayButton(display)
+                }
+            }
+        }
+        .padding(.horizontal, SettingsMetrics.rowInset)
+        .padding(.vertical, 13)
+    }
+
+    private func displayButton(_ display: CaptureDisplayOption) -> some View {
+        let isSelected = display.uuid == selection
+        return Button {
+            selection = display.uuid
+        } label: {
+            VStack(spacing: 8) {
+                DisplayWallpaperPreview(display: display, isSelected: isSelected)
+                VStack(spacing: 2) {
+                    Text(display.name)
+                        .font(.settingsRowTitle)
+                        .foregroundStyle(SettingsPalette.label)
+                        .lineLimit(1)
+                    Text(display.isMain ? "Main Display" : (display.detail ?? "Display"))
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.tertiaryLabel)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isUpdating)
+        .accessibilityLabel(display.name)
+        .accessibilityValue(isSelected ? "Selected" : "")
+    }
+}
+
+private struct DisplayWallpaperPreview: View {
+    let display: CaptureDisplayOption
+    let isSelected: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let previewSize = captureDisplayPreviewSize(
+                aspectRatio: displayAspectRatio,
+                container: proxy.size
+            )
+            previewSurface(size: previewSize)
+                .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+        }
+        .frame(height: 82)
+    }
+
+    private func previewSurface(size: CGSize) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(SettingsPalette.controlFill)
+            if let wallpaper {
+                Image(nsImage: wallpaper)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                LinearGradient(
+                    colors: [SettingsPalette.controlFill, SettingsPalette.cardStroke.opacity(0.7)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                Image(systemName: "display")
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(previewShape)
+        .overlay {
+            previewShape.strokeBorder(
+                isSelected ? SettingsPalette.accent : SettingsPalette.cardStroke,
+                lineWidth: isSelected ? 3 : 1
+            )
+        }
+        .overlay(alignment: .topTrailing) {
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white, SettingsPalette.accent)
+                    .padding(6)
+            }
+        }
+        .shadow(color: .black.opacity(0.16), radius: 3, y: 1)
+    }
+
+    private var previewShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+    }
+
+    private var displayAspectRatio: CGFloat {
+        guard
+            let width = display.pixelWidth,
+            let height = display.pixelHeight,
+            width > 0,
+            height > 0
+        else { return 16.0 / 10.0 }
+        return CGFloat(width) / CGFloat(height)
+    }
+
+    private var wallpaper: NSImage? {
+        guard let displayID = display.displayID else {
+            return Self.fixtureWallpaper
+        }
+        guard
+            let screen = NSScreen.screens.first(where: { screen in
+                (screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber)?.uint32Value
+                    == displayID
+            }),
+            let url = NSWorkspace.shared.desktopImageURL(for: screen)
+        else { return nil }
+        return NSImage(contentsOf: url)
+    }
+
+    /// Visual Lab has no attached-screen identity. A large deterministic image
+    /// keeps its preview on the same layout path as a real desktop wallpaper.
+    private static let fixtureWallpaper = NSImage(
+        size: NSSize(width: 1920, height: 1080),
+        flipped: false
+    ) { bounds in
+        NSGradient(colors: [
+            NSColor(calibratedRed: 0.14, green: 0.18, blue: 0.26, alpha: 1),
+            NSColor(calibratedRed: 0.52, green: 0.26, blue: 0.30, alpha: 1),
+        ])?.draw(in: bounds, angle: -18)
+        return true
     }
 }
 

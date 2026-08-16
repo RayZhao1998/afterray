@@ -23,11 +23,36 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadRateBytesPerSecond: Double?
     @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
+    @Published public var isUpdatingCaptureDisplay = false
     @Published public var isUpdatingStorageLimit = false
     @Published public var isUpdatingLanguage = false
     @Published public var isUpdatingExclusions = false
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
+    @Published public var captureDisplays: [CaptureDisplayOption] = [
+        CaptureDisplayOption(
+            uuid: "",
+            name: "Built-in Display",
+            detail: "3024 × 1964",
+            isMain: true,
+            pixelWidth: 3024,
+            pixelHeight: 1964
+        ),
+        CaptureDisplayOption(
+            uuid: "DISPLAY-STUDIO",
+            name: "Studio Display",
+            detail: "5120 × 2880",
+            pixelWidth: 5120,
+            pixelHeight: 2880
+        ),
+        CaptureDisplayOption(
+            uuid: "DISPLAY-PORTRAIT",
+            name: "Portrait Display",
+            detail: "2160 × 3840",
+            pixelWidth: 2160,
+            pixelHeight: 3840
+        ),
+    ]
     @Published public var excludedBundleIds: [String] = []
     @Published public var excludedDomains: [String] = []
     @Published public var llmProbe: LlmEndpointStatus? = LlmEndpointStatus(
@@ -140,6 +165,15 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     public func setRecordAudio(_ enabled: Bool) async {
         recordAudio = enabled
         message = enabled ? "Audio recording is on." : "Audio recording is off."
+    }
+
+    public func setCaptureDisplay(uuid: String) async {
+        guard let current = settings else { return }
+        isUpdatingCaptureDisplay = true
+        settings = replacing(current, captureDisplayUUID: uuid)
+        isUpdatingCaptureDisplay = false
+        let name = captureDisplays.first { $0.uuid == uuid }?.name ?? "selected display"
+        message = uuid.isEmpty ? "Preview follows the main display." : "Preview captures \(name)."
     }
 
     public func setStorageLimitBytes(_ bytes: UInt64) async {
@@ -316,6 +350,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             modelDir: current.modelDir,
             recordAudio: current.recordAudio,
             captureIntervalSeconds: current.captureIntervalSeconds,
+            captureDisplayUUID: current.captureDisplayUUID,
             storageLimitBytes: current.storageLimitBytes,
             excludedBundleIds: current.excludedBundleIds,
             protectedBundleIds: current.protectedBundleIds,
@@ -475,6 +510,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             modelDir: current?.modelDir ?? modelDirectoryPath,
             recordAudio: recordAudio,
             captureIntervalSeconds: 10,
+            captureDisplayUUID: current?.captureDisplayUUID ?? "",
             storageLimitBytes: current?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
             excludedBundleIds: current?.excludedBundleIds ?? excludedBundleIds,
             protectedBundleIds: current?.protectedBundleIds ?? [],
@@ -491,6 +527,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     private func replacing(
         _ current: AppSettings,
+        captureDisplayUUID: String? = nil,
         storageLimitBytes: UInt64? = nil,
         uiLanguage: String? = nil,
         summaryLanguage: String? = nil
@@ -500,6 +537,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             modelDir: current.modelDir,
             recordAudio: current.recordAudio,
             captureIntervalSeconds: current.captureIntervalSeconds,
+            captureDisplayUUID: captureDisplayUUID ?? current.captureDisplayUUID,
             storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
             excludedBundleIds: current.excludedBundleIds,
             protectedBundleIds: current.protectedBundleIds,

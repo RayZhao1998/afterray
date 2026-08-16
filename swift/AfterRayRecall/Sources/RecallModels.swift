@@ -575,6 +575,42 @@ public struct LanguageOption: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct CaptureDisplayOption: Identifiable, Equatable, Sendable {
+    public static let mainDisplay = CaptureDisplayOption(
+        uuid: "",
+        name: "Main display",
+        detail: "Follows the display selected as main in macOS",
+        isMain: true
+    )
+
+    public let uuid: String
+    public let name: String
+    public let detail: String?
+    public let isMain: Bool
+    public let displayID: UInt32?
+    public let pixelWidth: Int?
+    public let pixelHeight: Int?
+    public var id: String { uuid.isEmpty ? "main" : uuid }
+
+    public init(
+        uuid: String,
+        name: String,
+        detail: String? = nil,
+        isMain: Bool = false,
+        displayID: UInt32? = nil,
+        pixelWidth: Int? = nil,
+        pixelHeight: Int? = nil
+    ) {
+        self.uuid = uuid
+        self.name = name
+        self.detail = detail
+        self.isMain = isMain
+        self.displayID = displayID
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+    }
+}
+
 public struct AppSettings: Codable, Equatable, Sendable {
     public static let defaultStorageLimitBytes: UInt64 = 100_000_000_000
     public static let defaultLanguage = LanguageOption.autoCode
@@ -583,6 +619,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
+    /// Stable ColorSync UUID. Empty follows the macOS main display.
+    public let captureDisplayUUID: String
     public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
     /// Credential-bearing and system apps the daemon never captures.
@@ -604,6 +642,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir: String,
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
+        captureDisplayUUID: String = "",
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
         protectedBundleIds: [String] = [],
@@ -621,6 +660,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.modelDir = modelDir
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
+        self.captureDisplayUUID = captureDisplayUUID
         self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
         self.protectedBundleIds = protectedBundleIds
@@ -640,6 +680,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case modelDir = "model_dir"
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
+        case captureDisplayUUID = "capture_display_uuid"
         case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
         case protectedBundleIds = "protected_bundle_ids"
@@ -660,6 +701,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir = try container.decode(String.self, forKey: .modelDir)
         recordAudio = try container.decode(Bool.self, forKey: .recordAudio)
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
+        captureDisplayUUID = try container.decodeIfPresent(String.self, forKey: .captureDisplayUUID) ?? ""
         storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
             ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []

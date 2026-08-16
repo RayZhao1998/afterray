@@ -1,5 +1,6 @@
 import AfterRayRecall
 import AppKit
+import ColorSync
 import SwiftUI
 
 extension Notification.Name {
@@ -60,6 +61,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadRateBytesPerSecond: Double?
     @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
+    @Published var isUpdatingCaptureDisplay = false
     @Published var isUpdatingStorageLimit = false
     @Published var isUpdatingLanguage = false
     @Published var isUpdatingExclusions = false
@@ -71,6 +73,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var draftLlmBaseUrl = ""
     @Published var draftLlmModel = ""
     @Published var draftLlmApiKey = ""
+    @Published var captureDisplays: [CaptureDisplayOption] = [.mainDisplay]
     @Published var isInstallingCli = false
     @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary
     @Published private(set) var cliInstalled = AfterRayCliInstall.isInstalled
@@ -127,6 +130,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             async let nextJobs = daemon.jobs()
             let loaded = try await (nextSettings, nextLibrary, nextJobs)
             settings = loaded.0
+            refreshCaptureDisplays()
             library = loaded.1
             message = nil
             applyDownloadState(loaded.1.download)
@@ -339,6 +343,66 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             AfterRayPreferences.recordAudio = !enabled
             message = error.localizedDescription
         }
+    }
+
+    func setCaptureDisplay(uuid: String) async {
+        guard uuid != settings?.captureDisplayUUID else { return }
+        let displayName = captureDisplays.first { $0.uuid == uuid }?.name ?? "selected display"
+        isUpdatingCaptureDisplay = true
+        defer { isUpdatingCaptureDisplay = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateCaptureDisplay(uuid: uuid)
+            refreshCaptureDisplays()
+            message = uuid.isEmpty
+                ? "AfterRay now follows the main display."
+                : "AfterRay now captures \(displayName)."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func refreshCaptureDisplays() {
+        let selectedUUID = settings?.captureDisplayUUID ?? ""
+        var displays = NSScreen.screens.compactMap { screen -> CaptureDisplayOption? in
+            guard
+                let number = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber,
+                let unmanaged = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)
+            else { return nil }
+            let displayID = number.uint32Value
+            let isMain = displayID == CGMainDisplayID()
+            let uuid = unmanaged.takeRetainedValue()
+            let uuidString = (CFUUIDCreateString(nil, uuid) as String).uppercased()
+            let mode = CGDisplayCopyDisplayMode(displayID)
+            let detail = mode.map {
+                "\($0.pixelWidth) × \($0.pixelHeight)"
+            }
+            return CaptureDisplayOption(
+                uuid: isMain && selectedUUID != uuidString ? "" : uuidString,
+                name: screen.localizedName,
+                detail: detail,
+                isMain: isMain,
+                displayID: displayID,
+                pixelWidth: mode?.pixelWidth,
+                pixelHeight: mode?.pixelHeight
+            )
+        }
+        displays.sort { lhs, rhs in
+            if lhs.isMain != rhs.isMain { return lhs.isMain }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+        if let selected = settings?.captureDisplayUUID,
+           !selected.isEmpty,
+           !displays.contains(where: { $0.uuid == selected })
+        {
+            displays.append(CaptureDisplayOption(
+                uuid: selected,
+                name: "Unavailable display",
+                detail: selected
+            ))
+        }
+        captureDisplays = displays
     }
 
     func setUiLanguage(_ code: String) async {

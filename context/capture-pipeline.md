@@ -9,6 +9,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Screen capture is **not** in Rust. `apps/AfterRayCaptureShim` is a standalone SwiftPM package (macOS 15, not a target of the root `Package.swift`) using ScreenCaptureKit; the whole shim is one file, `Sources/AfterRayCaptureShim/main.swift`.
 - Pull-based: Rust decides timing. stdin commands `capture_screen` (requires `request_id`) and `stop` (main.swift:962-990); stdout carries JSON-line `Event`s only (`ready`/`artifact`/`warning`/`failed`/`stopped`); logs go to stderr.
 - Output dir is `0700`, artifact files `0600`; the shim excludes AfterRay's own windows from capture.
+- Display selection is persisted as a stable ColorSync UUID. Empty follows the macOS main display; a concrete UUID selects that display. The shim resolves the UUID against `SCShareableContent`, falls back to the main display when it is unavailable, and uses the same display filter for its audio stream and pull-based screenshots. This remains single-display capture.
 - The shim exists because the Rust workspace denies `unsafe_code` and ScreenCaptureKit delegates need unsafe FFI. Build it with `make capture-shim`.
 
 ## 2. Shim process ownership — afterray-platform-macos
@@ -63,3 +64,12 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - `afterray-core` is only two trait definitions — the real store is `afterray-store::Vault`, the real capture is `MacOsCaptureBackend`.
 - Background LLM submitters (T2, backfills, agent loops) must use `JobPriority::Background` and multi-round loops must hold `ModelQueue::hold_llm_lease()` (queue.rs:351), or rounds starve behind rivals.
 - Timestamps are epoch-ms `i64` everywhere; "day" is local-calendar; slot alignment is wall-clock 30-minute boundaries.
+
+## Multi-display extension
+
+- Keep one scheduler tick and one audio stream. Never duplicate system/microphone audio per display.
+- Replace the singular screen artifact with one atomic capture-batch event: one `request_id`, one timestamp, and one child image per display carrying stable UUID, pixel size, and desktop frame. Import the batch transactionally; timestamp-nearest pairing is ambiguous once several images share a tick.
+- Store images separately and compose a desktop mosaic only in Recall. Different scale factors and display arrangements make a single stitched source image a poor storage and OCR format.
+- Apply privacy before committing the batch. App exclusions should enter every `SCContentFilter`; browser/private-window policy must either classify each visible browser window or conservatively drop the whole batch when it cannot.
+- Persist selection as `main | selected(UUID set) | all`. Keep unavailable selected UUIDs so reconnecting a display restores intent; `all` resolves against the topology observed for each batch.
+- Legacy moments have no display metadata and should decode as a one-image legacy batch rather than requiring a destructive migration.

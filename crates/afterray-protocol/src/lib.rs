@@ -14,8 +14,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
 /// `usage`, `progress` and `compaction` stream events. 9 adds
 /// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
-/// the download queue instead of tearing the whole queue down.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// the download queue instead of tearing the whole queue down. 11 adds the
+/// persisted capture-display UUID.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -199,6 +200,10 @@ pub enum Request {
     UpdateSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         record_audio: Option<bool>,
+        /// Stable `ColorSync` UUID of one display, or an empty string to follow
+        /// the macOS main display. `None` leaves the preference unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_display_uuid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ui_language: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,6 +440,10 @@ pub struct AppSettings {
     pub model_dir: String,
     pub record_audio: bool,
     pub capture_interval_seconds: u64,
+    /// Stable `ColorSync` UUID of the selected display. Empty follows the macOS
+    /// main display whenever a capture helper starts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub capture_display_uuid: String,
     #[serde(default = "default_storage_limit_bytes")]
     pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1114,6 +1123,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: Some(false),
+                capture_display_uuid: None,
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
@@ -1131,6 +1141,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::UpdateSettings {
                 record_audio: None,
+                capture_display_uuid: None,
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
@@ -1153,6 +1164,24 @@ mod tests {
             .unwrap(),
             r#"{"type":"llm_probe","provider":"ollama"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&Request::UpdateSettings {
+                record_audio: None,
+                capture_display_uuid: Some("2B3C-display".into()),
+                ui_language: None,
+                summary_language: None,
+                storage_limit_bytes: None,
+                excluded_bundle_ids: None,
+                excluded_domains: None,
+                llm_provider: None,
+                llm_base_url: None,
+                llm_model: None,
+                llm_api_key: None,
+                model_download_endpoint: None,
+            })
+            .unwrap(),
+            r#"{"type":"update_settings","capture_display_uuid":"2B3C-display"}"#
+        );
     }
 
     #[test]
@@ -1165,6 +1194,7 @@ mod tests {
         assert!(settings.llm_base_url.is_empty());
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
+        assert!(settings.capture_display_uuid.is_empty());
         assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
         assert!(
             settings.model_download_endpoint.is_empty(),
@@ -1188,6 +1218,7 @@ mod tests {
     fn storage_limit_update_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::UpdateSettings {
             record_audio: None,
+            capture_display_uuid: None,
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
