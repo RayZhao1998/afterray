@@ -218,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         download_cancel_requested: AtomicBool::new(false),
         download_drop_pack: std::sync::Mutex::new(None),
         download_changed: tokio::sync::Notify::new(),
+        asr_changed: tokio::sync::Notify::new(),
         capture_interval: Duration::from_secs(
             std::env::var("AFTERRAY_CAPTURE_INTERVAL_SECONDS")
                 .ok()
@@ -255,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_gop_packer(Arc::clone(&state));
     spawn_slot_summarizer(Arc::clone(&state));
     spawn_text_df_maintainer(Arc::clone(&state));
+    spawn_asr_sweeper(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -433,6 +435,7 @@ struct AppState {
     /// carry on with the rest.
     download_drop_pack: std::sync::Mutex<Option<String>>,
     download_changed: tokio::sync::Notify,
+    asr_changed: tokio::sync::Notify,
     capture_interval: Duration,
     data_dir: PathBuf,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -1968,7 +1971,7 @@ async fn import_artifact(
                     afterray_protocol::AudioTrack::System
                 }
             };
-            let segment = state.store.insert_audio_segment(
+            state.store.insert_audio_segment(
                 session_id,
                 track,
                 started_at_ms,
@@ -1976,57 +1979,15 @@ async fn import_artifact(
                 content_type,
                 &bytes,
             )?;
-            let job = state
-                .models
-                .submit(ModelInput::Asr {
-                    audio_path: path.to_path_buf(),
-                    language: None,
-                })
-                .await?;
-            let model_state = Arc::clone(state);
-            let path = path.to_path_buf();
-            tokio::spawn(async move {
-                match model_state.models.wait(&job).await {
-                    Ok(snapshot) => match snapshot.output {
-                        Some(ModelOutput::Asr { text, language }) => {
-                            if text.trim().is_empty() {
-                                eprintln!(
-                                    "asr produced no visible text for {} ({})",
-                                    segment.id,
-                                    language.as_deref().unwrap_or("auto")
-                                );
-                            } else if let Ok(evidence_id) = model_state.store.insert_text_evidence(
-                                &segment.session_id,
-                                None,
-                                Some(&segment.id),
-                                "transcript",
-                                &text,
-                                segment.started_at_ms,
-                                Some(segment.ended_at_ms),
-                                &snapshot.adapter,
-                                None,
-                            ) {
-                                submit_embedding(&model_state, evidence_id, text).await;
-                            }
-                        }
-                        None => eprintln!(
-                            "asr job {} ended {:?}{}",
-                            snapshot.id,
-                            snapshot.state,
-                            snapshot
-                                .last_error
-                                .as_deref()
-                                .map(|error| format!(": {error}"))
-                                .unwrap_or_default()
-                        ),
-                        Some(_) => {
-                            eprintln!("asr job {} returned a non-transcript output", snapshot.id)
-                        }
-                    },
-                    Err(error) => eprintln!("asr job {job} did not finish: {error}"),
-                }
-                let _ = tokio::fs::remove_file(path).await;
-            });
+            // The encrypted segment is the durable queue. Plaintext exists
+            // again only while the sweeper owns a claimed ASR item.
+            if let Err(error) = tokio::fs::remove_file(path).await {
+                eprintln!(
+                    "could not remove imported audio staging file {}: {error}",
+                    path.display()
+                );
+            }
+            state.asr_changed.notify_one();
         }
         ArtifactKind::Accessibility => {
             // A snapshot that will not parse names no app, and an unnamed app
@@ -2582,6 +2543,140 @@ fn spawn_text_df_maintainer(state: Arc<AppState>) {
             }
         }
     });
+}
+
+fn spawn_asr_sweeper(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    state.asr_changed.notify_one();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                () = state.asr_changed.notified() => {}
+                () = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
+            match run_one_audio_transcription(&state).await {
+                Ok(true) => state.asr_changed.notify_one(),
+                Ok(false) => {}
+                Err(error) => eprintln!("asr backlog: {error}"),
+            }
+        }
+        eprintln!("asr backlog: stopped");
+    });
+}
+
+async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, String> {
+    let claimed = run_store(state, |state| {
+        state.store.claim_audio_transcription(now_ms())
+    }).await.map_err(|error| error.to_string())?;
+    let Some(claimed) = claimed else {
+        return Ok(false);
+    };
+    let segment = claimed.segment;
+    let path = match materialize_audio_for_asr(state, &segment).await {
+        Ok(path) => path,
+        Err(error) => {
+            fail_claimed_audio(state, &segment.id, claimed.attempts, &error).await;
+            return Err(error);
+        }
+    };
+    let outcome = async {
+        let job = state.models.submit(ModelInput::Asr {
+            audio_path: path.clone(),
+            language: None,
+        }).await.map_err(|error| error.to_string())?;
+        let snapshot = state.models.wait(&job).await.map_err(|error| error.to_string())?;
+        match snapshot.output {
+            Some(ModelOutput::Asr { text, language }) => {
+                if text.trim().is_empty() {
+                    eprintln!(
+                        "asr produced no visible text for {} ({})",
+                        segment.id,
+                        language.as_deref().unwrap_or("auto")
+                    );
+                }
+                let stored_segment = segment.clone();
+                let stored_text = text.clone();
+                let adapter = snapshot.adapter.clone();
+                let evidence_id = run_store(state, move |state| {
+                    state.store.complete_audio_transcription(
+                        &stored_segment, &stored_text, &adapter, now_ms(),
+                    )
+                }).await.map_err(|error| error.to_string())?;
+                if let Some(evidence_id) = evidence_id {
+                    submit_embedding(state, evidence_id, text).await;
+                }
+                Ok(())
+            }
+            Some(_) => Err(format!(
+                "ASR job {} returned a non-transcript output", snapshot.id
+            )),
+            None => Err(snapshot.last_error.unwrap_or_else(|| {
+                format!("ASR job {} ended {:?}", snapshot.id, snapshot.state)
+            })),
+        }
+    }.await;
+    let _ = tokio::fs::remove_file(&path).await;
+    if let Err(error) = outcome {
+        fail_claimed_audio(state, &segment.id, claimed.attempts, &error).await;
+        return Err(format!("{} failed: {error}", segment.id));
+    }
+    Ok(true)
+}
+
+async fn materialize_audio_for_asr(
+    state: &Arc<AppState>,
+    segment: &afterray_protocol::AudioSegment,
+) -> Result<PathBuf, String> {
+    let artifact_id = segment.audio_artifact_id.clone();
+    let segment_id = segment.id.clone();
+    run_store(state, move |state| {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let payload = state.store.read_artifact(&artifact_id)
+            .map_err(|error| error.to_string())?;
+        let directory = state.data_dir.join("capture-staging");
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = directory.join(format!(
+            "asr-retry-{segment_id}-{}.m4a",
+            uuid::Uuid::now_v7()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("could not materialize encrypted audio: {error}"))?;
+        if let Err(error) = file.write_all(&payload.bytes).and_then(|()| file.sync_all()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("could not materialize encrypted audio: {error}"));
+        }
+        Ok(path)
+    }).await
+}
+
+async fn fail_claimed_audio(
+    state: &Arc<AppState>,
+    segment_id: &str,
+    attempts: u32,
+    error: &str,
+) {
+    let delay_minutes = 1_i64 << attempts.min(6);
+    let now = now_ms();
+    let next = now.saturating_add(delay_minutes * 60 * 1_000);
+    let segment_id = segment_id.to_owned();
+    let error = error.to_owned();
+    if let Err(store_error) = run_store(state, move |state| {
+        state.store.fail_audio_transcription(&segment_id, &error, next, now)
+    }).await {
+        eprintln!("asr backlog: could not persist failure: {store_error}");
+    }
 }
 
 fn spawn_slot_summarizer(state: Arc<AppState>) {
@@ -3558,6 +3653,20 @@ async fn run_model_downloads(state: Arc<AppState>) {
             state.download_active.store(false, Ordering::Release);
             state.download_changed.notify_waiters();
             return;
+        }
+        if pack.id == "asr" {
+            let requeued = run_store(&state, |state| {
+                state.store.retry_failed_audio_transcriptions(now_ms())
+            })
+            .await;
+            match requeued {
+                Ok(count) if count > 0 => {
+                    eprintln!("asr backlog: requeued {count} segment(s) after model repair");
+                    state.asr_changed.notify_one();
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("asr backlog: could not requeue after repair: {error}"),
+            }
         }
     }
 }

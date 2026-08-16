@@ -86,7 +86,13 @@ pub use slot::{
 mod readonly;
 pub use readonly::ReadOnlyVault;
 
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
+
+#[derive(Debug, Clone)]
+pub struct ClaimedAudioTranscription {
+    pub segment: AudioSegment,
+    pub attempts: u32,
+}
 
 /// What conversations may occupy, separate from the capture budget.
 ///
@@ -2377,6 +2383,160 @@ impl Vault {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Claims one durable ASR item. Work left `running` by a daemon crash is
+    /// eligible again after five minutes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue transaction cannot be read or committed.
+    pub fn claim_audio_transcription(
+        &self,
+        now_ms: i64,
+    ) -> Result<Option<ClaimedAudioTranscription>, StoreError> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE audio_segments SET transcription_state = 'pending'
+              WHERE transcription_state = 'running'
+                AND transcription_updated_at_ms <= ?1",
+            [now_ms.saturating_sub(5 * 60 * 1_000)],
+        )?;
+        let candidate = transaction
+            .query_row(
+                "SELECT a.id, a.session_id, a.track, a.started_at_ms, a.ended_at_ms,
+                        a.audio_artifact_id, a.transcription_attempts
+                   FROM audio_segments a
+                  WHERE a.transcription_state IN ('pending', 'failed')
+                    AND a.transcription_next_attempt_ms <= ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM text_evidence te
+                         WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
+                    )
+                  ORDER BY a.started_at_ms, a.id LIMIT 1",
+                [now_ms],
+                |row| {
+                    let track: String = row.get(2)?;
+                    Ok(ClaimedAudioTranscription {
+                        segment: AudioSegment {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            track: if track == "microphone" {
+                                AudioTrack::Microphone
+                            } else {
+                                AudioTrack::System
+                            },
+                            started_at_ms: row.get(3)?,
+                            ended_at_ms: row.get(4)?,
+                            audio_artifact_id: row.get(5)?,
+                        },
+                        attempts: row.get::<_, u32>(6)?.saturating_add(1),
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(claimed) = &candidate {
+            transaction.execute(
+                "UPDATE audio_segments
+                    SET transcription_state = 'running',
+                        transcription_attempts = transcription_attempts + 1,
+                        transcription_updated_at_ms = ?2,
+                        transcription_error = NULL
+                  WHERE id = ?1",
+                params![claimed.segment.id, now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(candidate)
+    }
+
+    /// Persists an ASR failure and its next eligible retry time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue row cannot be updated.
+    pub fn fail_audio_transcription(
+        &self,
+        segment_id: &str,
+        error: &str,
+        next_attempt_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE audio_segments
+                SET transcription_state = 'failed', transcription_error = ?2,
+                    transcription_next_attempt_ms = ?3, transcription_updated_at_ms = ?4
+              WHERE id = ?1",
+            params![segment_id, error, next_attempt_ms, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Makes every failed ASR item immediately eligible after a model repair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue rows cannot be updated.
+    pub fn retry_failed_audio_transcriptions(&self, now_ms: i64) -> Result<usize, StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE audio_segments
+                SET transcription_state = 'pending', transcription_next_attempt_ms = ?1
+              WHERE transcription_state = 'failed'",
+            [now_ms],
+        ).map_err(Into::into)
+    }
+
+    /// Commits transcript evidence and marks the audio item done atomically.
+    /// Replaying a recovered claim is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transcript evidence or queue state cannot be
+    /// committed.
+    pub fn complete_audio_transcription(
+        &self,
+        segment: &AudioSegment,
+        text: &str,
+        model_version: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let existing: Option<String> = transaction.query_row(
+            "SELECT id FROM text_evidence
+              WHERE audio_segment_id = ?1 AND source = 'transcript'
+              ORDER BY id LIMIT 1",
+            [&segment.id],
+            |row| row.get(0),
+        ).optional()?;
+        let evidence_id = if text.trim().is_empty() || existing.is_some() {
+            None
+        } else {
+            let id = Uuid::now_v7().to_string();
+            transaction.execute(
+                "INSERT INTO text_evidence
+                 (id, session_id, moment_id, audio_segment_id, source, text, started_at_ms,
+                  ended_at_ms, model_version, layout_json)
+                 VALUES (?1, ?2, NULL, ?3, 'transcript', ?4, ?5, ?6, ?7, NULL)",
+                params![id, segment.session_id, segment.id, text, segment.started_at_ms,
+                    segment.ended_at_ms, model_version],
+            )?;
+            transaction.execute(
+                "INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)",
+                params![id, index_text(text)],
+            )?;
+            Some(id)
+        };
+        transaction.execute(
+            "UPDATE audio_segments
+                SET transcription_state = 'done', transcription_error = NULL,
+                    transcription_next_attempt_ms = 0, transcription_updated_at_ms = ?2
+              WHERE id = ?1",
+            params![segment.id, now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(evidence_id)
+    }
+
     pub fn set_favorite(&self, moment_id: &str, favorite: bool) -> Result<(), StoreError> {
         self.connection.lock().unwrap().execute(
             "UPDATE moments SET is_favorite = ?2 WHERE id = ?1",
@@ -3454,6 +3614,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_18(connection, from_version)?;
     migrate_schema_19(connection)?;
     migrate_schema_20(connection, from_version)?;
+    migrate_schema_21(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3967,6 +4128,39 @@ fn migrate_schema_20(connection: &Connection, from_version: u32) -> Result<(), S
             ],
         )?;
     }
+    Ok(())
+}
+
+fn migrate_schema_21(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(audio_segments)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in [
+        "transcription_state TEXT NOT NULL DEFAULT 'pending'",
+        "transcription_attempts INTEGER NOT NULL DEFAULT 0",
+        "transcription_error TEXT",
+        "transcription_next_attempt_ms INTEGER NOT NULL DEFAULT 0",
+        "transcription_updated_at_ms INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE audio_segments ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    connection.execute_batch(
+        "UPDATE audio_segments SET transcription_state = 'done'
+          WHERE EXISTS (
+              SELECT 1 FROM text_evidence te
+               WHERE te.audio_segment_id = audio_segments.id AND te.source = 'transcript'
+          );
+         CREATE INDEX IF NOT EXISTS audio_segments_transcription_queue
+           ON audio_segments(transcription_state, transcription_next_attempt_ms, started_at_ms);",
+    )?;
     Ok(())
 }
 
@@ -5020,6 +5214,120 @@ mod tests {
         assert_eq!(first.ended_at_ms, Some(200));
         assert_eq!(second.ended_at_ms, Some(250));
         assert_eq!(vault.close_orphaned_sessions_sync(400).unwrap(), 0);
+    }
+
+    #[test]
+    fn audio_transcription_claims_survive_failure_restart_and_replay() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let segment = vault.insert_audio_segment(
+            &session.id, AudioTrack::Microphone, 200, 300, "audio/mp4", b"audio",
+        ).unwrap();
+
+        let first = vault.claim_audio_transcription(1_000).unwrap().unwrap();
+        assert_eq!(first.segment.id, segment.id);
+        assert_eq!(first.attempts, 1);
+        vault.fail_audio_transcription(
+            &segment.id, "model unavailable", 2_000, 1_000,
+        ).unwrap();
+        assert!(vault.claim_audio_transcription(1_999).unwrap().is_none());
+        assert_eq!(vault.retry_failed_audio_transcriptions(1_500).unwrap(), 1);
+
+        let second = vault.claim_audio_transcription(1_500).unwrap().unwrap();
+        assert_eq!(second.attempts, 2);
+        let recovered = vault
+            .claim_audio_transcription(1_500 + 5 * 60 * 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.segment.id, segment.id);
+        assert_eq!(recovered.attempts, 3);
+
+        assert!(vault.complete_audio_transcription(
+            &segment, "hello world", "test-asr", 400_000,
+        ).unwrap().is_some());
+        assert!(vault.claim_audio_transcription(500_000).unwrap().is_none());
+        assert!(vault.complete_audio_transcription(
+            &segment, "duplicate", "test-asr", 500_000,
+        ).unwrap().is_none());
+        let transcripts = vault.transcripts_in_range(0, 1_000, 10).unwrap();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].2, "hello world");
+    }
+
+    #[test]
+    fn schema_21_migration_recovers_only_audio_without_a_transcript() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [21_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let vault = Vault::open_with_key(config.clone(), key).unwrap();
+        let session = vault.create_session_sync(100).unwrap();
+        let completed = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                200,
+                300,
+                "audio/mp4",
+                b"completed",
+            )
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                Some(&completed.id),
+                "transcript",
+                "already transcribed",
+                200,
+                Some(300),
+                "legacy-asr",
+                None,
+            )
+            .unwrap();
+        let pending = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                400,
+                500,
+                "audio/mp4",
+                b"pending",
+            )
+            .unwrap();
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX audio_segments_transcription_queue;
+                 ALTER TABLE audio_segments DROP COLUMN transcription_state;
+                 ALTER TABLE audio_segments DROP COLUMN transcription_attempts;
+                 ALTER TABLE audio_segments DROP COLUMN transcription_error;
+                 ALTER TABLE audio_segments DROP COLUMN transcription_next_attempt_ms;
+                 ALTER TABLE audio_segments DROP COLUMN transcription_updated_at_ms;
+                 UPDATE schema_meta SET version = 20;",
+            )
+            .unwrap();
+        drop(vault);
+
+        let migrated = Vault::open_with_key(config, key).unwrap();
+        let claimed = migrated.claim_audio_transcription(1_000).unwrap().unwrap();
+        assert_eq!(claimed.segment.id, pending.id);
+        assert!(migrated.claim_audio_transcription(1_000).unwrap().is_none());
+        let state: String = migrated
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT transcription_state FROM audio_segments WHERE id = ?1",
+                [&completed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "done");
     }
 
     #[test]
