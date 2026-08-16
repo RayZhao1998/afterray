@@ -6,7 +6,7 @@ In-process ASR (Qwen3-ASR via Candle/Metal) and embedding (nomic GGUF via llama-
 
 - `src/lib.rs:43 execute` — dispatches `ModelInput`; errors on `Ocr` and `Llm`. `sanitize_asr_text` (`:74`) drops hallucinated "thank you" ASR loops. `InferConfig::from_env` (`:28`) pulls model paths from the `afterray-models` catalog.
 - `src/bin/afterray-model-worker.rs` — the shipped worker binary (`[[bin]]` in `Cargo.toml`); speaks the v1 one-shot protocol from `afterray-models`: one JSON request on stdin, one JSON response on stdout, logs/timing on stderr only.
-- `src/asr.rs:19 transcribe` — Qwen3-ASR via `qwen3-asr`/Candle Metal.
+- `src/asr.rs:19 transcribe` — Qwen3-ASR via `qwen3-asr`/Candle Metal; prepares the generated tokenizer through `afterray-models` before decoding audio, and reports preparation/load failures as non-retryable missing-model errors.
 - `src/embed.rs:19 embed_text` — nomic GGUF via llama-cpp-2, 2048-token batch, L2-normalized output.
 - `src/audio.rs:15 load_mono_16k` — Symphonia decode + rubato resample to mono 16 kHz f32 before ASR.
 

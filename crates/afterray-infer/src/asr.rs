@@ -27,6 +27,9 @@ pub fn transcribe(
             "set AFTERRAY_ASR_MODEL or download the Qwen3 ASR pack",
         ));
     }
+    afterray_models::prepare_configured_qwen3_asr(model_dir).map_err(|error| {
+        AdapterError::MissingModel(format!("Qwen3-ASR is not prepared: {error}"))
+    })?;
     let samples = crate::audio::load_mono_16k(audio_path)?;
     if samples.is_empty() {
         return Ok((String::new(), language.map(ToOwned::to_owned)));
@@ -61,8 +64,11 @@ fn run_qwen3(
     samples: &[f32],
     language: Option<&str>,
 ) -> Result<qwen3_asr::TranscribeResult, AdapterError> {
-    let engine = qwen3_asr::AsrInference::load(model_dir, qwen3_asr::best_device())
-        .map_err(|error| AdapterError::Process(format!("could not load Qwen3-ASR: {error}")))?;
+    let engine =
+        qwen3_asr::AsrInference::load(model_dir, qwen3_asr::best_device()).map_err(|error| {
+            afterray_models::invalidate_qwen3_asr_ready(model_dir);
+            AdapterError::MissingModel(format!("could not load Qwen3-ASR: {error}"))
+        })?;
     let mut options = qwen3_asr::TranscribeOptions::default();
     if let Some(language) = language {
         options.language = Some(language.to_owned());

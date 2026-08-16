@@ -4,6 +4,7 @@
 //! isolated behind [`ModelAdapter`]. The shipped worker is the Rust
 //! `afterray-model-worker` binary; OCR stays on the native Swift helper.
 
+mod asr_pack;
 mod catalog;
 mod context;
 mod delta;
@@ -21,6 +22,10 @@ pub use catalog::{
     mlx_pack_context_tokens, model_directory,
     qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
     specs_for_download, specs_for_download_in,
+};
+pub use asr_pack::{
+    QWEN3_ASR_RECIPE_VERSION, invalidate_qwen3_asr_ready, prepare_configured_qwen3_asr,
+    prepare_qwen3_asr, verify_qwen3_asr_prepared,
 };
 pub use context::{
     CONTEXT_ENV_VARS, ContextProbe, MINIMUM_CONTEXT_TOKENS, REMOTE_DEFAULT_CONTEXT_TOKENS,

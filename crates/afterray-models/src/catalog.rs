@@ -96,6 +96,15 @@ impl PackSpec {
     #[must_use]
     pub fn inspect(&self) -> ModelPack {
         let (present, bytes, state, error) = match &self.source {
+            PackSource::HuggingFaceSnapshot { pin, .. } if self.id == "asr" => {
+                let bytes = directory_size(&self.path);
+                let revision = pin.as_ref().map_or("custom", |pin| pin.revision.as_str());
+                let files = pin.as_ref().map_or(&[][..], |pin| pin.files.as_slice());
+                match crate::asr_pack::verify_qwen3_asr_prepared(&self.path, revision, files) {
+                    Ok(()) => (true, bytes, ModelPackState::Ready, None),
+                    Err(error) => (false, bytes, ModelPackState::Failed, Some(error)),
+                }
+            }
             PackSource::HuggingFacePinnedSnapshot {
                 revision, files, ..
             } => inspect_pinned_snapshot(&self.path, revision, files),
@@ -817,6 +826,43 @@ mod tests {
         assert!(!inspect_model_path(&root.join("incomplete")).0);
         assert_eq!(inspect_model_path(&root.join("missing")), (false, 0));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asr_catalog_state_uses_the_worker_readiness_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "afterray-asr-catalog-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("vocab.json"), r#"{"a":0,"b":1,"ab":2}"#).unwrap();
+        fs::write(root.join("merges.txt"), "#version: 0.2\na b\n").unwrap();
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"3":{"content":"<eos>","special":true}}}"#,
+        )
+        .unwrap();
+        let pack = PackSpec {
+            id: "asr".into(),
+            name: "ASR fixture".into(),
+            capability: "asr".into(),
+            path: root.clone(),
+            required: true,
+            note: "fixture".into(),
+            expected_bytes: 0,
+            source: PackSource::HuggingFaceSnapshot {
+                repository: "fixture/asr".into(),
+                pin: None,
+            },
+        };
+
+        assert_eq!(pack.inspect().state, ModelPackState::Failed);
+        crate::asr_pack::prepare_qwen3_asr(&root, "custom", &[]).unwrap();
+        assert_eq!(pack.inspect().state, ModelPackState::Ready);
+        fs::write(root.join("tokenizer.json"), "{}").unwrap();
+        assert_eq!(pack.inspect().state, ModelPackState::Failed);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

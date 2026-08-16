@@ -222,6 +222,10 @@ pub async fn download_pack_with_cancellation(
                     expected_bytes: expected,
                 });
             }
+            if pack.id == "asr" {
+                crate::asr_pack::prepare_qwen3_asr(&pack.path, "custom", &[])
+                    .map_err(DownloadError::message)?;
+            }
         }
         PackSource::HuggingFacePinnedSnapshot {
             repository,
@@ -350,6 +354,10 @@ async fn download_snapshot_with_pin(
     })
     .await
     .map_err(|error| DownloadError::message(format!("verification task failed: {error}")))??;
+    if pack.id == "asr" {
+        crate::asr_pack::prepare_qwen3_asr(&pack.path, &pin.revision, &pin.files)
+            .map_err(DownloadError::message)?;
+    }
     on_progress(DownloadProgress {
         state: ModelPackState::Ready,
         completed_files: total_files,
