@@ -177,7 +177,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .foregroundStyle(ChatPalette.secondary)
             }
             Spacer(minLength: 12)
-            HStack(spacing: 6) {
+            HStack(spacing: 10) {
+                if let usage = model.contextUsage {
+                    ChatContextMeter(usage: usage)
+                }
                 if model.isLoadingHistory {
                     ProgressView().controlSize(.small).tint(ChatPalette.accent)
                 }
@@ -198,8 +201,13 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                             .padding(.top, 48)
                     }
                     ForEach(model.bubbles) { bubble in
-                        ChatBubbleView(bubble: bubble)
-                            .id(bubble.id)
+                        if bubble.role == .compaction {
+                            ChatCompactionRule(text: bubble.text)
+                                .id(bubble.id)
+                        } else {
+                            ChatBubbleView(bubble: bubble)
+                                .id(bubble.id)
+                        }
                     }
                 }
                 .padding(.horizontal, ChatMetrics.gutter)
@@ -298,6 +306,76 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 }
 
+/// How full the model's context window is.
+///
+/// A bar rather than a number alone: the useful question is "how much room is
+/// left", which a proportion answers at a glance and a token count does not.
+/// It only appears once the daemon has reported a round — an app that guessed
+/// would be inventing the one number the user has no way to check.
+private struct ChatContextMeter: View {
+    let usage: ChatContextUsage
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.10))
+                Capsule()
+                    .fill(tint)
+                    .frame(width: max(2, 44 * usage.fraction))
+            }
+            .frame(width: 44, height: 4)
+            Text(usage.shortLabel)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(usage.isTight ? ChatPalette.coral : ChatPalette.tertiary)
+                .monospacedDigit()
+        }
+        .help("Context used this turn: \(usage.promptTokens) of \(usage.windowTokens) tokens")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Context window")
+        .accessibilityValue("\(Int(usage.fraction * 100)) percent used")
+    }
+
+    private var tint: Color {
+        usage.isTight ? ChatPalette.coral : ChatPalette.accent.opacity(0.75)
+    }
+}
+
+/// Where the agent stopped being able to see.
+///
+/// Drawn as a rule across the thread rather than a bubble: it is not something
+/// anyone said, and a shorter answer below it needs the explanation to not
+/// simply read as the assistant getting worse.
+private struct ChatCompactionRule: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            line
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(text)
+                    .font(.system(size: 10.5))
+                    // One line, always. A wrapped divider reads as a message.
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .foregroundStyle(ChatPalette.tertiary)
+            .layoutPriority(1)
+            line
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var line: some View {
+        Rectangle()
+            .fill(ChatPalette.separator)
+            .frame(height: 1)
+    }
+}
+
 private struct ChatConversationRow: View {
     let conversation: ChatConversation
     let isSelected: Bool
@@ -350,11 +428,15 @@ private struct ChatConversationRow: View {
 private struct ChatBubbleView: View {
     let bubble: ChatBubble
     @State private var toolsExpanded = false
+    @State private var reasoningExpanded = false
 
     var body: some View {
         HStack {
             if bubble.role == .user { Spacer(minLength: 48) }
             VStack(alignment: bubble.role == .user ? .trailing : .leading, spacing: 6) {
+                if !bubble.reasoning.isEmpty {
+                    reasoningChip
+                }
                 if !bubble.tools.isEmpty {
                     toolChip
                 }
@@ -365,6 +447,56 @@ private struct ChatBubbleView: View {
             .frame(maxWidth: 560, alignment: bubble.role == .user ? .trailing : .leading)
             if bubble.role == .assistant { Spacer(minLength: 48) }
         }
+    }
+
+    /// Says when an answer stands on a shortened lookup. Without it, a reply
+    /// that missed something the tool did return looks like the model failing
+    /// rather than the budget biting.
+    private func resultNote(chars: Int, tool: ChatToolCall) -> String {
+        guard tool.truncated else { return "\(chars) characters back" }
+        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+    }
+
+    /// The model's reasoning, folded away.
+    ///
+    /// Collapsed by default and never streamed: it is long, unedited, and for
+    /// "what did I do today" the user wants the answer, not the deliberation.
+    /// Kept reachable because when an answer looks wrong, the reasoning is
+    /// usually where the wrongness is visible.
+    private var reasoningChip: some View {
+        DisclosureGroup(isExpanded: $reasoningExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(bubble.reasoning) { round in
+                    VStack(alignment: .leading, spacing: 3) {
+                        if bubble.reasoning.count > 1 {
+                            Text("Round \(round.round)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(ChatPalette.tertiary)
+                        }
+                        Text(round.text)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(ChatPalette.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            Text(reasoningLabel)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ChatPalette.tertiary)
+        }
+        .tint(ChatPalette.tertiary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var reasoningLabel: String {
+        bubble.reasoning.count > 1
+            ? "Thought it through in \(bubble.reasoning.count) rounds"
+            : "Thought it through"
     }
 
     private var toolChip: some View {
@@ -380,18 +512,31 @@ private struct ChatBubbleView: View {
                             .foregroundStyle(ChatPalette.secondary)
                             .textSelection(.enabled)
                         if let chars = tool.resultChars {
-                            Text("\(chars) characters back")
+                            Text(resultNote(chars: chars, tool: tool))
                                 .font(.system(size: 10.5))
-                                .foregroundStyle(ChatPalette.tertiary)
+                                .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)
                         }
                     }
                 }
             }
             .padding(.top, 6)
         } label: {
-            Text(ChatToolSummary.collapsed(bubble.tools))
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(ChatPalette.tertiary)
+            HStack(spacing: 5) {
+                Text(ChatToolSummary.collapsed(bubble.tools))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(ChatPalette.tertiary)
+                if bubble.hasTruncatedEvidence {
+                    Text("shortened")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(ChatPalette.coral.opacity(0.9))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(
+                            ChatPalette.coral.opacity(0.12),
+                            in: Capsule()
+                        )
+                }
+            }
         }
         .tint(ChatPalette.tertiary)
         .padding(.horizontal, 10)
@@ -409,9 +554,24 @@ private struct ChatBubbleView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                ChatMarkdownView(blocks: bubble.markdownBlocks)
-                if bubble.isStreaming {
-                    ChatStreamCaret()
+                // The indicator replaces the caret rather than joining it. A
+                // blinking caret in front of no text reads as "waiting for you";
+                // this reads as "waiting for me".
+                if let progress = bubble.progress, bubble.text.isEmpty {
+                    ChatWorkingIndicator(progress: progress)
+                } else {
+                    ChatMarkdownView(blocks: bubble.markdownBlocks)
+                    if bubble.isStreaming {
+                        ChatStreamCaret()
+                    }
+                    if bubble.wasAborted {
+                        // What is above is real, just not all of what was
+                        // coming. Saying so stops a half answer reading as a
+                        // confident short one.
+                        Text("Stopped — this is as far as it got.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ChatPalette.tertiary)
+                    }
                 }
             }
         }
@@ -547,6 +707,50 @@ private struct ChatCodeBlock: View {
                 .frame(width: 2)
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Shown while a turn is alive with nothing to show yet.
+///
+/// Two signals, deliberately. The dots carry motion, which is what makes a live
+/// window feel live. The readout carries proof: a spinner spins just as happily
+/// over a dead socket, so the number beside it is the part that actually
+/// answers "is it stuck". It is also the only half that survives into a
+/// screenshot or a snapshot test.
+private struct ChatWorkingIndicator: View {
+    let progress: ChatProgress
+    @State private var phase = 0.0
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 3) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(ChatPalette.accent)
+                        .frame(width: 4, height: 4)
+                        .opacity(opacity(index))
+                }
+            }
+            Text(progress.title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(ChatPalette.secondary)
+            Text(progress.detail)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(ChatPalette.tertiary)
+                .monospacedDigit()
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                phase = 3
+            }
+        }
+    }
+
+    /// A travelling pulse rather than three synchronised blinks: three dots
+    /// fading together is hard to tell from a rendering stall.
+    private func opacity(_ index: Int) -> Double {
+        let distance = abs(phase - Double(index))
+        return 0.25 + 0.75 * max(0, 1 - min(distance, 1))
     }
 }
 

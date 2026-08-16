@@ -81,7 +81,25 @@ pub use slot::{
     slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 18;
+mod readonly;
+pub use readonly::ReadOnlyVault;
+
+pub const SCHEMA_VERSION: u32 = 19;
+
+/// What conversations may occupy, separate from the capture budget.
+///
+/// Deliberately its own pool rather than a share of `storage_limit_bytes`.
+/// Chat is a few kilobytes per turn against gigabytes of frames, so a shared
+/// pool would let screenshots evict a year of conversations without ever
+/// noticeably relieving the pressure — and shrinking the capture limit would
+/// silently take chat history with it.
+///
+/// At roughly two kilobytes a message this holds well over a hundred thousand
+/// of them, so in practice it bounds a runaway rather than trimming real use.
+pub const CONVERSATION_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-row overhead charged on top of the text: ids, timestamps, indexes.
+const CONVERSATION_ROW_OVERHEAD_BYTES: i64 = 256;
 
 /// Cosine floor for a semantic hit to count as a hit at all.
 ///
@@ -557,6 +575,21 @@ impl ReadPool {
             .unwrap()
     }
 }
+
+/// What one [`Vault::update_message`] call writes.
+///
+/// Every field is overwritten, so a caller passes the whole current state
+/// rather than a delta: the turn holds it in memory anyway, and a partial
+/// update would let a crash leave two halves written at different beats.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessageUpdate<'a> {
+    pub content: &'a str,
+    pub tool_log: Option<&'a str>,
+    pub reasoning: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub usage_json: Option<&'a str>,
+}
+
 
 impl Vault {
     pub fn open(config: VaultConfig, provider: &dyn KeyProvider) -> Result<Self, StoreError> {
@@ -1875,6 +1908,59 @@ impl Vault {
         Ok(id)
     }
 
+    /// Overwrites a message's body as a turn produces it.
+    ///
+    /// The row is inserted empty when the stream opens and updated as it runs,
+    /// so an interrupted turn leaves what it had rather than nothing. Callers
+    /// throttle: this is a write per call, and a token-rate write would spend
+    /// the whole turn in `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn update_message(
+        &self,
+        id: &str,
+        update: &MessageUpdate<'_>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "UPDATE conversation_messages
+                SET content = ?2, tool_log = ?3, reasoning = ?4, status = ?5, usage_json = ?6
+              WHERE id = ?1",
+            params![
+                id,
+                update.content,
+                update.tool_log,
+                update.reasoning,
+                update.status,
+                update.usage_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks every row still flagged `streaming` as stopped.
+    ///
+    /// Run at startup: a row in that state means the daemon died mid-turn, and
+    /// nothing will ever finish it. Leaving it would show a permanently live
+    /// spinner in the thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn settle_orphaned_streams(&self) -> Result<usize, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE conversation_messages SET status = ?1 WHERE status = ?2",
+            params![
+                afterray_protocol::MESSAGE_STATUS_ABORTED,
+                afterray_protocol::MESSAGE_STATUS_STREAMING
+            ],
+        )?;
+        Ok(changed)
+    }
+
     /// Messages of one conversation in order.
     ///
     /// # Errors
@@ -1886,7 +1972,8 @@ impl Vault {
     ) -> Result<Vec<ConversationMessage>, StoreError> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT id, conversation_id, role, content, tool_log, created_at_ms
+            "SELECT id, conversation_id, role, content, tool_log, created_at_ms,
+                    reasoning, status, usage_json
                FROM conversation_messages
               WHERE conversation_id = ?1
               ORDER BY created_at_ms, id",
@@ -1899,6 +1986,9 @@ impl Vault {
                 content: row.get(3)?,
                 tool_log: row.get(4)?,
                 created_at_ms: row.get(5)?,
+                reasoning: row.get(6)?,
+                status: row.get(7)?,
+                usage_json: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -2696,16 +2786,96 @@ impl Vault {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Total bytes the conversation tables hold, text and reasoning included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation_bytes(&self) -> Result<u64, StoreError> {
+        let connection = self.readers.get();
+        let used: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(
+                 LENGTH(CAST(content AS BLOB))
+               + LENGTH(CAST(COALESCE(tool_log, '') AS BLOB))
+               + LENGTH(CAST(COALESCE(reasoning, '') AS BLOB))
+               + LENGTH(CAST(COALESCE(usage_json, '') AS BLOB))
+               + ?1
+             ), 0) FROM conversation_messages",
+            [CONVERSATION_ROW_OVERHEAD_BYTES],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(used).unwrap_or(0))
+    }
+
+    /// Drops the least recently used conversations until chat fits its budget.
+    ///
+    /// The unit is a **whole conversation**, chosen by `updated_at_ms`. Trimming
+    /// individual messages was rejected: a thread with its middle removed is
+    /// worse than a thread that is gone, because the turns that remain refer to
+    /// each other and to evidence that is no longer named, and nothing on screen
+    /// says which parts went. A conversation disappearing from the sidebar is
+    /// something a person can see and understand.
+    ///
+    /// The most recently updated conversation is never evicted, so the thread
+    /// being written to cannot be deleted underneath its own turn — even if it
+    /// alone is over budget, in which case there is nothing better to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query or delete fails.
+    pub fn enforce_conversation_retention(&self) -> Result<Vec<String>, StoreError> {
+        self.evict_conversations_until(CONVERSATION_LIMIT_BYTES)
+    }
+
+    /// [`Self::enforce_conversation_retention`] against an explicit limit, so a
+    /// test can reach the eviction path without writing 256 MB.
+    fn evict_conversations_until(&self, limit: u64) -> Result<Vec<String>, StoreError> {
+        let mut evicted = Vec::new();
+        loop {
+            if self.conversation_bytes()? <= limit {
+                return Ok(evicted);
+            }
+            let (oldest, total) = {
+                let connection = self.readers.get();
+                let total: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM conversations", [], |row| {
+                        row.get(0)
+                    })?;
+                let oldest: Option<String> = connection
+                    .query_row(
+                        "SELECT id FROM conversations ORDER BY updated_at_ms ASC, id ASC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                (oldest, total)
+            };
+            // One conversation left is the floor: it is the one in use.
+            let (Some(id), true) = (oldest, total > 1) else {
+                return Ok(evicted);
+            };
+            self.delete_conversation(&id)?;
+            evicted.push(id);
+        }
+    }
+
+    /// Bytes the capture artifacts hold, the counterpart to
+    /// [`Self::conversation_bytes`]. The two budgets are separate pools; see
+    /// [`CONVERSATION_LIMIT_BYTES`] for why.
+    fn artifact_bytes(connection: &Connection) -> Result<i64, StoreError> {
+        Ok(connection.query_row(
+            "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+            [ARTIFACT_FILE_OVERHEAD_BYTES],
+            |row| row.get(0),
+        )?)
+    }
+
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
             let mut connection = self.connection.lock().unwrap();
-            let used: i64 = connection.query_row(
-                "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
-                [ARTIFACT_FILE_OVERHEAD_BYTES],
-                |row| row.get(0),
-            )?;
+            let used = Self::artifact_bytes(&connection)?;
             let excess = used.saturating_sub(max).max(0);
             if excess == 0 {
                 return Ok(());
@@ -3106,6 +3276,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_15(connection)?;
     migrate_schema_16(connection)?;
     migrate_schema_18(connection, from_version)?;
+    migrate_schema_19(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3549,6 +3720,35 @@ fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
 /// stamped 17 has `人々` split across two tokens that the query no longer asks
 /// for. Either way nothing recovers the old rows but a rebuild, so it happens
 /// once, on the open that finds the older file.
+/// Assistant messages gain the state a turn needs to survive being interrupted.
+///
+/// `status` distinguishes a row that is still being written from one that
+/// finished and one that was stopped part-way — before this, a turn that did
+/// not reach `done` left nothing at all. `reasoning` keeps the model's thinking
+/// beside the answer it produced. `usage_json` keeps the occupancy of the turn
+/// that wrote the row, so reopening a thread can show it without inventing a
+/// number.
+///
+/// Purely additive: existing rows read back as `status = NULL`, which means
+/// "finished", because every row written before this migration did.
+fn migrate_schema_19(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(conversation_messages)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in ["reasoning TEXT", "status TEXT", "usage_json TEXT"] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE conversation_messages ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_schema_18(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
     if from_version >= 18 {
         return Ok(());
@@ -3954,6 +4154,123 @@ mod pipeline_bench;
 
 #[cfg(test)]
 mod tests {
+
+    /// Conversations were outside every budget: an unbounded growth path, and
+    /// reasoning made each row bigger. They now have their own pool, and the
+    /// unit of eviction is a whole conversation.
+    #[test]
+    fn conversation_retention_evicts_whole_threads_oldest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [3_u8; 32],
+        )
+        .unwrap();
+
+        // Four threads, oldest first, each far past the budget on its own.
+        let bulk = "x".repeat(200_000);
+        let mut ids = Vec::new();
+        for index in 0..4_i64 {
+            let id = vault
+                .create_conversation(&format!("thread {index}"), 1_000 + index)
+                .unwrap();
+            for _ in 0..8 {
+                vault
+                    .append_message(&id, "assistant", &bulk, None, 1_000 + index)
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        let before = vault.conversation_bytes().unwrap();
+        assert!(before > 0);
+
+        // A budget small enough to bite, applied by the same code path.
+        let evicted = vault.evict_conversations_until(before / 3).unwrap();
+        assert!(!evicted.is_empty(), "nothing was evicted");
+        assert_eq!(evicted[0], ids[0], "the least recently used must go first");
+
+        let left: Vec<String> = vault
+            .conversations(100)
+            .unwrap()
+            .into_iter()
+            .map(|conversation| conversation.id)
+            .collect();
+        assert!(
+            left.contains(&ids[3]),
+            "the most recent thread must survive: it is the one in use"
+        );
+        // Whole threads, never half of one.
+        for id in &evicted {
+            assert!(
+                vault.conversation_messages(id).unwrap().is_empty(),
+                "an evicted thread left messages behind"
+            );
+        }
+        assert!(vault.conversation_bytes().unwrap() < before);
+    }
+
+    /// Tool results are the largest thing a thread holds now that they are
+    /// stored, so the chat budget has to see them. They ride in `tool_log`,
+    /// which `conversation_bytes` already sums — this is the test that says so
+    /// out loud, because a column added to the row and not to the sum is a
+    /// budget that quietly stops being a budget.
+    #[test]
+    fn a_stored_tool_result_counts_against_the_chat_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [4_u8; 32],
+        )
+        .unwrap();
+        let id = vault.create_conversation("thread", 1_000).unwrap();
+        vault
+            .append_message(&id, "user", "what was I reading", None, 1_000)
+            .unwrap();
+        let without = vault.conversation_bytes().unwrap();
+
+        let log = format!(
+            r#"[{{"name":"get_ocr","args":{{}},"result":"{}","chars":50000}}]"#,
+            "x".repeat(50_000)
+        );
+        vault
+            .append_message(&id, "assistant", "you were reading", Some(&log), 1_001)
+            .unwrap();
+        let with = vault.conversation_bytes().unwrap();
+
+        assert!(
+            with >= without + 50_000,
+            "a 50 KB result added {} bytes to the accounting",
+            with - without
+        );
+    }
+
+    /// The floor: one conversation is never evicted, even alone and oversized.
+    #[test]
+    fn conversation_retention_keeps_the_last_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [4_u8; 32],
+        )
+        .unwrap();
+        let id = vault.create_conversation("only", 1).unwrap();
+        vault
+            .append_message(&id, "assistant", &"y".repeat(100_000), None, 1)
+            .unwrap();
+
+        let evicted = vault.evict_conversations_until(1).unwrap();
+        assert!(evicted.is_empty());
+        assert_eq!(vault.conversations(10).unwrap().len(), 1);
+    }
     use super::*;
 
     fn test_vault(max_storage_gigabytes: u64) -> (tempfile::TempDir, Vault) {

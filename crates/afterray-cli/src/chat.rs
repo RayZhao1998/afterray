@@ -135,12 +135,58 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
         ChatStreamEvent::ToolCall { name, args } => {
             println!("tool_call {name} {args}");
         }
-        ChatStreamEvent::ToolResult { name, chars } => {
-            println!("tool_result {name} ({chars} chars)");
+        ChatStreamEvent::ToolResult {
+            name,
+            chars,
+            truncated,
+            dropped,
+        } => {
+            let cut = if *truncated {
+                format!(", ~{dropped} tokens cut")
+            } else {
+                String::new()
+            };
+            println!("tool_result {name} ({chars} chars{cut})");
         }
         ChatStreamEvent::Token { text } => {
             print!("{text}");
             std::io::stdout().flush()?;
+        }
+        ChatStreamEvent::Usage {
+            prompt_tokens,
+            window_tokens,
+            round,
+        } => {
+            println!("usage round={round} {prompt_tokens}/{window_tokens} tokens");
+        }
+        // The row the answer is being written into. Nothing to print: the CLI
+        // shows the text, and the id only matters to a client that reloads.
+        ChatStreamEvent::Started { .. } => {}
+        ChatStreamEvent::Progress {
+            phase,
+            reasoning_deltas,
+            elapsed_ms,
+            round,
+        } => {
+            // On one line, rewritten in place: this fires every 400 ms while a
+            // turn is quiet, and scrolling the terminal would bury the answer.
+            print!(
+                "\r{phase} round={round} {reasoning_deltas} steps {}s   ",
+                elapsed_ms / 1_000
+            );
+            std::io::stdout().flush()?;
+        }
+        ChatStreamEvent::Compaction {
+            strategy,
+            from_round,
+            to_round,
+            tokens_before,
+            tokens_after,
+        } => {
+            println!(
+                "compaction {strategy} rounds {from_round}..={to_round} \
+                 {tokens_before} -> {tokens_after} tokens"
+            );
         }
         ChatStreamEvent::Done {
             message_id,

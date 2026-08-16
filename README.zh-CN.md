@@ -28,7 +28,7 @@ AfterRay 是一款本地优先的 macOS 电脑历史记录应用。它会录制�
 
 你可以选择本地模型，例如自己的 Ollama，或任何提供 OpenAI 兼容 API 的 AI provider。
 
-## 有什么酷的
+## 你能用它做什么
 
 - **回溯你的工作。** 在原生时间线上回到某个时刻的屏幕、文字、应用上下文和音频。
 - **找到正确的时刻。** 按精确文字或语义搜索 OCR、转写、窗口标题和辅助功能上下文，
@@ -45,6 +45,10 @@ AfterRay 可在**设置 → 高级 → CLI for agents**中安装 `afterray` CLI�
 Codex 等工具可以借此查询你选择分享的历史。本仓库也在
 [`skills/afterray`](skills/afterray/SKILL.md) 附带了一个供支持 Skills 的 Agent 使用的
 Skill。
+
+内置助手只能使用明确允许的只读历史工具。本地模型会把提示词和检索到的证据留在
+这台 Mac 上；远程模型服务商则会在每次请求中收到这些内容。完整边界和已接受风险见
+[agent harness 威胁模型](docs/harness-threat-model.md)。
 
 ## 许可证
 

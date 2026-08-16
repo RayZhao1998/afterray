@@ -1,7 +1,7 @@
 mod stream;
 
 use crate::{
-    AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
+    AdapterError, Cancellation, LlmDelta, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
     PersistentMlxAdapter, QWEN35_4B_MLX_PACK_ID, QWEN35_9B_MLX_PACK_ID,
 };
 use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
@@ -26,6 +26,15 @@ pub struct LlmRuntimeConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// The context window this turn is planned against, once it has been worked
+    /// out ([`crate::probe_context_tokens`]). `None` means nobody has asked yet.
+    ///
+    /// It lives here because two places need the same number and they must not
+    /// disagree: the harness budgets the transcript against it, and the Ollama
+    /// request declares it as `num_ctx`. Budgeting for more than we declare
+    /// gets the prompt cut; declaring more than we budget for allocates a KV
+    /// cache nobody uses.
+    pub context_tokens: Option<usize>,
 }
 
 impl Default for LlmRuntimeConfig {
@@ -35,6 +44,7 @@ impl Default for LlmRuntimeConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: None,
+            context_tokens: None,
         }
     }
 }
@@ -79,46 +89,60 @@ impl LlmRuntimeConfig {
     }
 }
 
-/// Optional chat-only side channel. The next remote `execute` takes the
-/// sender so a queued T2 job cannot keep the outlet after chat arms it.
+/// Chat-only token outlets, one per queued job.
+///
+/// This used to be a single `Option<Sender>` that the next `execute` took,
+/// whoever it belonged to. With one LLM lane and two turns in flight that
+/// mis-delivers: turn A can be queued while turn B installs its sender, and
+/// when A is finally admitted it takes B's outlet — B's window then renders
+/// A's answer. Worse, A's guard on the way out cleared the slot regardless of
+/// whose sender was in it.
+///
+/// Keying by job id makes a sender reachable only by the job it was installed
+/// for, so neither confusion is expressible.
 #[derive(Clone, Default)]
 pub struct LlmTokenSink {
-    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    inner: Arc<std::sync::Mutex<BTreeMap<String, mpsc::Sender<LlmDelta>>>>,
 }
 
 impl LlmTokenSink {
-    /// Installs a sender until the guard drops. Chat holds the guard around
-    /// `submit`/`wait` so tokens from that generation can leak out.
+    /// Arms the outlet for one job until the guard drops.
+    ///
+    /// Install *after* submitting, so `job_id` is known. A job admitted before
+    /// its sender lands simply does not stream that round — the completed text
+    /// still comes back — which is the safe direction to fail.
     #[must_use = "dropping the guard clears the token outlet"]
-    pub fn install(&self, tx: mpsc::Sender<String>) -> LlmTokenSinkGuard {
-        *self.lock() = Some(tx);
+    pub fn install(&self, job_id: &str, tx: mpsc::Sender<LlmDelta>) -> LlmTokenSinkGuard {
+        self.lock().insert(job_id.to_owned(), tx);
         LlmTokenSinkGuard {
             inner: Arc::clone(&self.inner),
+            job_id: job_id.to_owned(),
         }
     }
 
-    fn take(&self) -> Option<mpsc::Sender<String>> {
-        self.lock().take()
+    fn take(&self, job_id: &str) -> Option<mpsc::Sender<LlmDelta>> {
+        self.lock().remove(job_id)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<String>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, mpsc::Sender<LlmDelta>>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-/// Clears the outlet even if the chat task is cancelled mid-wait.
+/// Clears one job's outlet even if the chat task is cancelled mid-wait.
 pub struct LlmTokenSinkGuard {
-    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    inner: Arc<std::sync::Mutex<BTreeMap<String, mpsc::Sender<LlmDelta>>>>,
+    job_id: String,
 }
 
 impl Drop for LlmTokenSinkGuard {
     fn drop(&mut self) {
-        *self
-            .inner
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.job_id);
     }
 }
 
@@ -198,7 +222,7 @@ impl ModelAdapter for LlmRouterAdapter {
         let config = self.snapshot();
         // Consume the outlet on every path so a later remote job cannot
         // inherit a chat sender that was never claimed.
-        let token_tx = self.token_sink.take();
+        let token_tx = self.token_sink.take(job_id);
         match config.provider {
             LlmProvider::MlxLocal => {
                 let pack_id = config.mlx_pack_id().ok_or_else(|| {
@@ -216,7 +240,12 @@ impl ModelAdapter for LlmRouterAdapter {
                     .await
             }
             LlmProvider::Ollama | LlmProvider::OpenaiCompatible => {
-                let ModelInput::Llm { prompt, system } = input else {
+                let ModelInput::Llm {
+                    prompt,
+                    system,
+                    messages,
+                } = input
+                else {
                     return Err(AdapterError::InvalidOutput(
                         "LLM router received a non-LLM input".into(),
                     ));
@@ -229,6 +258,7 @@ impl ModelAdapter for LlmRouterAdapter {
                     &self.client,
                     &config,
                     prompt,
+                    messages,
                     system.as_deref(),
                     token_tx,
                     cancellation,
@@ -365,13 +395,22 @@ async fn generate_remote(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     prompt: &str,
+    messages: &[crate::ChatMessage],
     system: Option<&str>,
-    token_tx: Option<mpsc::Sender<String>>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     if let Some(token_tx) = token_tx {
-        return stream::generate_streaming(client, config, prompt, system, token_tx, cancellation)
-            .await;
+        return stream::generate_streaming(
+            client,
+            config,
+            prompt,
+            messages,
+            system,
+            token_tx,
+            cancellation,
+        )
+        .await;
     }
     let model = config.chat_model();
     if model.is_empty() {
@@ -682,6 +721,78 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The cross-conversation bug, as a test. Two turns arm the outlet; each
+    /// job may only take its own sender.
+    ///
+    /// With a single unkeyed slot, the second install overwrote the first and
+    /// whichever job the one LLM lane admitted next took whatever was there —
+    /// so one chat window rendered another's answer.
+    #[tokio::test]
+    async fn one_job_cannot_take_another_jobs_token_outlet() {
+        let sink = LlmTokenSink::default();
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let guard_a = sink.install("job-a", tx_a);
+        let guard_b = sink.install("job-b", tx_b);
+
+        // Each job gets its own, regardless of install order.
+        let taken_b = sink.take("job-b").expect("job-b outlet");
+        taken_b.send(LlmDelta::content("for B")).await.unwrap();
+        let taken_a = sink.take("job-a").expect("job-a outlet");
+        taken_a.send(LlmDelta::content("for A")).await.unwrap();
+
+        assert_eq!(rx_a.try_recv().unwrap(), LlmDelta::content("for A"));
+        assert_eq!(rx_b.try_recv().unwrap(), LlmDelta::content("for B"));
+        // And a job with no outlet gets nothing rather than someone else's.
+        assert!(sink.take("job-c").is_none());
+        drop((guard_a, guard_b));
+    }
+
+    /// A finishing turn must not clear a later turn's outlet on the way out.
+    #[tokio::test]
+    async fn a_guard_only_clears_its_own_entry() {
+        let sink = LlmTokenSink::default();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        let guard_a = sink.install("job-a", tx_a);
+        let _guard_b = sink.install("job-b", tx_b);
+        drop(guard_a);
+        assert!(sink.take("job-a").is_none());
+        assert!(sink.take("job-b").is_some(), "job-b's outlet was collateral");
+    }
+
+    /// The only adapter that can reach the network declares itself LLM-only,
+    /// and the queue routes by capability. So an embedding — the one model call
+    /// whose input is a string the agent chose — is served by the local worker
+    /// and cannot be pointed at a remote endpoint by any setting.
+    ///
+    /// This is the property `docs/harness-threat-model.md` leans on when it
+    /// says `search_evidence` is not an exfiltration path.
+    #[tokio::test]
+    async fn the_remote_router_refuses_everything_that_is_not_an_llm_call() {
+        let adapter = LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(
+            LlmRuntimeConfig::default(),
+        )));
+        assert_eq!(adapter.capability(), ModelCapability::Llm);
+
+        let refused = adapter
+            .execute(
+                "job-embed",
+                &ModelInput::Embedding {
+                    text: "anything the agent typed".into(),
+                },
+                Cancellation::default(),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(AdapterError::InvalidOutput(_) | AdapterError::Process(_))
+            ),
+            "the remote router accepted an embedding job: {refused:?}"
+        );
+    }
     use super::*;
 
     #[test]
@@ -833,13 +944,14 @@ mod tests {
             LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())));
         let sink = adapter.token_sink();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let _guard = sink.install(tx);
+        let _guard = sink.install("job-1", tx);
         let error = adapter
             .execute(
                 "job-1",
                 &ModelInput::Llm {
                     prompt: "hi".into(),
                     system: None,
+                    messages: Vec::new(),
                 },
                 Cancellation::default(),
             )
@@ -848,7 +960,7 @@ mod tests {
         assert!(matches!(error, AdapterError::MissingModel(_)));
         assert!(rx.try_recv().is_err());
         assert!(
-            sink.take().is_none(),
+            sink.take("job-1").is_none(),
             "the outlet must be consumed so a later job cannot inherit it"
         );
     }

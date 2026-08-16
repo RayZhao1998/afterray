@@ -5,6 +5,8 @@
 //! `afterray-model-worker` binary; OCR stays on the native Swift helper.
 
 mod catalog;
+mod context;
+mod delta;
 mod download;
 mod persistent_mlx;
 mod process;
@@ -15,10 +17,17 @@ pub use catalog::{
     ManifestFile, PackSource, PackSpec, QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES,
     QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION, READY_MARKER,
-    catalog_in, default_catalog, inspect_model_path, library, library_in, model_directory,
+    catalog_in, default_catalog, inspect_model_path, library, library_in,
+    mlx_pack_context_tokens, model_directory,
     qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
     specs_for_download, specs_for_download_in,
 };
+pub use context::{
+    CONTEXT_ENV_VARS, ContextProbe, MINIMUM_CONTEXT_TOKENS, REMOTE_DEFAULT_CONTEXT_TOKENS,
+    architecture_context_length, pinned_context_tokens, probe_context_tokens,
+    resolve_context_tokens, running_context_length,
+};
+pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{
     DownloadError, DownloadProgress, download_pack, download_packs,
     download_packs_with_cancellation, remove_pack, verify_files,
@@ -88,7 +97,32 @@ pub enum ModelInput {
         prompt: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         system: Option<String>,
+        /// The same conversation as `prompt`, message by message.
+        ///
+        /// Both, not either: `/api/chat` and the OpenAI-compatible endpoints
+        /// take an array and cache on its longest stable prefix, while the
+        /// managed MLX worker speaks the worker protocol and takes one string.
+        /// `prompt` is the flattening of exactly these messages, so the two can
+        /// never describe different conversations.
+        ///
+        /// Empty for callers that have no conversation — the T2 summariser asks
+        /// one question and reads one answer.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        messages: Vec<ChatMessage>,
     },
+}
+
+/// One message of a conversation, as the model layer carries it.
+///
+/// Its own type rather than the harness's: the dependency runs harness →
+/// `afterray-agent` → models, and this crate must not reach back up. The seam
+/// converts, as it already does for token deltas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// `system`, `user` or `assistant` — the three roles every provider agrees
+    /// on. Kept as a string because it goes straight onto the wire.
+    pub role: String,
+    pub content: String,
 }
 
 impl ModelInput {

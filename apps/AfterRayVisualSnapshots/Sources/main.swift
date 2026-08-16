@@ -105,7 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
-            + captionScenes
+            + captionScenes + chatScenes
     }
 }
 
@@ -612,6 +612,42 @@ private func settingsScene(
         content: AnyView(
             AfterRaySettingsView(model: model, onClose: {}, initialPage: initialPage)
                 .frame(width: 900, height: 700)
+        )
+    )
+}
+
+// MARK: - Chat panel
+
+/// The chat chrome that reports on itself: the context meter in the header, the
+/// compaction rule in the thread, and the caveat on an answer built from a
+/// shortened lookup. All three are easy to get subtly wrong — a meter that
+/// misreads, a rule that looks like a message — and only pixels show it.
+@MainActor
+private var chatScenes: [SnapshotScene] {
+    [
+        chatScene(name: "16-chat-context-pressure", scenario: .pressure),
+        chatScene(name: "17-chat-tools", scenario: .tools),
+        // The two dead-air states. A thinking model spends most of a turn here
+        // and a cold load spends its first ten seconds here, so this is what
+        // the chat window looks like most of the time it is working.
+        chatScene(name: "18-chat-thinking", scenario: .thinking),
+        chatScene(name: "19-chat-waiting", scenario: .waiting),
+        // Reasoning kept beside the answer, folded away, and a turn that was
+        // stopped part-way keeping what it had produced.
+        chatScene(name: "20-chat-reasoning", scenario: .reasoning),
+    ]
+}
+
+@MainActor
+private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
+    let model = ChatPreviewModel(scenario: scenario)
+    return SnapshotScene(
+        name: name,
+        size: CGSize(width: 980, height: 680),
+        settleSeconds: 1.2,
+        content: AnyView(
+            AfterRayChatView(model: model, onClose: {})
+                .frame(width: 980, height: 680)
         )
     )
 }

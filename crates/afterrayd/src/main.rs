@@ -5,8 +5,10 @@ mod gop_packer;
 mod memory;
 mod stream;
 mod tools;
+mod turn_row;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
+use afterray_harness::ContextBudget;
 use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
     ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter,
@@ -31,6 +33,7 @@ use afterray_store::{
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -234,7 +237,10 @@ async fn main() -> anyhow::Result<()> {
         llm_config,
         llm_token_sink,
         mlx_adapters,
+        running_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
+
+    settle_orphaned_turns(&state);
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
         Ok(0) => {}
@@ -434,6 +440,12 @@ struct AppState {
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
+    /// Cancel tokens for turns currently running, by conversation.
+    ///
+    /// A `ChatAbort` arrives on a *different* connection from the stream it
+    /// stops — the stream's own connection is busy writing events — so the
+    /// token has to be reachable by name.
+    running_turns: Arc<crate::stream::RunningTurns>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -566,7 +578,26 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 conversation_id,
                 message,
             }) => {
-                stream::handle_chat_stream(&mut write, &state, conversation_id, message).await?;
+                // A hang-up no longer cancels. Closing the panel means "I will
+                // read it later": the turn runs on and writes itself into its
+                // row, so coming back finds the finished answer. Only an
+                // explicit ChatAbort stops a turn — see Request::ChatAbort.
+                let cancel = afterray_harness::CancelToken::new();
+                let (result, peer_present) = stream::run_watching_for_hangup(
+                    stream::handle_chat_stream(
+                        &mut write,
+                        &state,
+                        conversation_id,
+                        message,
+                        cancel.clone(),
+                    ),
+                    &mut lines,
+                )
+                .await;
+                result?;
+                if !peer_present {
+                    break;
+                }
             }
             Ok(Request::ReadThumbnail {
                 moment_id,
@@ -634,6 +665,35 @@ where
         .expect("blocking store task panicked")
 }
 
+/// A row still marked `streaming` means the daemon died mid-turn and nothing
+/// will ever finish it. Left alone it would show a live spinner forever.
+fn settle_orphaned_turns(state: &AppState) {
+    match state.store.settle_orphaned_streams() {
+        Ok(0) => {}
+        Ok(count) => eprintln!("chat: settled {count} turn(s) orphaned by a previous run"),
+        Err(error) => eprintln!("chat: could not settle orphaned turns: {error}"),
+    }
+}
+
+/// Stops the turn running on a conversation, if one is.
+fn abort_turn(state: &AppState, conversation_id: &str) -> Response {
+    let token = state
+        .running_turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(conversation_id)
+        .cloned();
+    match token {
+        Some(token) => {
+            token.cancel();
+            Response::success(serde_json::json!({"aborted": true}))
+        }
+        // Not an error: the turn may have finished between the user pressing
+        // stop and this arriving, which is a race the app should not report.
+        None => Response::success(serde_json::json!({"aborted": false})),
+    }
+}
+
 async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
     match request {
         Request::Ping => Response::success(serde_json::json!({"pong": true})),
@@ -688,6 +748,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::ChatStream { .. } => {
             Response::failure("chat streams are framed as NDJSON events and are handled separately")
         }
+        Request::ChatAbort { conversation_id } => abort_turn(state, &conversation_id),
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
@@ -706,12 +767,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             }
             Err(error) => Response::failure(error.to_string()),
         },
-        Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
+        Request::MomentGet { moment_id } => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
         },
         Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
-            Ok(Some(moment_id)) => match tools::moment_detail(&state.store, &moment_id) {
+            Ok(Some(moment_id)) => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
                 Ok(moment) => Response::success(moment),
                 Err(error) => Response::failure(error),
             },
@@ -746,14 +807,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
             .await
         }
-        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
+        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
         },
         Request::EvidenceAx {
             moment_id,
             digest_only,
-        } => match tools::ax_evidence(&state.store, &moment_id, digest_only) {
+        } => match tools::ax_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id, digest_only) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
         },
@@ -778,7 +839,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
         } => {
-            let llm_ready = ensure_remote_llm_model(state).await;
+            let model = ready_model(state).await;
             ask::handle_ask(
                 &state.store,
                 &state.models,
@@ -786,7 +847,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 from_ms,
                 to_ms,
                 now_ms(),
-                llm_ready,
+                model,
             )
             .await
         }
@@ -794,14 +855,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             conversation_id,
             message,
         } => {
-            let llm_ready = ensure_remote_llm_model(state).await;
+            let model = ready_model(state).await;
             chat::handle_send(
                 &state.store,
                 &state.models,
                 conversation_id.as_deref(),
                 &message,
                 now_ms(),
-                llm_ready,
+                model,
             )
             .await
         }
@@ -1024,6 +1085,48 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
         let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
     }
     start_capture_runtime(state, session_id).await
+}
+
+/// Everything a turn needs to know about the model: that there is one, and
+/// what window it has.
+///
+/// The window is worked out here rather than at startup because it is not a
+/// property of our settings — it is a property of what the server has loaded
+/// right now, and that changes between turns.
+pub(crate) async fn ready_model(state: &AppState) -> ask::TurnModel {
+    if !ensure_remote_llm_model(state).await {
+        return ask::TurnModel::missing();
+    }
+    ask::TurnModel::ready(resolve_context_budget(state).await)
+}
+
+/// Probes the provider for this turn's context window, records it on the shared
+/// config so the outgoing request declares the same number, and turns it into a
+/// budget.
+///
+/// Runs per turn. `/api/ps` only reports a window once the model is resident,
+/// so a value read at startup would be the wrong one exactly when it mattered;
+/// two localhost round trips are cheap next to the generation that follows.
+async fn resolve_context_budget(state: &AppState) -> ContextBudget {
+    let config = current_llm_config(state);
+    let afford = afterray_platform_macos::local_context_tokens();
+    let probe = afterray_models::probe_context_tokens(&config, afford).await;
+    let changed = {
+        let mut llm = state
+            .llm_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = llm.context_tokens != Some(probe.resolved);
+        llm.context_tokens = Some(probe.resolved);
+        changed
+    };
+    // Once per change, not once per turn: the interesting event is the window
+    // moving, and a user whose window came out small needs the inputs to know
+    // whether it was their machine or their model.
+    if changed {
+        eprintln!("llm.{}", probe.summary());
+    }
+    ContextBudget::for_window(probe.resolved)
 }
 
 fn current_llm_config(state: &AppState) -> LlmRuntimeConfig {
@@ -1337,6 +1440,7 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
                 let key = persisted.legacy_llm_api_key.trim();
                 (!key.is_empty()).then(|| key.to_owned())
             }),
+        context_tokens: None,
     };
     // Settings carried over from the retired built-in provider can hold a
     // remote chat model id, which is not a managed MLX pack. Drop it so the
@@ -1939,7 +2043,7 @@ pub(crate) fn text_hits(
 /// The semantic side is floored by `SEMANTIC_MIN_SIMILARITY`, so a query with
 /// nothing near it comes back short rather than padded.
 pub(crate) async fn search_hits(
-    store: &Vault,
+    store: afterray_store::ReadOnlyVault<'_>,
     models: &ModelQueue,
     query: &str,
     limit: usize,
@@ -2024,7 +2128,7 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
     /// Rounds are model calls, so this bounds both cost and transcript
-    /// growth. The transcript is append-only — never clipped — so a
+    /// growth. The transcript is append-only — never pruned — so a
     /// prefix-caching runtime re-prefills only each round's delta.
     const T2_MAX_ROUNDS: usize = 8;
 
@@ -2039,20 +2143,40 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     // preempts; other background summaries wait until the guard drops.
     let lease_hold = state.models.hold_llm_lease();
     let tools = SlotT2Tools {
-        store: &state.store,
+        store: afterray_store::ReadOnlyVault::new(&state.store),
         card: &inputs.card,
     };
-    let turn = agent::run_agent_loop(
-        &state.models,
+    let model = afterray_agent::QueueModel {
+        models: &state.models,
+        priority: afterray_models::JobPriority::Background {
+            lease: Some(lease_hold.id()),
+        },
+        token_sink: None,
+    };
+    let turn = afterray_harness::run_turn(
+        &model,
         &tools,
-        inputs.system,
-        &inputs.user,
-        agent::AgentLoopConfig {
-            max_rounds: T2_MAX_ROUNDS,
-            clip_chars: None,
-            priority: afterray_models::JobPriority::Background {
-                lease: Some(lease_hold.id()),
+        &mut afterray_harness::Discard,
+        &afterray_harness::LoopConfig {
+            budget: afterray_harness::ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..afterray_harness::ContextBudget::DEFAULT
             },
+            // The background sweeper has no user waiting on it to stop.
+            cancel: afterray_harness::CancelToken::new(),
+            // Append-only. A prefix-caching runtime re-prefills only each
+            // round's delta, and rewriting an earlier round would invalidate
+            // the whole cached prefix. The prompt is built from one slot's
+            // card, so it is bounded by construction.
+            compaction: None,
+        },
+        inputs.system,
+        // The T2 prompt is one slot's card: no history, and the card itself is
+        // the task.
+        afterray_harness::Opening {
+            seed: String::new(),
+            history: afterray_harness::History::new(),
+            task: inputs.user.clone(),
         },
     )
     .await
@@ -2081,9 +2205,10 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         .map(|call| call.name.as_str())
         .collect();
     eprintln!(
-        "slot.t2 slot={slot_start_ms} prompt_chars={} rounds={} tools={tool_names:?} \
+        "slot.t2 slot={slot_start_ms} prompt_tokens={}/{} rounds={} tools={tool_names:?} \
          out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
-        inputs.user.chars().count(),
+        turn.usage.prompt_tokens,
+        turn.usage.window_tokens,
         turn.tool_calls.len() + 1,
         turn.answer.chars().count(),
         parsed.is_some(),
@@ -2408,6 +2533,7 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     let job_id = match state
         .models
         .submit(ModelInput::Llm {
+            messages: Vec::new(),
             prompt,
             system: Some(
                 "You are AfterRay. Be concise and never invent missing evidence.".to_owned(),
@@ -2532,7 +2658,8 @@ fn slot_prompt_for(
 /// The slot-scoped tools a T2 agent may call. Every tool reads only this
 /// slot's evidence; the summariser has no business elsewhere in the vault.
 struct SlotT2Tools<'a> {
-    store: &'a afterray_store::Vault,
+    /// Reads only, like every other tool surface.
+    store: afterray_store::ReadOnlyVault<'a>,
     card: &'a afterray_store::SlotCard,
 }
 
@@ -2643,9 +2770,13 @@ impl SlotT2Tools<'_> {
     }
 }
 
-impl agent::ToolSurface for SlotT2Tools<'_> {
-    async fn invoke(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
-        match name {
+impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
+    async fn invoke(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<afterray_harness::Budgeted, String> {
+        let text = match name {
             "get_run_text" => self.get_run_text(args),
             "get_transcript" => self.get_transcript(),
             "get_ocr" => self.get_ocr(args),
@@ -2653,7 +2784,10 @@ impl agent::ToolSurface for SlotT2Tools<'_> {
             other => Err(format!(
                 "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
             )),
-        }
+        }?;
+        // These tools already page themselves against `T2_TOOL_PAGE_CHARS`, so
+        // there is nothing left for a second budget to cut.
+        Ok(afterray_harness::Budgeted::verbatim(text))
     }
 }
 
@@ -3865,7 +3999,7 @@ mod tests {
             )
             .unwrap();
 
-        let hits = search_hits(&vault, &queue(Vec::new()), "needle", 10)
+        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &queue(Vec::new()), "needle", 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -3952,7 +4086,7 @@ print(json.dumps({
         );
         config.args = vec!["-c".to_owned(), script.to_owned()];
         let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
-        let hits = search_hits(&vault, &models, "needle", 10).await.unwrap();
+        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &models, "needle", 10).await.unwrap();
 
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|hit| hit.text == "needle exact words"));

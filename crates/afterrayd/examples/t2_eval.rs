@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_url,
         model: model.clone(),
         api_key: None,
+        context_tokens: None,
     }));
     let adapters: Vec<Arc<dyn ModelAdapter>> =
         vec![Arc::new(LlmRouterAdapter::new(Arc::clone(&config)))];
@@ -107,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         let job = queue
             .submit(ModelInput::Llm {
+                messages: Vec::new(),
                 prompt: user.clone(),
                 system: Some(T2_SYSTEM_PROMPT.to_owned()),
             })

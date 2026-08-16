@@ -32,7 +32,7 @@ not need to build AfterRay or run separate first-launch setup commands.
 Choose local models, such as your own Ollama, or any AI provider with an
 OpenAI-compatible API.
 
-## What is cool about it
+## What you can do
 
 - **Rewind your work.** Browse a native timeline back to the exact screen,
   words, app context, and audio around a moment.
@@ -51,6 +51,12 @@ AfterRay can install an `afterray` CLI from **Settings → Advanced → CLI for
 agents**. It lets tools such as Claude Code and Codex query the history you
 choose to share. This repository also includes an Agent Skill at
 [`skills/afterray`](skills/afterray/SKILL.md) for agents that support skills.
+
+The built-in assistant receives only allowlisted, read-only history tools. A
+local model keeps prompts and retrieved evidence on this Mac; a remote model
+provider receives them as part of each request. The complete boundary and its
+accepted risks are documented in the
+[agent harness threat model](docs/harness-threat-model.md).
 
 ## License
 

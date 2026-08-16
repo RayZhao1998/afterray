@@ -5,6 +5,14 @@ use zeroize::Zeroize as _;
 pub mod socket;
 
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
+/// Bumped whenever the request or event vocabulary changes.
+///
+/// The handshake is strict equality, so a version that does not move is worse
+/// than useless: at 7, an app that knows `ChatAbort` and a daemon that does not
+/// both claim 7, the handshake passes, the abort fails to deserialise, and —
+/// because a hang-up no longer cancels — the user presses stop and the model
+/// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
+/// `usage`, `progress` and `compaction` stream events.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +167,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
         message: String,
+    },
+    /// Stop the turn running on `conversation_id`, from a second connection.
+    ///
+    /// Explicit, rather than inferred from a closed socket, because the two
+    /// mean opposite things: pressing stop is "do not finish this", while
+    /// closing the panel is "I will read it later". Only the first should end
+    /// the turn — see the daemon's `run_watching_for_hangup`.
+    ChatAbort {
+        conversation_id: String,
     },
     ChatList,
     ChatHistory {
@@ -523,8 +540,31 @@ pub struct ConversationMessage {
     /// looked up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_log: Option<String>,
+    /// The model's reasoning for this turn, as a JSON array of
+    /// `{"round": n, "text": "…"}`.
+    ///
+    /// A JSON array rather than one blob because reasoning is produced per
+    /// round, and the one API that requires it back — `DeepSeek`'s
+    /// `reasoning_content`, which 400s on multi-turn without it — wants it
+    /// verbatim per assistant message. Keeping the rounds apart leaves that
+    /// possible; concatenating would not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// `streaming`, `complete` or `aborted`. `None` on every row written
+    /// before turns were persisted as they ran, all of which finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Context occupancy of the turn that wrote this row, as JSON. Read back
+    /// when a thread is reopened so the meter does not have to be invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_json: Option<String>,
     pub created_at_ms: i64,
 }
+
+/// What a stored assistant row is: still being written, finished, or stopped.
+pub const MESSAGE_STATUS_STREAMING: &str = "streaming";
+pub const MESSAGE_STATUS_COMPLETE: &str = "complete";
+pub const MESSAGE_STATUS_ABORTED: &str = "aborted";
 
 /// Reply to [`Request::ChatSend`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -833,6 +873,10 @@ pub struct AskAnswer {
 /// Tokens are optional: adapters that cannot stream omit them until the
 /// finished answer is known, then emit a single `token` so clients can
 /// treat every turn the same way.
+///
+/// Growing this enum is additive by contract. A client that meets a `kind` it
+/// does not know must skip the line, and new fields on an existing kind must
+/// be `#[serde(default)]` so an older daemon's lines still decode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
@@ -843,9 +887,64 @@ pub enum ChatStreamEvent {
     ToolResult {
         name: String,
         chars: usize,
+        /// Whether the result was cut to fit its budget. The app says so on the
+        /// bubble: an answer built from a shortened result deserves the caveat.
+        #[serde(default)]
+        truncated: bool,
+        /// Estimated tokens the cut removed.
+        #[serde(default)]
+        dropped: usize,
     },
     Token {
         text: String,
+    },
+    /// How full the context window is, once per round.
+    ///
+    /// Context pressure was invisible from every angle before this: the user
+    /// could not see that a long thread was crowding the window, and neither
+    /// could anyone reading a bug report.
+    Usage {
+        prompt_tokens: usize,
+        window_tokens: usize,
+        round: usize,
+    },
+    /// The turn is alive but has nothing to show yet.
+    ///
+    /// Covers every stretch where the window would otherwise sit empty: a
+    /// thinking model streaming reasoning, a cold model load before the first
+    /// byte, and the generation of a `TOOL` draft that the answer gate hides.
+    /// A client that renders `elapsed_ms` or `reasoning_deltas` as a changing
+    /// number can answer "is it stuck" without trusting an animation.
+    Progress {
+        /// `generating` or `thinking`. A string rather than a closed set, so a
+        /// later phase does not break an older client's decode.
+        phase: String,
+        #[serde(default)]
+        reasoning_deltas: usize,
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        round: usize,
+    },
+    /// An earlier part of the turn was dropped to make room.
+    ///
+    /// Announced rather than silent, and carrying the range it covers, so the
+    /// thread can show where the agent stopped being able to see.
+    Compaction {
+        strategy: String,
+        from_round: usize,
+        to_round: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+    },
+    /// The row this turn will be written to, sent before any output.
+    ///
+    /// The assistant message exists in the vault from the moment the stream
+    /// opens, so a client can name it immediately and does not have to invent a
+    /// local placeholder that no reload would ever match.
+    Started {
+        message_id: String,
+        conversation_id: String,
     },
     Done {
         message_id: String,
@@ -1175,10 +1274,42 @@ mod tests {
         let result = ChatStreamEvent::ToolResult {
             name: "get_slot_card".into(),
             chars: 2480,
+            truncated: false,
+            dropped: 0,
         };
         assert_eq!(
             serde_json::to_string(&result).unwrap(),
-            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480}"#
+            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480,"truncated":false,"dropped":0}"#
+        );
+        let usage = ChatStreamEvent::Usage {
+            prompt_tokens: 5_120,
+            window_tokens: 16_384,
+            round: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&usage).unwrap(),
+            r#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#
+        );
+        let progress = ChatStreamEvent::Progress {
+            phase: "thinking".into(),
+            reasoning_deltas: 131,
+            elapsed_ms: 2_400,
+            round: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&progress).unwrap(),
+            r#"{"kind":"progress","phase":"thinking","reasoning_deltas":131,"elapsed_ms":2400,"round":1}"#
+        );
+        let compaction = ChatStreamEvent::Compaction {
+            strategy: "prune_tool_results".into(),
+            from_round: 0,
+            to_round: 2,
+            tokens_before: 14_000,
+            tokens_after: 6_200,
+        };
+        assert_eq!(
+            serde_json::to_string(&compaction).unwrap(),
+            r#"{"kind":"compaction","strategy":"prune_tool_results","from_round":0,"to_round":2,"tokens_before":14000,"tokens_after":6200}"#
         );
         let token = ChatStreamEvent::Token {
             text: "你今天下午".into(),
@@ -1206,6 +1337,23 @@ mod tests {
         assert!(line.ends_with(b"\n"));
         let parsed: ChatStreamEvent = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
         assert_eq!(parsed, token);
+    }
+
+    /// A line written by a daemon that predates `truncated`/`dropped` must
+    /// still decode, or upgrading the daemon and the app becomes a lockstep.
+    #[test]
+    fn tool_result_decodes_without_the_newer_fields() {
+        let parsed: ChatStreamEvent =
+            serde_json::from_str(r#"{"kind":"tool_result","name":"get_ocr","chars":12}"#).unwrap();
+        assert_eq!(
+            parsed,
+            ChatStreamEvent::ToolResult {
+                name: "get_ocr".into(),
+                chars: 12,
+                truncated: false,
+                dropped: 0,
+            }
+        );
     }
 
     #[test]

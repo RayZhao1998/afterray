@@ -1,4 +1,6 @@
-use crate::{AdapterError, Cancellation, ManifestFile, ModelInput, ModelOutput, READY_MARKER};
+use crate::{
+    AdapterError, Cancellation, LlmDelta, ManifestFile, ModelInput, ModelOutput, READY_MARKER,
+};
 use afterray_protocol::ModelPackState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,14 +122,16 @@ impl PersistentMlxAdapter {
         &self,
         job_id: &str,
         input: &ModelInput,
-        token_tx: Option<mpsc::Sender<String>>,
+        token_tx: Option<mpsc::Sender<LlmDelta>>,
         cancellation: Cancellation,
     ) -> Result<ModelOutput, AdapterError> {
         if let Some(error) = mlx_platform_incompatibility() {
             self.set_health(ModelPackState::Incompatible, None, None, Some(error.into()));
             return Err(AdapterError::Process(error.into()));
         }
-        let ModelInput::Llm { prompt, system } = input else {
+        // `messages` is ignored here on purpose: the worker protocol takes one
+        // prompt, and `prompt` is the flattening of exactly those messages.
+        let ModelInput::Llm { prompt, system, .. } = input else {
             return Err(AdapterError::InvalidOutput(
                 "MLX adapter received a non-LLM input".into(),
             ));
@@ -314,7 +318,7 @@ impl PersistentMlxAdapter {
         runtime: &mut Runtime,
         request: MlxRequest<'_>,
         request_id: &str,
-        token_tx: Option<mpsc::Sender<String>>,
+        token_tx: Option<mpsc::Sender<LlmDelta>>,
         cancellation: Cancellation,
     ) -> GenerateAttempt {
         let Some(worker) = runtime.worker.as_mut() else {
@@ -356,7 +360,10 @@ impl PersistentMlxAdapter {
                                     && let Some(tx) = &token_tx
                                 {
                                     emitted_delta = true;
-                                    let _ = tx.send(text).await;
+                                    // The MLX worker already strips reasoning
+                                    // in `normalize_model_output`, so whatever
+                                    // reaches here is answer text.
+                                    let _ = tx.send(LlmDelta::content(text)).await;
                                 }
                             }
                             "final" => {
@@ -604,6 +611,7 @@ done
 
     fn prompt(value: &str) -> ModelInput {
         ModelInput::Llm {
+            messages: Vec::new(),
             prompt: value.into(),
             system: Some("system".into()),
         }
@@ -658,7 +666,7 @@ done
             .execute_streaming("job-1", &prompt("one"), Some(tx), Cancellation::default())
             .await
             .unwrap();
-        assert_eq!(rx.recv().await.as_deref(), Some("hello "));
+        assert_eq!(rx.recv().await, Some(LlmDelta::content("hello ")));
         let second = adapter
             .execute_streaming("job-2", &prompt("two"), None, Cancellation::default())
             .await
