@@ -19,12 +19,13 @@ use afterray_models::{
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
-    apply_background_qos,
+    apply_background_qos, parent_app_anchor, peer_is_afterray_app,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode, HistoryScope,
-    LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request,
-    Response, SearchHit, Status, local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, CLI_EVIDENCE_WINDOW_MS, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode,
+    HistoryScope, LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState,
+    Request, Response, SearchHit, Status, authorize_cli_request, local_calendar_day_bounds_ms,
+    redact_cli_response_data,
 };
 use afterray_store::{
     LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
@@ -224,6 +225,12 @@ async fn async_main() -> anyhow::Result<()> {
     let capture_paused = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
     let recording_active = Arc::new(AtomicBool::new(false));
+    let app_anchor = parent_app_anchor();
+    if app_anchor.is_none() {
+        eprintln!(
+            "no AfterRay parent to pin; socket clients stay on the CLI query surface"
+        );
+    }
     let state = Arc::new(AppState {
         store,
         capture,
@@ -259,6 +266,8 @@ async fn async_main() -> anyhow::Result<()> {
             persisted.ui_language.clone(),
             persisted.summary_language.clone(),
         )),
+        cli_evidence_until_ms: std::sync::Mutex::new(persisted.cli_evidence_until_ms),
+        app_anchor,
         llm_config,
         llm_token_sink,
         mlx_adapters,
@@ -476,6 +485,11 @@ struct AppState {
     /// (ui_language, summary_language) as stored preferences; `auto` until
     /// the user picks, resolved against the system locale at prompt time.
     languages: std::sync::Mutex<(String, String)>,
+    /// Close of the CLI evidence window. `None` or a past instant is off.
+    cli_evidence_until_ms: std::sync::Mutex<Option<i64>>,
+    /// AfterRay.app that spawned us (Team ID and/or cdhash). Absent when
+    /// afterrayd was started from a shell — then nobody is privileged.
+    app_anchor: Option<afterray_platform_macos::CodeIdentity>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
@@ -513,6 +527,8 @@ struct PersistedSettings {
     summary_language: String,
     #[serde(default)]
     model_download_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cli_evidence_until_ms: Option<i64>,
 }
 
 fn default_language() -> String {
@@ -570,6 +586,7 @@ impl Default for PersistedSettings {
             ui_language: default_language(),
             summary_language: default_language(),
             model_download_endpoint: String::new(),
+            cli_evidence_until_ms: None,
         }
     }
 }
@@ -593,71 +610,25 @@ fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
 }
 
 async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> {
+    let privileged = client_is_privileged(&stream, &state);
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
-            // Artifact / thumbnail reads decrypt on the blocking pool. Doing
-            // that on a worker used to freeze accepts and chat streams while
-            // the filmstrip scrubbed.
-            Ok(Request::ReadArtifact { artifact_id }) => {
-                let result =
-                    run_store(&state, move |s| read_still_artifact(s, &artifact_id)).await;
-                write_artifact_response(&mut write, result).await?;
-            }
-            Ok(Request::ReadGopSegment { segment_id }) => {
-                let result =
-                    run_store(&state, move |s| s.store.read_gop_artifact(&segment_id)).await;
-                write_artifact_response(&mut write, result).await?;
-            }
-            Ok(Request::ReadGopFrame {
-                segment_id,
-                index,
-                mode,
-            }) => {
-                let result = run_store(&state, move |s| {
-                    gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
-                })
-                .await;
-                write_artifact_response(&mut write, result).await?;
-            }
-            Ok(Request::ChatStream {
-                conversation_id,
-                message,
-            }) => {
-                // A hang-up no longer cancels. Closing the panel means "I will
-                // read it later": the turn runs on and writes itself into its
-                // row, so coming back finds the finished answer. Only an
-                // explicit ChatAbort stops a turn — see Request::ChatAbort.
-                let cancel = afterray_harness::CancelToken::new();
-                let (result, peer_present) = stream::run_watching_for_hangup(
-                    stream::handle_chat_stream(
-                        &mut write,
-                        &state,
-                        conversation_id,
-                        message,
-                        cancel.clone(),
-                    ),
-                    &mut lines,
-                )
-                .await;
-                result?;
-                if !peer_present {
-                    break;
+            Ok(request) if !privileged => {
+                if let Err(message) = authorize_cli_request(
+                    &request,
+                    cli_evidence_until_ms(&state),
+                    now_ms(),
+                ) {
+                    write_json_response(&mut write, &Response::failure(message)).await?;
+                    continue;
                 }
-            }
-            Ok(Request::ReadThumbnail {
-                moment_id,
-                max_edge,
-            }) => {
-                let result = run_store(&state, move |s| {
-                    read_moment_thumbnail(&s.store, &moment_id, max_edge)
-                })
-                .await;
-                write_artifact_response(&mut write, result).await?;
+                handle_authorized_request(request, &state, &mut write, &mut lines, false)
+                    .await?;
             }
             Ok(request) => {
-                write_json_response(&mut write, &dispatch(request, &state).await).await?;
+                handle_authorized_request(request, &state, &mut write, &mut lines, true).await?;
             }
             Err(error) => {
                 write_json_response(
@@ -668,6 +639,97 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
             }
         }
     }
+    Ok(())
+}
+
+fn client_is_privileged(stream: &UnixStream, state: &AppState) -> bool {
+    use std::os::fd::AsRawFd as _;
+    peer_is_afterray_app(stream.as_raw_fd(), state.app_anchor.as_ref())
+}
+
+fn cli_evidence_until_ms(state: &AppState) -> Option<i64> {
+    state
+        .cli_evidence_until_ms
+        .lock()
+        .map(|until| *until)
+        .unwrap_or(None)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_authorized_request(
+    request: Request,
+    state: &Arc<AppState>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    privileged: bool,
+) -> anyhow::Result<()> {
+    match request {
+            // Artifact / thumbnail reads decrypt on the blocking pool. Doing
+            // that on a worker used to freeze accepts and chat streams while
+            // the filmstrip scrubbed.
+            Request::ReadArtifact { artifact_id } => {
+                let result =
+                    run_store(state, move |s| read_still_artifact(s, &artifact_id)).await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ReadGopSegment { segment_id } => {
+                let result =
+                    run_store(state, move |s| s.store.read_gop_artifact(&segment_id)).await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ReadGopFrame {
+                segment_id,
+                index,
+                mode,
+            } => {
+                let result = run_store(state, move |s| {
+                    gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
+                })
+                .await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ChatStream {
+                conversation_id,
+                message,
+            } => {
+                // A hang-up no longer cancels. Closing the panel means "I will
+                // read it later": the turn runs on and writes itself into its
+                // row, so coming back finds the finished answer. Only an
+                // explicit ChatAbort stops a turn — see Request::ChatAbort.
+                let cancel = afterray_harness::CancelToken::new();
+                let (result, _peer_present) = stream::run_watching_for_hangup(
+                    stream::handle_chat_stream(
+                        write,
+                        state,
+                        conversation_id,
+                        message,
+                        cancel.clone(),
+                    ),
+                    lines,
+                )
+                .await;
+                result?;
+            }
+            Request::ReadThumbnail {
+                moment_id,
+                max_edge,
+            } => {
+                let result = run_store(state, move |s| {
+                    read_moment_thumbnail(&s.store, &moment_id, max_edge)
+                })
+                .await;
+                write_artifact_response(write, result).await?;
+            }
+            other => {
+                let mut response = dispatch(other.clone(), state).await;
+                if !privileged
+                    && let Some(data) = response.data.as_mut()
+                {
+                    redact_cli_response_data(&other, data);
+                }
+                write_json_response(write, &response).await?;
+            }
+        }
     Ok(())
 }
 
@@ -755,6 +817,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 host_build: std::env::var("AFTERRAY_HOST_BUILD")
                     .ok()
                     .filter(|v| !v.is_empty()),
+                cli_evidence_until_ms: cli_evidence_until_ms(state),
             })
         }
         Request::RecordStart => record_start(state).await,
@@ -990,6 +1053,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             llm_model,
             llm_api_key,
             model_download_endpoint,
+            cli_evidence_access,
         } => {
             update_settings(
                 state,
@@ -1005,6 +1069,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     llm_model,
                     llm_api_key,
                     model_download_endpoint,
+                    cli_evidence_access,
                 },
             )
             .await
@@ -1340,11 +1405,28 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|endpoint| endpoint.clone())
             .unwrap_or_default(),
+        cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
     save_persisted_settings(&state.data_dir, &persisted_settings(state))
+}
+
+/// Disk first, then memory. A failed write must not leave the live window
+/// open (or closed) against a settings.json that still has the old value.
+fn persist_then_store_cli_evidence(
+    data_dir: &Path,
+    mut pending: PersistedSettings,
+    slot: &std::sync::Mutex<Option<i64>>,
+    until: Option<i64>,
+) -> std::io::Result<()> {
+    pending.cli_evidence_until_ms = until;
+    save_persisted_settings(data_dir, &pending)?;
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pending.cli_evidence_until_ms;
+    Ok(())
 }
 
 fn persisted_settings(state: &AppState) -> PersistedSettings {
@@ -1380,6 +1462,7 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .lock()
             .map(|endpoint| endpoint.clone())
             .unwrap_or_default(),
+        cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
 }
 
@@ -1397,6 +1480,7 @@ struct SettingsPatch {
     llm_model: Option<String>,
     llm_api_key: Option<String>,
     model_download_endpoint: Option<String>,
+    cli_evidence_access: Option<bool>,
 }
 
 async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
@@ -1412,7 +1496,19 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         llm_model,
         llm_api_key,
         model_download_endpoint,
+        cli_evidence_access,
     } = patch;
+    if let Some(enabled) = cli_evidence_access {
+        let until = enabled.then(|| now_ms().saturating_add(CLI_EVIDENCE_WINDOW_MS));
+        if let Err(error) = persist_then_store_cli_evidence(
+            &state.data_dir,
+            persisted_settings(state),
+            &state.cli_evidence_until_ms,
+            until,
+        ) {
+            return Response::failure(format!("could not save CLI evidence access: {error}"));
+        }
+    }
     if let Some(endpoint) = model_download_endpoint {
         let cleaned = endpoint.trim().trim_end_matches('/').to_owned();
         // Same origin policy as the LLM endpoint: https, or plain http only to
@@ -4093,6 +4189,48 @@ mod tests {
         let error = bind_control_socket(&linked).unwrap_err().to_string();
         assert!(error.contains("not a socket"), "{error}");
         assert!(socket.exists(), "the symlink target must survive too");
+    }
+
+    #[test]
+    fn cli_evidence_persists_before_memory_and_rolls_back_on_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let slot = std::sync::Mutex::new(None);
+        persist_then_store_cli_evidence(
+            directory.path(),
+            PersistedSettings::default(),
+            &slot,
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(42));
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42)
+        );
+
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not-a-directory").unwrap();
+        let err = persist_then_store_cli_evidence(
+            &blocked,
+            PersistedSettings {
+                cli_evidence_until_ms: Some(42),
+                ..PersistedSettings::default()
+            },
+            &slot,
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some(42),
+            "a failed persist must not change the live window"
+        );
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42),
+            "the last good settings.json must survive the failed write"
+        );
     }
 
     #[test]

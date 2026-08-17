@@ -9,6 +9,7 @@ macOS platform glue for the daemon: owns the `AfterRayCaptureShim` child process
 - `lib.rs:108 ArtifactKind` — `screen | system_audio | microphone | accessibility`.
 - `power.rs` — `on_ac_power`, `battery_fraction`, `seconds_since_user_input`, `load_per_core`, `apply_background_qos` (used by the T2 gate and the GOP packer thread).
 - `locale.rs` — `preferred_languages`.
+- `peer.rs` — `peer_is_afterray_app(fd, parent_app_anchor())`. Audit token + valid `dev.afterray.app` signature, then matching Team ID **or** the spawn-time parent cdhash. Identifier-only / ad-hoc copies are rejected. Path is not a trust signal.
 
 ## Build / test
 
